@@ -13,6 +13,9 @@
 $authPasswordHash = '$2y$12$qlzLQ1kcv15WIeFIIxdkcup8BQJijLSb.bjncLIHr1LL/HgrqKTo6';
 // Default password: admin123. Change it in File > Settings before public use.
 
+// Base64-encoded JSON, maintained by File > Settings. Empty uses defaults/legacy settings.
+$workspaceSettingsBase64 = '';
+
 function fmAuthReply($code, $message, $extra = [])
 {
     http_response_code($code);
@@ -53,35 +56,75 @@ function fmLoginAttempt($password, $hash)
     if (!$stored) fmAuthReply(503, 'Cannot record login attempt. Access denied.');
     return [$valid, $blocked];
 }
-function fmUpdatePasswordHash($oldHash, $newHash)
+// Password and UI settings share one lock so simultaneous changes preserve each other.
+function fmRewriteConfiguration($transform)
 {
     $directory = fmPrivateAuthDirectory();
-    $lockPath = $directory . '/password.lock';
-    if (is_link($lockPath)) throw new RuntimeException('Invalid password lock.');
+    $lockPath = $directory . '/configuration.lock';
+    if (is_link($lockPath)) throw new RuntimeException('Invalid configuration lock.');
     $lock = @fopen($lockPath, 'c');
-    if (!$lock || !@chmod($lockPath, 0600) || !flock($lock, LOCK_EX)) throw new RuntimeException('Cannot lock password configuration.');
+    if (!$lock || !@chmod($lockPath, 0600) || !flock($lock, LOCK_EX)) {
+        if (is_resource($lock)) fclose($lock);
+        throw new RuntimeException('Cannot lock configuration.');
+    }
     $temporary = null;
     try {
-        $source = file_get_contents(__FILE__);
-        $pattern = '/^\$authPasswordHash = \'[^\']*\';$/m';
-        if (preg_match_all($pattern, $source, $matches) !== 1 || $matches[0][0] !== '$authPasswordHash = ' . var_export($oldHash, true) . ';') throw new RuntimeException('Password configuration changed. Reload and try again.');
-        $replacement = '$authPasswordHash = ' . var_export($newHash, true) . ';';
-        $updated = preg_replace_callback($pattern, function () use ($replacement) { return $replacement; }, $source, 1);
-        $backup = $directory . '/password-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(5)) . '.bak';
-        if (@file_put_contents($backup, $source, LOCK_EX) !== strlen($source) || !@chmod($backup, 0600) || hash_file('sha256', $backup) !== hash('sha256', $source)) throw new RuntimeException('Cannot verify configuration backup. Password unchanged.');
-        $temporary = tempnam(dirname(__FILE__), '.fm-auth-save-');
+        clearstatcache(true, __FILE__);
+        $stat = @stat(__FILE__);
+        $source = @file_get_contents(__FILE__);
+        if (!$stat || $stat['nlink'] !== 1 || !is_string($source)) throw new RuntimeException('Cannot read configuration safely.');
+        $updated = $transform($source);
+        if (!is_string($updated) || $updated === '') throw new RuntimeException('Invalid configuration update.');
+        if ($updated === $source) return;
+        token_get_all($updated, TOKEN_PARSE);
+        $backup = $directory . '/configuration-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(5)) . '.bak';
+        if (@file_put_contents($backup, $source, LOCK_EX) !== strlen($source) || !@chmod($backup, 0600) || @hash_file('sha256', $backup) !== hash('sha256', $source)) throw new RuntimeException('Cannot verify configuration backup. Nothing changed.');
+        $temporary = @tempnam(dirname(__FILE__), '.fm-auth-save-');
         if (!$temporary || dirname($temporary) !== dirname(__FILE__)) throw new RuntimeException('Cannot create temporary configuration.');
-        if (@file_put_contents($temporary, $updated, LOCK_EX) !== strlen($updated) || hash_file('sha256', $temporary) !== hash('sha256', $updated)) throw new RuntimeException('Configuration write failed.');
-        $stat = stat(__FILE__); $tempStat = stat($temporary);
+        $handle = @fopen($temporary, 'wb');
+        if (!$handle) throw new RuntimeException('Cannot write temporary configuration.');
+        try {
+            $offset = 0;
+            while ($offset < strlen($updated)) {
+                $written = fwrite($handle, substr($updated, $offset));
+                if ($written === false || $written === 0) throw new RuntimeException('Configuration write failed.');
+                $offset += $written;
+            }
+            if (!fflush($handle) || (function_exists('fsync') && !fsync($handle))) throw new RuntimeException('Cannot flush configuration.');
+        } finally { fclose($handle); }
+        if (@hash_file('sha256', $temporary) !== hash('sha256', $updated)) throw new RuntimeException('Configuration verification failed.');
+        $tempStat = stat($temporary);
         if ($stat['uid'] !== $tempStat['uid'] && !@chown($temporary, $stat['uid'])) throw new RuntimeException('Cannot preserve configuration owner.');
         if ($stat['gid'] !== $tempStat['gid'] && !@chgrp($temporary, $stat['gid'])) throw new RuntimeException('Cannot preserve configuration group.');
-        if (!@chmod($temporary, $stat['mode'] & 0777) || hash_file('sha256', __FILE__) !== hash('sha256', $source) || !@rename($temporary, __FILE__)) throw new RuntimeException('Cannot replace configuration safely.');
+        if (!@chmod($temporary, $stat['mode'] & 0777)) throw new RuntimeException('Cannot preserve configuration permissions.');
+        clearstatcache(true, __FILE__);
+        $latest = @stat(__FILE__);
+        if (!$latest || $latest['ino'] !== $stat['ino'] || @hash_file('sha256', __FILE__) !== hash('sha256', $source) || !@rename($temporary, __FILE__)) throw new RuntimeException('Configuration changed or cannot be replaced safely. Reload and try again.');
         $temporary = null;
         if (function_exists('opcache_invalidate')) @opcache_invalidate(__FILE__, true);
     } finally {
         if ($temporary && is_file($temporary)) @unlink($temporary);
         flock($lock, LOCK_UN); fclose($lock);
     }
+}
+function fmUpdatePasswordHash($oldHash, $newHash)
+{
+    fmRewriteConfiguration(function ($source) use ($oldHash, $newHash) {
+        $pattern = '/^\$authPasswordHash = \'[^\']*\';$/m';
+        if (preg_match_all($pattern, $source, $matches) !== 1 || $matches[0][0] !== '$authPasswordHash = ' . var_export($oldHash, true) . ';') throw new RuntimeException('Password configuration changed. Reload and try again.');
+        return preg_replace_callback($pattern, function () use ($newHash) { return '$authPasswordHash = ' . var_export($newHash, true) . ';'; }, $source, 1);
+    });
+}
+function fmValidateWorkspaceSettings($data)
+{
+    if (!is_array($data)) throw new RuntimeException('Invalid settings.');
+    $timezone = $data['timezone'] ?? null;
+    $format = $data['date_format'] ?? null;
+    $font = $data['font_size'] ?? null;
+    if (!is_string($timezone) || !in_array($timezone, timezone_identifiers_list(DateTimeZone::ALL_WITH_BC), true)) throw new RuntimeException('Select a valid timezone.');
+    if (!is_string($format) || $format === '' || strlen($format) > 128 || !preg_match('//u', $format) || preg_match('/[\x00-\x1f\x7f]/', $format)) throw new RuntimeException('Date format must be 1–128 bytes without control characters.');
+    if (!is_string($font) || !preg_match('/^(1[0-9]|2[0-9]|3[0-2])px$/D', $font)) throw new RuntimeException('Font size must be between 10px and 32px.');
+    return ['timezone' => $timezone, 'date_format' => $format, 'font_size' => $font];
 }
 
 // Read the current hash from disk so OPcache cannot keep an old password valid.
@@ -185,14 +228,23 @@ $config = [
     "font_size" => "16px",
 ];
 
-if (file_exists("$root_path/.fm-config")) {
-    $userConfig = "$root_path/.fm-config";
-    $settings = json_decode(file_get_contents($userConfig), true);
-
-    $config['timezone'] = $settings['timezone'] ?? $config['timezone'];
-    $config['date_format'] = $settings['date_format'] ?? $config['date_format'];
-    $config['font_size'] = $settings['font_size'] ?? $config['font_size'];
-}
+// Read settings from disk as data, never eval, so OPcache cannot retain old values.
+if (preg_match('/^\$workspaceSettingsBase64 = \'([A-Za-z0-9+\/=]*)\';$/m', $authHeader, $settingsMatch) !== 1) fmAuthReply(503, 'Settings configuration unavailable.');
+try {
+    if ($settingsMatch[1] !== '') {
+        $decoded = base64_decode($settingsMatch[1], true);
+        $storedSettings = fmValidateWorkspaceSettings($decoded === false ? null : json_decode($decoded, true));
+        $config = array_replace($config, $storedSettings);
+    } elseif (is_file("$root_path/.fm-config")) {
+        // Existing installations keep their settings until the next Settings save.
+        $legacy = @file_get_contents("$root_path/.fm-config", false, null, 0, 4097);
+        $legacy = is_string($legacy) && strlen($legacy) <= 4096 ? json_decode($legacy, true) : null;
+        if (is_array($legacy)) {
+            try { $config = array_replace($config, fmValidateWorkspaceSettings(array_replace($config, $legacy))); }
+            catch (Throwable $ignored) { /* Invalid legacy settings cannot inject markup or CSS. */ }
+        }
+    }
+} catch (Throwable $error) { fmAuthReply(503, 'Settings configuration unavailable.'); }
 
 // Set timezone
 date_default_timezone_set($config["timezone"]);
@@ -338,6 +390,20 @@ $workspaceThemeScript = <<<'JS'
 </script>
 
 <style>
+    /* One text scale for menus and floating UI, independent of Bootstrap defaults. */
+    :root { --workspace-ui-font-size: 0.78rem; }
+    .modal, .modal .modal-content, #git-diff-dialog,
+    .cool-alert-modal, .cool-alert-toast { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: var(--workspace-ui-font-size) !important; line-height: 1.5; }
+    .modal .modal-title, .modal .modal-body, .modal .modal-footer,
+    .modal .modal-body :is(p, li, label, h1, h2, h3, h4, h5, h6, small, .form-text, .alert, .list-group-item),
+    .modal :is(.form-control, .form-select, .btn, .table th, .table td, kbd),
+    .cool-alert-modal-title, .cool-alert-toast-title, .cool-alert-title,
+    .cool-alert-modal-message, .cool-alert-toast-message, .cool-alert-text, .cool-alert-modal-btn,
+    .context-menu .context-menu-item, .ace_tooltip { font-size: var(--workspace-ui-font-size) !important; }
+    @media (max-width: 760px) {
+        /* Avoid browser zoom while typing in mobile dialogs. */
+        .modal :is(input.form-control, textarea.form-control, select.form-select) { font-size: 16px !important; }
+    }
     /* Shared floating surfaces follow the workspace theme, including light palettes. */
     .modal { --bs-body-color: var(--text-primary); --bs-body-bg: var(--bg-main); --bs-border-color: var(--border-default); }
     .modal .table {
@@ -2080,19 +2146,22 @@ function createFile($path, $name, $content = "")
 function updateSettings($timezone, $dateFormat, $fontSize)
 {
     global $config;
-    if (empty($timezone) && empty($dateFormat) && empty($fontSize)) {
-        return ["status" => "error", "message" => "No changes made"];
-    }
-    $data = [
-        'timezone' => empty($timezone) ? $config["timezone"] : $timezone,
-        'date_format' => empty($dateFormat) ? $config["date_format"] : $dateFormat,
-        'font_size' => empty($fontSize) ? $config["font_size"] : $fontSize,
-    ];
-    $file = $config["root_path"] . "/.fm-config";
-    if (file_put_contents($file, json_encode($data))) {
-        return ["status" => "success", "message" => "Settings updated successfully", "type" => "confirm"];
-    } else {
-        return ["status" => "error", "message" => "Failed to update settings"];
+    if ($timezone === '' && $dateFormat === '' && $fontSize === '') return ['status' => 'error', 'message' => 'No changes made'];
+    try {
+        $data = fmValidateWorkspaceSettings([
+            'timezone' => $timezone === '' ? $config['timezone'] : $timezone,
+            'date_format' => $dateFormat === '' ? $config['date_format'] : $dateFormat,
+            'font_size' => $fontSize === '' ? $config['font_size'] : $fontSize,
+        ]);
+        $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+        fmRewriteConfiguration(function ($source) use ($encoded) {
+            $pattern = '/^\$workspaceSettingsBase64 = \'[A-Za-z0-9+\/=]*\';$/m';
+            if (preg_match_all($pattern, $source) !== 1) throw new RuntimeException('Settings configuration changed. Reload and try again.');
+            return preg_replace_callback($pattern, function () use ($encoded) { return '$workspaceSettingsBase64 = ' . var_export($encoded, true) . ';'; }, $source, 1);
+        });
+        return ['status' => 'success', 'message' => 'Settings saved in filemanager.php', 'type' => 'confirm'];
+    } catch (Throwable $error) {
+        return ['status' => 'error', 'message' => $error->getMessage()];
     }
 }
 
@@ -2995,10 +3064,6 @@ if ($username == null) {
             display: block;
         }
 
-        .search-container {
-            max-width: 280px;
-        }
-
         .search-container .input-group .form-control {
             background: var(--bg-elevated);
             border: 1px solid var(--border-default);
@@ -3259,7 +3324,7 @@ if ($username == null) {
         .toolbar-utilities .input-group .form-control { height: 25px; min-height: 25px; padding: 1px 7px; font-size: 0.75rem; }
         .toolbar-utilities .btn-search { height: 25px; padding: 1px 8px; font-size: 0.75rem; }
         #workspace-theme { max-width: 130px; background: var(--bg-elevated); color: var(--text-primary); }
-        .menu-heading { background: transparent; border: 0; border-radius: 4px; padding: 3px 8px; color: var(--text-primary); font-size: 0.78rem; }
+        .menu-heading { background: transparent; border: 0; border-radius: 4px; padding: 3px 8px; color: var(--text-primary); font-size: var(--workspace-ui-font-size); }
         .menu-heading:hover, .menu-heading[aria-expanded="true"] { background: var(--bg-hover); }
         .menu-shortcut { margin-left: auto; padding-left: 20px; font-size: 0.7rem; color: var(--text-muted); }
         .editor-menu-action:disabled { opacity: 0.45; cursor: default; }
@@ -3343,11 +3408,27 @@ if ($username == null) {
 
         .git-status-badge { margin-left: 8px; font-size: 0.7rem; font-weight: 600; color: var(--text-link); }
 
+        /* Keep search central and sign-out independent from the application menus. */
+        .main-toolbar { display: grid; grid-template-columns: minmax(max-content, 1fr) minmax(220px, min(46vw, 640px)) minmax(max-content, 1fr); column-gap: 12px; }
+        .toolbar-actions { grid-column: 1; grid-row: 1; flex: none; }
+        .toolbar-utilities { grid-column: 2; grid-row: 1; width: 100%; min-width: 0; margin: 0; padding: 0; }
+        .toolbar-utilities .search-container { width: 100%; min-width: 0; }
+        #logout-form { grid-column: 3; grid-row: 1; justify-self: end; margin: 0; }
+        #logout-form .menu-heading { white-space: nowrap; }
+        .main-toolbar > #upload-progress { grid-row: 2; grid-column: 1 / -1; width: 100% !important; margin: 0 !important; }
+        .workspace-theme-choice { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 8px 10px; font-size: var(--workspace-ui-font-size); color: var(--text-secondary); }
+        .workspace-theme-choice #workspace-theme { width: 100%; max-width: none; min-height: 30px; border: 1px solid var(--border-default); border-radius: 4px; padding: 3px 6px; font: inherit; }
+        @media (min-width: 761px) and (max-width: 1050px) {
+            .main-toolbar { grid-template-columns: max-content minmax(150px, 1fr) max-content; column-gap: 8px; }
+        }
         .mobile-workspace-controls { display: none; }
         @media (max-width: 760px) {
             html, body { height: var(--mobile-viewport-height, 100dvh); }
-            .main-toolbar { height: auto; min-height: 46px; padding: 4px 8px; flex-wrap: wrap; gap: 4px; }
-            .mobile-workspace-controls { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; }
+            .main-toolbar { display: flex; position: relative; height: auto; min-height: 46px; padding: 4px 8px; flex-wrap: wrap; gap: 4px; }
+            #logout-form { position: absolute; right: 8px; top: 4px; }
+            #logout-form .menu-heading { min-height: 38px; }
+            .workspace-theme-choice #workspace-theme { min-height: 38px; font-size: 16px; }
+            .mobile-workspace-controls { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; padding-right: 76px; }
             .mobile-workspace-controls button, #mobile-tabs-select { min-height: 38px; border: 1px solid var(--border-default); border-radius: 4px; background: var(--bg-main); color: var(--text-primary); padding: 5px 9px; font: inherit; }
             #mobile-tabs-select { flex: 1; min-width: 0; max-width: 100%; font-size: 16px; }
             .toolbar-actions { display: none; flex: 1 0 100%; max-height: 40vh; overflow-y: auto; flex-direction: column; align-items: stretch; }
@@ -3463,8 +3544,8 @@ if ($username == null) {
         }
 
         .file-name:hover {
-            color: var(--text-link);
-            text-decoration: underline;
+            color: var(--text-primary);
+            text-decoration: none;
         }
 
         .folder-icon {
@@ -3878,9 +3959,7 @@ if ($username == null) {
             <button type="button" id="mobile-list-btn">List</button>
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><button type="button" class="header-btns" id="menu-show-files">File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled>Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled>Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled>Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled>Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled>Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal">Keyboard shortcuts &amp; help</button></div></div><form method="post" id="logout-form" style="margin-left:8px"><input type="hidden" name="fm_auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form></nav>
-        <div class="toolbar-utilities d-flex align-items-center gap-2">
-            <select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme">Color theme<select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
                 <option value="theme_mix">Theme Mix</option>
                 <option value="one_dark">One Dark</option>
                 <option value="nord_dark">Nord Dark</option>
@@ -3893,7 +3972,8 @@ if ($username == null) {
                 <option value="github">GitHub Light</option>
                 <option value="tomorrow">Tomorrow</option>
                 <option value="kuroir">Kuroir</option>
-            </select>
+            </select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files">File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled>Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled>Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled>Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled>Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled>Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal">Keyboard shortcuts &amp; help</button></div></div></nav>
+        <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
                     <input type="text" class="form-control" id="search-input" placeholder="Search files…">
@@ -3901,6 +3981,7 @@ if ($username == null) {
                 </div>
             </div>
         </div>
+        <form method="post" id="logout-form"><input type="hidden" name="fm_auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form>
         <input type="file" id="file-upload" multiple style="display:none">
 
         <!-- Upload progress -->
@@ -4000,7 +4081,7 @@ if ($username == null) {
             <div class="modal-body">
                 <p>Click a folder in the sidebar to expand it; click a file to open an editor tab. Drag the sidebar border to resize it.</p>
                 <p><strong>Ctrl / ⌘ S</strong> — Save<br><strong>Ctrl / ⌘ Z</strong> — Undo<br><strong>Ctrl H</strong> — Find / Replace<br><strong>Shift Alt F</strong> — Format<br><strong>F11</strong> — Fullscreen</p>
-                <p>Change the theme on the top bar. Use View to toggle the minimap and word wrap. Unsaved tabs show a dot.</p>
+                <p>Choose a color theme in View. Use View to toggle the minimap and word wrap. Unsaved tabs show a dot.</p>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
         </div></div>
@@ -4776,21 +4857,19 @@ if ($username == null) {
                 </tr>`).join('');
 
                 document.querySelectorAll('.file-item').forEach(row => {
-                    row.addEventListener('dblclick', function() {
-                        const name = this.dataset.name;
-                        const type = this.dataset.type;
-                        if (type === 'dir') {
-                            navigateTo(currentPath + '/' + name);
-                        } else {
-                            openFileEditor(name);
-                        }
-                    });
-
                     row.addEventListener('click', function(e) {
-                        if (e.target.type === 'checkbox') return;
-                        const cb = this.querySelector('.item-check');
-                        cb.checked = !cb.checked;
-                        cb.dispatchEvent(new Event('change'));
+                        if (e.target.closest('.checkbox-col')) return;
+                        e.preventDefault();
+                        // Modifier clicks and trash rows retain selection behavior.
+                        if (e.ctrlKey || e.metaKey || e.shiftKey || currentPath === '/.trash') {
+                            const cb = this.querySelector('.item-check');
+                            cb.checked = !cb.checked;
+                            cb.dispatchEvent(new Event('change'));
+                            return;
+                        }
+                        const name = this.dataset.name;
+                        if (this.dataset.type === 'dir') navigateTo(currentPath + '/' + name);
+                        else openFileEditor(name);
                     });
 
                     row.addEventListener('contextmenu', function(e) {
@@ -5559,17 +5638,17 @@ if ($username == null) {
                 });
             });
             // Move between menu headings with the keyboard or pointer while a menu is open.
-            document.querySelectorAll('.menu-heading').forEach(heading => {
+            document.querySelectorAll('.toolbar-actions .menu-heading[data-bs-toggle="dropdown"]').forEach(heading => {
                 heading.addEventListener('mouseenter', () => {
-                    if (document.querySelector('.menu-heading[aria-expanded="true"]') && heading.getAttribute('aria-expanded') !== 'true') {
-                        document.querySelectorAll('.menu-heading[aria-expanded="true"]').forEach(open => bootstrap.Dropdown.getOrCreateInstance(open).hide());
+                    if (document.querySelector('.toolbar-actions .menu-heading[aria-expanded="true"]') && heading.getAttribute('aria-expanded') !== 'true') {
+                        document.querySelectorAll('.toolbar-actions .menu-heading[aria-expanded="true"]').forEach(open => bootstrap.Dropdown.getOrCreateInstance(open).hide());
                         bootstrap.Dropdown.getOrCreateInstance(heading).show();
                     }
                 });
                 heading.addEventListener('keydown', event => {
                     if (!['ArrowLeft','ArrowRight'].includes(event.key)) return;
                     event.preventDefault();
-                    const headings = [...document.querySelectorAll('.menu-heading')];
+                    const headings = [...document.querySelectorAll('.toolbar-actions .menu-heading[data-bs-toggle="dropdown"]')];
                     const index = headings.indexOf(heading);
                     const next = headings[(index + (event.key === 'ArrowRight' ? 1 : headings.length - 1)) % headings.length];
                     bootstrap.Dropdown.getOrCreateInstance(heading).hide();
