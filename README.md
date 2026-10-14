@@ -26,11 +26,12 @@ The application is independent of Microsoft. It uses Ace, not the Visual Studio 
 | Explorer | Expandable folders; resizable sidebar with width stored in a cookie; file search, sorting, selection, context menus |
 | Editing | Syntax highlighting; language selection in the status bar; font size; undo/redo; find/replace; word wrap; copy document text; formatting for supported languages |
 | Navigation | Syntax-colored minimap with click/drag navigation; selected-text occurrence markers; keyboard shortcuts |
-| Appearance | Theme Mix, One Dark, Nord Dark, Tomorrow variants, Cobalt, Monokai, Dracula, GitHub variants, Kuroir; themed menus, popups, and scrollbars |
+| Appearance | Theme Mix, Tokyo Night, Night Owl, Ayu Dark, One Dark, Nord Dark, Tomorrow variants, Cobalt, Monokai, Dracula, GitHub variants, Kuroir; themed menus, popups, and scrollbars |
 | Icons | Embedded Material Icon Theme SVGs for common file types and named folders; embedded Seti fallback icons |
 | File operations | Create, rename, copy, move, upload, download, trash/restore, permissions, compression/extraction where server capabilities permit |
 | Git | `M` modified, `U` untracked, `A` added; comparison against HEAD including unsaved editor text; added/deleted lines highlighted in a dialog |
 | Authentication | Password hash in the PHP file; change password through Settings; protected requests; CSRF tokens; session expiry; login attempt limits |
+| Mobile | Full-width explorer/editor switching; compact menu; open-file selector; hideable code shortcut row; keyboard-aware viewport |
 
 ## Requirements
 
@@ -72,7 +73,25 @@ Open `http://127.0.0.1:8080/filemanager.php`. Change the password later through 
 
 Expand folders in the left explorer and click a file to open an internal tab. Resize the sidebar by dragging its boundary. Tabs and cursor positions are restored after reload; **unsaved document contents are not stored in cookies**.
 
-Use **File → Save** or Ctrl/⌘ S to save, **Edit → Find / Replace** to search, and **View** to toggle the minimap or word wrap. Formatting is an explicit **Tools → Format document** action; saving does not automatically format code. Language and font size are selected in the bottom status bar.
+Use **File → Save** or Ctrl/⌘ S to save, **Edit → Find / Replace** to search, and **View** to toggle the minimap or word wrap. Formatting is an explicit **Tools → Format document** action; saving does not automatically format code. Language and font size are selected in the bottom status bar. Choose the interface theme under **View → Color theme**. File search is centered in the top bar; **Sign out** is at the far right.
+
+## Saved settings
+
+The timezone dropdown shows UTC offsets and a live time preview. The browser-detected timezone is offered through **Use browser timezone**, never applied automatically. Confirm the choice with **Save Settings**, or use **Cancel** to discard it.
+
+Settings and the optional password change share one form and the **Cancel / Save Settings** buttons. Leave all password fields empty to keep the current password. If changing it, supply the current password and matching new passwords. All values are validated before a single configuration replacement; an invalid field leaves both settings and password unchanged. Cancel discards the form edits. Saving does not reload the workspace or discard open editor changes.
+
+**File → Settings** stores the timezone, PHP date format, and interface font size directly in `filemanager.php`, alongside the password configuration. Values are held as base64-encoded JSON data, not executable PHP. Font size accepts 10px–32px; timezones and date formats are validated before saving.
+
+Saving settings requires permission to replace the application file. Password and settings updates share a lock and use a verified private backup, checked temporary file, and atomic replacement. If writing fails, the original remains intact. Keep a separate copy of your personal settings and password configuration when upgrading the application.
+
+Existing `.fm-config` files are read for compatibility until settings are saved in the PHP file. The next successful Settings save migrates the effective values into `filemanager.php`; no new `.fm-config` is created. The old file is left untouched and can be removed after confirming the migrated settings.
+
+## Mobile layout
+
+On screens up to 760 px wide, **Files** opens the full-width explorer, **List** opens the file table, and an editor tab fills the available width. The compact **☰** menu contains the existing actions, theme selector, and file search. Open files remain accessible through horizontal tabs and a dropdown; returning to the explorer preserves its scroll position.
+
+Mobile editors default to word wrap and a hidden minimap; the mobile minimap preference is stored separately from the desktop preference. A hideable shortcut row provides Tab, outdent, braces, parentheses, undo, and redo. Use **⌨** to toggle it and **…** in the status bar to show additional editor settings. Viewport resize events adjust the workspace when the on-screen keyboard opens and keep the focused cursor in view. Dialogs and editor search fit the narrow layout. Desktop navigation remains available on wider screens.
 
 ## Git comparison
 

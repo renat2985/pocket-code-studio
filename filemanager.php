@@ -115,6 +115,20 @@ function fmUpdatePasswordHash($oldHash, $newHash)
         return preg_replace_callback($pattern, function () use ($newHash) { return '$authPasswordHash = ' . var_export($newHash, true) . ';'; }, $source, 1);
     });
 }
+function fmUpdateWorkspaceConfiguration($data, $oldHash, $newHash = null)
+{
+    $data = fmValidateWorkspaceSettings($data);
+    $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
+    fmRewriteConfiguration(function ($source) use ($encoded, $oldHash, $newHash) {
+        $passwordPattern = '/^\$authPasswordHash = \'[^\']*\';$/m';
+        $settingsPattern = '/^\$workspaceSettingsBase64 = \'[A-Za-z0-9+\/=]*\';$/m';
+        if (preg_match_all($passwordPattern, $source, $matches) !== 1 || $matches[0][0] !== '$authPasswordHash = ' . var_export($oldHash, true) . ';') throw new RuntimeException('Password configuration changed. Reload and try again.');
+        if (preg_match_all($settingsPattern, $source) !== 1) throw new RuntimeException('Settings configuration changed. Reload and try again.');
+        $updated = preg_replace_callback($settingsPattern, function () use ($encoded) { return '$workspaceSettingsBase64 = ' . var_export($encoded, true) . ';'; }, $source, 1);
+        if ($newHash !== null) $updated = preg_replace_callback($passwordPattern, function () use ($newHash) { return '$authPasswordHash = ' . var_export($newHash, true) . ';'; }, $updated, 1);
+        return $updated;
+    });
+}
 function fmValidateWorkspaceSettings($data)
 {
     if (!is_array($data)) throw new RuntimeException('Invalid settings.');
@@ -196,6 +210,34 @@ if ($authAction === 'logout' && $isPostRequest) {
     setcookie(session_name(), '', ['expires' => time() - 3600, 'path' => '/', 'secure' => $authHTTPS, 'httponly' => true, 'samesite' => 'Strict']);
     fmAuthReply(200, 'Signed out.');
 }
+if ($authAction === 'save_settings' && $isPostRequest) {
+    try {
+        $data = fmValidateWorkspaceSettings([
+            'timezone' => $_POST['timezone'] ?? null,
+            'date_format' => $_POST['dateformat'] ?? null,
+            'font_size' => $_POST['fontSize'] ?? null,
+        ]);
+        $current = $_POST['current_password'] ?? '';
+        $new = $_POST['new_password'] ?? '';
+        $confirm = $_POST['confirm_password'] ?? '';
+        if (!is_string($current) || !is_string($new) || !is_string($confirm)) fmAuthReply(400, 'Invalid password fields. Nothing was saved.');
+        $changePassword = $current !== '' || $new !== '' || $confirm !== '';
+        $newHash = null;
+        if ($changePassword) {
+            if (!password_verify($current, $authPasswordHash)) fmAuthReply(403, 'Current password is incorrect. Nothing was saved.');
+            if (strlen($new) < 12 || strlen($new) > 72 || strpos($new, "\0") !== false || $new !== $confirm) fmAuthReply(400, 'New passwords must match and contain 12–72 bytes. Nothing was saved.');
+            $newHash = password_hash($new, PASSWORD_DEFAULT);
+        }
+        fmUpdateWorkspaceConfiguration($data, $authPasswordHash, $newHash);
+        if ($newHash !== null) {
+            session_regenerate_id(true);
+            $_SESSION['auth'] = hash('sha256', $newHash);
+            $_SESSION['auth_started'] = $_SESSION['auth_seen'] = time();
+        }
+        session_write_close();
+        fmAuthReply(200, $changePassword ? 'Settings and password saved. Other sessions have been signed out.' : 'Settings saved.', ['password_changed' => $changePassword]);
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
+}
 if ($authAction === 'change_password' && $isPostRequest) {
     $current = $_POST['current_password'] ?? null;
     $new = $_POST['new_password'] ?? null;
@@ -224,7 +266,7 @@ $config = [
     "root_path" => $root_path,
     "allowed_extensions" => ["*"],
     "timezone" => "Africa/Lagos",
-    "date_format" => "M j Y, g:i A",
+    "date_format" => "M j Y, H:i:s",
     "font_size" => "16px",
 ];
 
@@ -318,6 +360,9 @@ $workspaceThemeScript = <<<'JS'
     };
     window.fmCSRFToken = fmCSRF;
     const palettes = {
+        tokyo_night: ["#1a1b26","#16161e","#16161e","#14141b","#a9b1d6","#787c99","#565f89","#7aa2f7","#e0af68"],
+        night_owl: ["#011627","#011627","#011627","#0b253a","#d6deeb","#89a4bb","#637777","#82aaff","#ecc48d"],
+        ayu_dark: ["#10141c","#0d1017","#0b0e14","#10141c","#bfbdb6","#bfbdb6","#5a6673","#e6b450","#ffb454"],
         theme_mix: ['#282c34','#21252b','#252a32','#2c313c','#abb2bf','#9da5b4','#7f848e','#528bff','#d19a66'],
         one_dark: ['#282c34','#21252b','#252a32','#2c313c','#abb2bf','#9da5b4','#7f848e','#61afef','#e5c07b'],
         nord_dark: ['#2e3440','#272d38','#343c4a','#434c5e','#d8dee9','#c4cbd7','#a2adbf','#88c0d0','#ebcb8b'],
@@ -503,7 +548,7 @@ if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff']
                 $statuses[$name]=$xy==='??' ? 'U' : (strpos($xy,'D')!==false ? 'D' : (strpos($xy,'A')!==false ? 'A' : 'M'));
                 if (strpbrk($xy,'RC')!==false) $i++;
             }
-            $result=['status'=>'success','files'=>$statuses];
+            $result=['status'=>'success','available'=>true,'files'=>(object)$statuses];
         } else {
             $requested=$_POST['file'] ?? null;
             $file=is_string($requested) ? realpath($requested) : false;
@@ -535,7 +580,15 @@ if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff']
             } unset($line);
             $result=['status'=>'success','diff'=>implode("\n",$lines),'untracked'=>$tracked===''];
         }
-    } catch (Throwable $error) { http_response_code(400); $result=['status'=>'error','message'=>$error->getMessage()]; }
+    } catch (Throwable $error) {
+        if (($_POST['action'] ?? '') === 'git_status') {
+            // Git is optional; an unavailable repository is not a failed file operation.
+            $result = ['status' => 'success', 'available' => false, 'files' => (object) [], 'message' => $error->getMessage()];
+        } else {
+            http_response_code(400);
+            $result = ['status' => 'error', 'message' => $error->getMessage()];
+        }
+    }
     finally { foreach ($temporaryFiles as $temp) @unlink($temp); }
     echo json_encode($result,JSON_INVALID_UTF8_SUBSTITUTE); exit;
 }
@@ -562,6 +615,81 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+*/
+
+/* Embedded theme palette notices (retained in single-file deployments):
+Tokyo Night palette adapted for Ace. Source: https://github.com/enkia/tokyo-night-vscode-theme
+The MIT License (MIT)
+
+Copyright (c) 2018-present Enkia
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+Night Owl palette adapted for Ace. Source: https://github.com/sdras/night-owl-vscode-theme
+MIT License
+
+Copyright (c) 2018 Sarah Drasner
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+Ayu Dark palette adapted for Ace. Source: https://github.com/ayu-theme/vscode-ayu
+MIT License
+
+Copyright (c) 2016 Ike Kurghinyan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 */
 
 // Serve the integrated code editor before handling file-manager requests.
@@ -752,7 +880,7 @@ $modeOptions = [
 ];
 
 $fileSize = filesize($filename);
-$lastModified = date("M j Y, g:i A", filemtime($filename));
+$lastModified = date("M j Y, H:i:s", filemtime($filename));
 $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
 ?>
 <!DOCTYPE html>
@@ -765,20 +893,6 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
     <title><?= htmlspecialchars($basename) ?> — Pocket Code Studio</title>
     <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMyMTI1MmIiLz48cGF0aCBkPSJtMjMgMjAtMTIgMTIgMTIgMTJtMTgtMjQgMTIgMTItMTIgMTJtLTYtMjgtNiAzMiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNjFhZmVmIiBzdHJva2Utd2lkdGg9IjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjwvc3ZnPg==" type="image/svg+xml">
 
-    <!-- Ace Editor -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ext-language_tools.js"></script>
-
-    <!-- Prettier -->
-    <script src="https://unpkg.com/prettier@2.7.1/standalone.js"></script>
-    <script src="https://unpkg.com/prettier@2.7.1/parser-html.js"></script>
-    <script src="https://unpkg.com/prettier@2.7.1/parser-babel.js"></script>
-    <script src="https://unpkg.com/prettier@2.7.1/parser-postcss.js"></script>
-    <script src="https://unpkg.com/@prettier/plugin-php@0.19.0/standalone.js"></script>
-    <script src="https://unpkg.com/@prettier/plugin-php@0.19.0/parser-php.js"></script>
-    <script src="https://unpkg.com/prettier@2.7.1/parser-markdown.js"></script>
-
-    <!-- Font Awesome 6 (matches file manager) -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
 
     <style>
@@ -1236,7 +1350,7 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
         #editor .ace_scrollbar::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-gold-hover); }
         #editor .ace_scrollbar::-webkit-scrollbar-corner { background: var(--bg-main); }
 
-        #minimap { position: relative; width: 112px; flex-shrink: 0; overflow: hidden; touch-action: none; cursor: pointer; border-left: 1px solid var(--border-subtle); }
+        #minimap { position: absolute; top: 0; right: 12px; bottom: 10px; z-index: 5; background: transparent; width: 112px; flex-shrink: 0; overflow: hidden; touch-action: none; cursor: pointer; border-left: 1px solid var(--border-subtle); }
         #minimap[hidden] { display: none; }
         #occurrence-rail { width: 12px; flex-shrink: 0; position: relative; background: var(--bg-main); border-left: 1px solid var(--border-subtle); cursor: pointer; touch-action: none; outline: none; }
         #occurrence-rail:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
@@ -1304,6 +1418,8 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
             <button type="button" id="mobile-keys-toggle" aria-label="Toggle code keyboard shortcuts" aria-pressed="true">⌨</button>
             <button type="button" id="mobile-status-toggle" aria-label="More editor settings" aria-expanded="false">…</button>
             <select class="status-language" id="fontSize" onchange="changeFontSize(this.value)" title="Font size" aria-label="Font size">
+                <option value="10px">10px</option>
+                <option value="11px">11px</option>
                 <option value="12px">12px</option>
                 <option value="13px">13px</option>
                 <option value="14px" selected>14px</option>
@@ -1331,6 +1447,19 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
         </div>
     </div>
 
+    <!-- Ace Editor -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ext-language_tools.js"></script>
+
+    <!-- Prettier -->
+    <script src="https://unpkg.com/prettier@2.7.1/standalone.js"></script>
+    <script src="https://unpkg.com/prettier@2.7.1/parser-html.js"></script>
+    <script src="https://unpkg.com/prettier@2.7.1/parser-babel.js"></script>
+    <script src="https://unpkg.com/prettier@2.7.1/parser-postcss.js"></script>
+    <script src="https://unpkg.com/@prettier/plugin-php@0.19.0/standalone.js"></script>
+    <script src="https://unpkg.com/prettier@2.7.1/parser-markdown.js"></script>
+
+    <!-- Font Awesome 6 (matches file manager) -->
     <script>
 ace.define("ace/theme/one_dark-css",["require","exports","module"], function(require, exports, module){module.exports = ".ace-one-dark .ace_gutter {\n    background: #282c34;\n    color: #6a6f7a\n}\n\n.ace-one-dark .ace_print-margin {\n    width: 1px;\n    background: #e8e8e8\n}\n\n.ace-one-dark {\n    background-color: #282c34;\n    color: #abb2bf\n}\n\n.ace-one-dark .ace_cursor {\n    color: #528bff\n}\n\n.ace-one-dark .ace_marker-layer .ace_selection {\n    background: #3d4350\n}\n\n.ace-one-dark.ace_multiselect .ace_selection.ace_start {\n    box-shadow: 0 0 3px 0 #282c34;\n    border-radius: 2px\n}\n\n.ace-one-dark .ace_marker-layer .ace_step {\n    background: #c6dbae\n}\n\n.ace-one-dark .ace_marker-layer .ace_bracket {\n    margin: -1px 0 0 -1px;\n    border: 1px solid #747369\n}\n\n.ace-one-dark .ace_marker-layer .ace_active-line {\n    background: rgba(76, 87, 103, .19)\n}\n\n.ace-one-dark .ace_gutter-active-line {\n    background-color: rgba(76, 87, 103, .19)\n}\n\n.ace-one-dark .ace_marker-layer .ace_selected-word {\n    border: 1px solid #3d4350\n}\n\n.ace-one-dark .ace_fold {\n    background-color: #61afef;\n    border-color: #abb2bf\n}\n\n.ace-one-dark .ace_keyword {\n    color: #c678dd\n}\n\n.ace-one-dark .ace_keyword.ace_operator {\n    color: #c678dd\n}\n\n.ace-one-dark .ace_keyword.ace_other.ace_unit {\n    color: #d19a66\n}\n\n.ace-one-dark .ace_constant.ace_language {\n    color: #d19a66\n}\n\n.ace-one-dark .ace_constant.ace_numeric {\n    color: #d19a66\n}\n\n.ace-one-dark .ace_constant.ace_character {\n    color: #56b6c2\n}\n\n.ace-one-dark .ace_constant.ace_other {\n    color: #56b6c2\n}\n\n.ace-one-dark .ace_support.ace_function {\n    color: #61afef\n}\n\n.ace-one-dark .ace_support.ace_constant {\n    color: #d19a66\n}\n\n.ace-one-dark .ace_support.ace_class {\n    color: #e5c07b\n}\n\n.ace-one-dark .ace_support.ace_type {\n    color: #e5c07b\n}\n\n.ace-one-dark .ace_storage {\n    color: #c678dd\n}\n\n.ace-one-dark .ace_storage.ace_type {\n    color: #c678dd\n}\n\n.ace-one-dark .ace_invalid {\n    color: #fff;\n    background-color: #f2777a\n}\n\n.ace-one-dark .ace_invalid.ace_deprecated {\n    color: #272b33;\n    background-color: #d27b53\n}\n\n.ace-one-dark .ace_string {\n    color: #98c379\n}\n\n.ace-one-dark .ace_string.ace_regexp {\n    color: #e06c75\n}\n\n.ace-one-dark .ace_comment {\n    font-style: italic;\n    color: #5c6370\n}\n\n.ace-one-dark .ace_variable {\n    color: #e06c75\n}\n\n.ace-one-dark .ace_variable.ace_parameter {\n    color: #d19a66\n}\n\n.ace-one-dark .ace_meta.ace_tag {\n    color: #e06c75\n}\n\n.ace-one-dark .ace_entity.ace_other.ace_attribute-name {\n    color: #e06c75\n}\n\n.ace-one-dark .ace_entity.ace_name.ace_function {\n    color: #61afef\n}\n\n.ace-one-dark .ace_entity.ace_name.ace_tag {\n    color: #e06c75\n}\n\n.ace-one-dark .ace_markup.ace_heading {\n    color: #98c379\n}\n\n.ace-one-dark .ace_indent-guide {\n    background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAACCAYAAACZgbYnAAAAEklEQVQImWPQ09NrYAgMjP4PAAtGAwchHMyAAAAAAElFTkSuQmCC) right repeat-y\n}\n\n.ace-one-dark .ace_indent-guide-active {\n    background: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAACCAYAAACZgbYnAAAAEklEQVQIW2PQ1dX9zzBz5sz/ABCcBFFentLlAAAAAElFTkSuQmCC) right repeat-y;\n}\n";
 
@@ -1373,6 +1502,24 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
             exports.cssText = "\n.ace-theme-mix { background: #282c34; color: #abb2bf; }\n.ace-theme-mix .ace_gutter { background: #282c34; color: #495162; }\n.ace-theme-mix .ace_gutter-active-line, .ace-theme-mix .ace_marker-layer .ace_active-line { background: #2c313c; }\n.ace-theme-mix .ace_cursor { color: #528bff; }\n.ace-theme-mix .ace_marker-layer .ace_selection { background: #67769660; }\n.ace-theme-mix .ace_marker-layer .ace_selected-word { background: #ffffff10; border: 1px solid #dddddd; }\n.ace-theme-mix .ace_marker-layer .ace_bracket { background: #515a6b; border: 1px solid #515a6b; }\n.ace-theme-mix .ace_print-margin { background: #abb2bf26; }\n.ace-theme-mix .ace_invisible { color: #ffffff1d; }\n.ace-theme-mix .ace_indent-guide { box-shadow: inset -1px 0 #3b4048; background: none; }\n.ace-theme-mix .ace_comment { color: #5c6370; font-style: italic; }\n.ace-theme-mix .ace_keyword, .ace-theme-mix .ace_storage { color: #d55fde; }\n.ace-theme-mix .ace_keyword.ace_operator { color: #2bbac5; }\n.ace-theme-mix .ace_string { color: #89ca78; }\n.ace-theme-mix .ace_constant { color: #d19a66; }\n.ace-theme-mix .ace_constant.ace_language { color: #d55fde; }\n.ace-theme-mix .ace_variable { color: #ef596f; }\n.ace-theme-mix .ace_variable.ace_language, .ace-theme-mix .ace_support.ace_class, .ace-theme-mix .ace_support.ace_type { color: #e5c07b; }\n.ace-theme-mix .ace_identifier { color: #e5c07b; }\n.ace-theme-mix .ace_entity.ace_name.ace_function, .ace-theme-mix .ace_support.ace_function { color: #61afef; }\n.ace-theme-mix .ace_meta.ace_tag, .ace-theme-mix .ace_meta.ace_tag.ace_punctuation { color: #abb2bf; }\n.ace-theme-mix .ace_meta.ace_tag.ace_tag-name, .ace-theme-mix .ace_entity.ace_name.ace_tag { color: #ef596f; }\n.ace-theme-mix .ace_entity.ace_other.ace_attribute-name { color: #d19a66; font-style: italic; }\n.ace-theme-mix .ace_support.ace_type.ace_property-name { color: #abb2bf; }\n.ace-theme-mix .ace_punctuation, .ace-theme-mix .ace_paren { color: #abb2bf; }\n.ace-theme-mix .ace_invalid { color: #fff; background: #c24038; }\n.ace-theme-mix .ace_fold { background: #61afef; border-color: #abb2bf; }\n.ace-theme-mix .ace_markup.ace_heading { color: #ef596f; }\n.ace-theme-mix .ace_markup.ace_list { color: #e5c07b; }\n.ace-theme-mix .ace_markup.ace_bold { color: #d19a66; font-weight: bold; }\n.ace-theme-mix .ace_markup.ace_italic { color: #d55fde; font-style: italic; }\n";
             require("ace/lib/dom").importCssString(exports.cssText, exports.cssClass);
         });
+        ace.define("ace/theme/tokyo_night", ["require", "exports", "module", "ace/lib/dom"], function(require, exports, module) {
+            exports.isDark = true;
+            exports.cssClass = "ace-pcs-tokyo-night";
+            exports.cssText = ".ace-pcs-tokyo-night {background-color:#1a1b26;color:#a9b1d6;}\n.ace-pcs-tokyo-night .ace_gutter {background:#1a1b26;color:#363b54;}\n.ace-pcs-tokyo-night .ace_cursor {color:#c0caf5;}\n.ace-pcs-tokyo-night .ace_print-margin {width:1px;background:#14141b;}\n.ace-pcs-tokyo-night .ace_marker-layer .ace_selection {background:#515c7e4d;}\n.ace-pcs-tokyo-night .ace_marker-layer .ace_active-line {background:#1e202e;}\n.ace-pcs-tokyo-night .ace_gutter-active-line {background:#1e202e;}\n.ace-pcs-tokyo-night .ace_marker-layer .ace_selected-word {border:1px solid #7aa2f760;background:#7aa2f712;}\n.ace-pcs-tokyo-night .ace_marker-layer .ace_bracket {border:1px solid #565f89;background:#7aa2f715;}\n.ace-pcs-tokyo-night .ace_keyword {color:#bb9af7;}\n.ace-pcs-tokyo-night .ace_storage {color:#bb9af7;}\n.ace-pcs-tokyo-night .ace_string {color:#9ece6a;}\n.ace-pcs-tokyo-night .ace_constant {color:#ff9e64;}\n.ace-pcs-tokyo-night .ace_entity.ace_name.ace_function {color:#7aa2f7;}\n.ace-pcs-tokyo-night .ace_support.ace_function {color:#7aa2f7;}\n.ace-pcs-tokyo-night .ace_variable {color:#c0caf5;}\n.ace-pcs-tokyo-night .ace_identifier {color:#c0caf5;}\n.ace-pcs-tokyo-night .ace_keyword.ace_operator {color:#89ddff;}\n.ace-pcs-tokyo-night .ace_meta.ace_tag.ace_tag-name {color:#f7768e;}\n.ace-pcs-tokyo-night .ace_entity.ace_name.ace_tag {color:#f7768e;}\n.ace-pcs-tokyo-night .ace_entity.ace_other.ace_attribute-name {color:#bb9af7;}\n.ace-pcs-tokyo-night .ace_support.ace_type {color:#2ac3de;}\n.ace-pcs-tokyo-night .ace_support.ace_class {color:#2ac3de;}\n.ace-pcs-tokyo-night .ace_comment {color:#565f89;font-style:italic;}\n.ace-pcs-tokyo-night .ace_invalid {color:#a9b1d6;background:#b63b52;}\n.ace-pcs-tokyo-night .ace_fold {background:#7aa2f7;border-color:#a9b1d6;}\n.ace-pcs-tokyo-night .ace_indent-guide {box-shadow:inset -1px 0 #565f8930;}\n.ace-pcs-tokyo-night .ace_markup.ace_heading {color:#7aa2f7;font-weight:bold;}";
+            require("ace/lib/dom").importCssString(exports.cssText, exports.cssClass);
+        });
+        ace.define("ace/theme/night_owl", ["require", "exports", "module", "ace/lib/dom"], function(require, exports, module) {
+            exports.isDark = true;
+            exports.cssClass = "ace-pcs-night-owl";
+            exports.cssText = ".ace-pcs-night-owl {background-color:#011627;color:#d6deeb;}\n.ace-pcs-night-owl .ace_gutter {background:#011627;color:#4b6479;}\n.ace-pcs-night-owl .ace_cursor {color:#80a4c2;}\n.ace-pcs-night-owl .ace_print-margin {width:1px;background:#0b253a;}\n.ace-pcs-night-owl .ace_marker-layer .ace_selection {background:#1d3b53;}\n.ace-pcs-night-owl .ace_marker-layer .ace_active-line {background:#28707d29;}\n.ace-pcs-night-owl .ace_gutter-active-line {background:#28707d29;}\n.ace-pcs-night-owl .ace_marker-layer .ace_selected-word {border:1px solid #82aaff60;background:#82aaff12;}\n.ace-pcs-night-owl .ace_marker-layer .ace_bracket {border:1px solid #637777;background:#82aaff15;}\n.ace-pcs-night-owl .ace_keyword {color:#c792ea;}\n.ace-pcs-night-owl .ace_storage {color:#c792ea;}\n.ace-pcs-night-owl .ace_string {color:#ecc48d;}\n.ace-pcs-night-owl .ace_constant {color:#f78c6c;}\n.ace-pcs-night-owl .ace_entity.ace_name.ace_function {color:#82aaff;}\n.ace-pcs-night-owl .ace_support.ace_function {color:#82aaff;}\n.ace-pcs-night-owl .ace_variable {color:#d6deeb;}\n.ace-pcs-night-owl .ace_identifier {color:#d6deeb;}\n.ace-pcs-night-owl .ace_keyword.ace_operator {color:#7fdbca;}\n.ace-pcs-night-owl .ace_meta.ace_tag.ace_tag-name {color:#7fdbca;}\n.ace-pcs-night-owl .ace_entity.ace_name.ace_tag {color:#7fdbca;}\n.ace-pcs-night-owl .ace_entity.ace_other.ace_attribute-name {color:#addb67;}\n.ace-pcs-night-owl .ace_support.ace_type {color:#ffcb8b;}\n.ace-pcs-night-owl .ace_support.ace_class {color:#ffcb8b;}\n.ace-pcs-night-owl .ace_comment {color:#637777;font-style:italic;}\n.ace-pcs-night-owl .ace_invalid {color:#d6deeb;background:#b63b52;}\n.ace-pcs-night-owl .ace_fold {background:#82aaff;border-color:#d6deeb;}\n.ace-pcs-night-owl .ace_indent-guide {box-shadow:inset -1px 0 #63777730;}\n.ace-pcs-night-owl .ace_markup.ace_heading {color:#82aaff;font-weight:bold;}";
+            require("ace/lib/dom").importCssString(exports.cssText, exports.cssClass);
+        });
+        ace.define("ace/theme/ayu_dark", ["require", "exports", "module", "ace/lib/dom"], function(require, exports, module) {
+            exports.isDark = true;
+            exports.cssClass = "ace-pcs-ayu-dark";
+            exports.cssText = ".ace-pcs-ayu-dark {background-color:#10141c;color:#bfbdb6;}\n.ace-pcs-ayu-dark .ace_gutter {background:#10141c;color:#5a6378a6;}\n.ace-pcs-ayu-dark .ace_cursor {color:#e6b450;}\n.ace-pcs-ayu-dark .ace_print-margin {width:1px;background:#10141c;}\n.ace-pcs-ayu-dark .ace_marker-layer .ace_selection {background:#3388ff40;}\n.ace-pcs-ayu-dark .ace_marker-layer .ace_active-line {background:#161a24;}\n.ace-pcs-ayu-dark .ace_gutter-active-line {background:#161a24;}\n.ace-pcs-ayu-dark .ace_marker-layer .ace_selected-word {border:1px solid #e6b45060;background:#e6b45012;}\n.ace-pcs-ayu-dark .ace_marker-layer .ace_bracket {border:1px solid #5a6673;background:#e6b45015;}\n.ace-pcs-ayu-dark .ace_keyword {color:#ff8f40;}\n.ace-pcs-ayu-dark .ace_storage {color:#ff8f40;}\n.ace-pcs-ayu-dark .ace_string {color:#aad94c;}\n.ace-pcs-ayu-dark .ace_constant {color:#d2a6ff;}\n.ace-pcs-ayu-dark .ace_entity.ace_name.ace_function {color:#ffb454;}\n.ace-pcs-ayu-dark .ace_support.ace_function {color:#ffb454;}\n.ace-pcs-ayu-dark .ace_variable {color:#bfbdb6;}\n.ace-pcs-ayu-dark .ace_identifier {color:#bfbdb6;}\n.ace-pcs-ayu-dark .ace_keyword.ace_operator {color:#f29668;}\n.ace-pcs-ayu-dark .ace_meta.ace_tag.ace_tag-name {color:#39bae6;}\n.ace-pcs-ayu-dark .ace_entity.ace_name.ace_tag {color:#39bae6;}\n.ace-pcs-ayu-dark .ace_entity.ace_other.ace_attribute-name {color:#ffb454;}\n.ace-pcs-ayu-dark .ace_support.ace_type {color:#59c2ff;}\n.ace-pcs-ayu-dark .ace_support.ace_class {color:#59c2ff;}\n.ace-pcs-ayu-dark .ace_comment {color:#5a6673;font-style:italic;}\n.ace-pcs-ayu-dark .ace_invalid {color:#bfbdb6;background:#b63b52;}\n.ace-pcs-ayu-dark .ace_fold {background:#e6b450;border-color:#bfbdb6;}\n.ace-pcs-ayu-dark .ace_indent-guide {box-shadow:inset -1px 0 #5a667330;}\n.ace-pcs-ayu-dark .ace_markup.ace_heading {color:#e6b450;font-weight:bold;}";
+            require("ace/lib/dom").importCssString(exports.cssText, exports.cssClass);
+        });
         editor.setTheme("ace/theme/theme_mix");
         editor.session.setMode("ace/mode/<?= $editorMode ?>");
         editor.setOptions({
@@ -1384,7 +1531,6 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
             highlightActiveLine: true,
             highlightSelectedWord: true,
             enableAutoIndent: true,
-            enableKeyboardAccessibility: true,
             showPrintMargin: false,
             scrollPastEnd: 0.5,
             tabSize: 4,
@@ -1721,7 +1867,10 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
             mapCanvas.height = Math.round(height * ratio);
             mapContext.setTransform(ratio, 0, 0, ratio, 0, 0);
             mapContext.fillStyle = getComputedStyle(editor.container).backgroundColor;
+            // Dim underlying editor text independently from the miniature code.
+            mapContext.globalAlpha = 0.88;
             mapContext.fillRect(0, 0, width, height);
+            mapContext.globalAlpha = 0.5;
             const count = editor.session.getLength();
             const first = editor.getFirstVisibleRow();
             const last = Math.min(count - 1, editor.getLastVisibleRow());
@@ -1747,6 +1896,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
                     if (column >= maxColumns) break;
                 }
             }
+            mapContext.globalAlpha = 1;
             const top = Math.max(0, (first - mapStartRow) * mapLineHeight);
             const viewportHeight = Math.min(height, Math.max(8, visible * mapLineHeight));
             mapViewport.style.top = Math.min(height - viewportHeight, top) + 'px';
@@ -2968,8 +3118,8 @@ if ($username == null) {
     <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCI+PHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTQiIGZpbGw9IiMyMTI1MmIiLz48cGF0aCBkPSJtMjMgMjAtMTIgMTIgMTIgMTJtMTgtMjQgMTIgMTItMTIgMTJtLTYtMjgtNiAzMiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNjFhZmVmIiBzdHJva2Utd2lkdGg9IjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjwvc3ZnPg==" type="image/svg+xml">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/coolalertjs@latest/dist/coolalert.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.6/dist/htmx.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/coolalertjs@latest/dist/coolalert.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.6/dist/htmx.min.js"></script>
     <style>
         /* ── Design Tokens ───────────────────────────────────────── */
         :root {
@@ -3606,6 +3756,12 @@ if ($username == null) {
             text-decoration: underline;
         }
 
+        #search-results .search-result-item { cursor: pointer; }
+        #search-results .search-result-item:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+        .search-result-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+        .search-result-label { overflow-wrap: anywhere; }
+        .search-result-path { color: var(--text-muted) !important; }
+
         /* ── Context Menu ────────────────────────────────────────── */
         .context-menu {
             position: fixed;
@@ -3961,6 +4117,9 @@ if ($username == null) {
         </div>
         <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme">Color theme<select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
                 <option value="theme_mix">Theme Mix</option>
+                <option value="tokyo_night">Tokyo Night</option>
+                <option value="night_owl">Night Owl</option>
+                <option value="ayu_dark">Ayu Dark</option>
                 <option value="one_dark">One Dark</option>
                 <option value="nord_dark">Nord Dark</option>
                 <option value="tomorrow_night_eighties">Tomorrow Night 80s</option>
@@ -4247,24 +4406,30 @@ if ($username == null) {
     <div class="modal fade" id="settingsModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog">
             <div class="modal-content">
-                <form hx-post="" hx-trigger="submit" hx-swap="none">
+                <form method="post" id="workspace-settings-form">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="fas fa-cog me-2" style="color:var(--accent)"></i>File Manager
                             Settings</h5>
                     </div>
                     <div class="modal-body">
                         <div class="mb-3">
-                            <label class="form-label">Timezone</label>
-                            <input type="text" class="form-control" name="timezone"
-                                value="<?= htmlspecialchars($config['timezone']) ?>" placeholder="Africa/Lagos"
-                                required>
-                            <input type="hidden" name="action" value="settings">
-                            <div class="form-text">PHP timezone identifier (e.g. Africa/Lagos, UTC)</div>
+                            <label class="form-label" for="settings-timezone">Timezone</label>
+                            <select class="form-select" id="settings-timezone" name="timezone" required aria-describedby="timezone-preview timezone-browser-hint">
+                                <?php foreach (timezone_identifiers_list(DateTimeZone::ALL_WITH_BC) as $zone):
+                                    $offset = (new DateTimeZone($zone))->getOffset(new DateTimeImmutable('now'));
+                                    $offsetLabel = sprintf('UTC%s%02d:%02d', $offset < 0 ? '-' : '+', intdiv(abs($offset), 3600), intdiv(abs($offset) % 3600, 60)); ?>
+                                    <option value="<?= htmlspecialchars($zone, ENT_QUOTES, 'UTF-8') ?>" <?= $config['timezone'] === $zone ? 'selected' : '' ?>><?= htmlspecialchars(str_replace('_', ' ', $zone) . ' (' . $offsetLabel . ')', ENT_QUOTES, 'UTF-8') ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <div class="form-text" id="timezone-preview"></div>
+                            <div class="form-text" id="timezone-browser-hint"></div>
+                            <button type="button" class="btn btn-secondary mt-2" id="use-browser-timezone" hidden>Use browser timezone</button>
+                            <input type="hidden" name="fm_auth_action" value="save_settings">
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Date Format</label>
                             <input type="text" class="form-control" name="dateformat"
-                                value="<?= htmlspecialchars($config['date_format']) ?>" placeholder="M j Y, g:i A"
+                                value="<?= htmlspecialchars($config['date_format']) ?>" placeholder="M j Y, H:i:s"
                                 required>
                             <div class="form-text">PHP date() format string</div>
                         </div>
@@ -4273,6 +4438,14 @@ if ($username == null) {
                             <input type="text" class="form-control" name="fontSize"
                                 value="<?= htmlspecialchars($config['font_size']) ?>" placeholder="14px" required>
                         </div>
+                        <section aria-labelledby="settings-password-heading" style="border-top:1px solid var(--border-subtle);margin-top:16px;padding-top:12px">
+                            <h6 id="settings-password-heading">Change password</h6>
+                            <p class="form-text">Leave all password fields empty to keep your current password.</p>
+                            <label class="form-label" for="current-password">Current password</label><input class="form-control mb-2" type="password" id="current-password" name="current_password" autocomplete="current-password" maxlength="72">
+                            <label class="form-label" for="new-password">New password</label><input class="form-control mb-2" type="password" id="new-password" name="new_password" autocomplete="new-password" minlength="12" maxlength="72">
+                            <label class="form-label" for="confirm-password">Repeat new password</label><input class="form-control mb-3" type="password" id="confirm-password" name="confirm_password" autocomplete="new-password" minlength="12" maxlength="72">
+                        </section>
+                        <p class="form-text mb-0" id="settings-result" role="status" aria-live="polite"></p>
                     </div>
                     <div class="modal-footer">
                         <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
@@ -4284,15 +4457,7 @@ if ($username == null) {
                         </button>
                     </div>
                 </form>
-                <form method="post" id="change-password-form" class="modal-body" style="border-top:1px solid var(--border-subtle)">
-                    <h6>Change password</h6>
-                    <input type="hidden" name="fm_auth_action" value="change_password">
-                    <label class="form-label" for="current-password">Current password</label><input class="form-control mb-2" type="password" id="current-password" name="current_password" autocomplete="current-password" required>
-                    <label class="form-label" for="new-password">New password</label><input class="form-control mb-2" type="password" id="new-password" name="new_password" autocomplete="new-password" minlength="12" maxlength="72" required>
-                    <label class="form-label" for="confirm-password">Repeat new password</label><input class="form-control mb-3" type="password" id="confirm-password" name="confirm_password" autocomplete="new-password" minlength="12" maxlength="72" required>
-                    <button class="btn btn-primary" type="submit">Change password</button>
-                    <p class="form-text" id="password-result" role="status"></p>
-                </form>
+
             </div>
         </div>
     </div>
@@ -4646,19 +4811,72 @@ if ($username == null) {
 
         document.addEventListener('DOMContentLoaded', function() {
 
-            document.getElementById('change-password-form').addEventListener('submit', async event => {
-                event.preventDefault();
-                const form = event.currentTarget;
-                const button = form.querySelector('button');
-                const result = document.getElementById('password-result');
-                button.disabled = true;
+            const settingsForm = document.getElementById('workspace-settings-form');
+            const settingsResult = document.getElementById('settings-result');
+            const timezoneSelect = document.getElementById('settings-timezone');
+            const timezonePreview = document.getElementById('timezone-preview');
+            const timezoneHint = document.getElementById('timezone-browser-hint');
+            const useBrowserTimezone = document.getElementById('use-browser-timezone');
+            let browserTimezone = null;
+            let timezonePreviewTimer = null;
+            try { browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch (_) {}
+            function updateTimezonePreview() {
                 try {
-                    const response = await fetch(location.pathname, {method: 'POST', body: new FormData(form)});
+                    timezonePreview.textContent = 'Current time: ' + new Intl.DateTimeFormat('en-GB', {
+                        timeZone: timezoneSelect.value, year: 'numeric', month: 'short', day: '2-digit',
+                        hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+                    }).format(new Date());
+                } catch (_) { timezonePreview.textContent = 'Time preview is unavailable for this timezone.'; }
+                const supported = browserTimezone && [...timezoneSelect.options].some(option => option.value === browserTimezone);
+                timezoneHint.textContent = !browserTimezone ? 'Your browser did not provide a timezone. Choose one from the list.'
+                    : 'Browser timezone: ' + browserTimezone + (supported ? '. Applied only after Save Settings.' : ' (not supported by this server).');
+                useBrowserTimezone.hidden = !supported || timezoneSelect.value === browserTimezone;
+            }
+            useBrowserTimezone.addEventListener('click', () => {
+                if ([...timezoneSelect.options].some(option => option.value === browserTimezone)) {
+                    timezoneSelect.value = browserTimezone;
+                    updateTimezonePreview();
+                }
+            });
+            timezoneSelect.addEventListener('change', updateTimezonePreview);
+            document.getElementById('settingsModal').addEventListener('show.bs.modal', () => {
+                updateTimezonePreview();
+                clearInterval(timezonePreviewTimer);
+                timezonePreviewTimer = setInterval(updateTimezonePreview, 1000);
+            });
+
+            let settingsSaving = false;
+            settingsForm.addEventListener('submit', async event => {
+                event.preventDefault();
+                if (settingsSaving) return;
+                settingsSaving = true;
+                const buttons = [...settingsForm.querySelectorAll('button')];
+                buttons.forEach(button => { button.disabled = true; });
+                settingsResult.textContent = 'Saving settings…';
+                try {
+                    const response = await fetch(location.pathname, {method: 'POST', body: new FormData(settingsForm)});
                     const data = await response.json();
-                    result.textContent = data.message;
-                    if (response.ok && data.status === 'success') form.reset();
-                } catch (_) { result.textContent = 'Password change was not confirmed. Please try signing in to verify.'; }
-                finally { button.disabled = false; }
+                    settingsResult.textContent = data.message || 'Could not save settings.';
+                    if (response.ok && data.status === 'success') {
+                        settingsForm.querySelectorAll('input:not([type="password"])').forEach(input => { input.defaultValue = input.value; });
+                        settingsForm.querySelectorAll('select').forEach(select => {
+                            const selected = select.value;
+                            [...select.options].forEach(option => { option.defaultSelected = option.value === selected; });
+                            select.value = selected;
+                        });
+                        settingsForm.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
+                        document.documentElement.style.setProperty('--font-size', settingsForm.elements.fontSize.value);
+                        loadFileList();
+                        bootstrap.Modal.getOrCreateInstance(document.getElementById('settingsModal')).hide();
+                    }
+                } catch (_) { settingsResult.textContent = 'Could not confirm saving. Your values remain in the form; reload to check the current settings.'; }
+                finally { settingsSaving = false; buttons.forEach(button => { button.disabled = false; }); }
+            });
+            document.getElementById('settingsModal').addEventListener('hidden.bs.modal', () => {
+                clearInterval(timezonePreviewTimer);
+                settingsForm.reset();
+                settingsForm.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
+                settingsResult.textContent = '';
             });
             document.getElementById('logout-form').addEventListener('submit', async event => {
                 event.preventDefault();
@@ -4810,7 +5028,15 @@ if ($username == null) {
             }
 
             let gitStatusRequest = 0;
-            async function refreshGitStatus() {
+            let gitStatusTimer = null;
+            let gitStatusUnavailable = false;
+            function refreshGitStatus() {
+                if (gitStatusUnavailable) return;
+                clearTimeout(gitStatusTimer);
+                gitStatusTimer = setTimeout(loadGitStatus, 200);
+            }
+            async function loadGitStatus() {
+                if (gitStatusUnavailable) return;
                 const request = ++gitStatusRequest;
                 try {
                     const body = new FormData(); body.append('action','git_status');
@@ -4819,6 +5045,7 @@ if ($username == null) {
                     if (request !== gitStatusRequest) return;
                     document.querySelectorAll('.git-status-badge').forEach(element => element.remove());
                     if (!response.ok || data.status !== 'success') return;
+                    if (data.available === false) { gitStatusUnavailable = true; return; }
                     const appendBadge = (element, path) => {
                         const status = data.files[path.replace(/^\/+/, '')];
                         if (!status) return;
@@ -5446,22 +5673,51 @@ if ($username == null) {
                                 tbody.innerHTML =
                                     `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)">No results found</td></tr>`;
                             } else {
-                                tbody.innerHTML = data.data.map(r => `
-                                <tr class="search-result-item" data-path="${r.path}" style="cursor:pointer">
-                                    <td>${r.icon} ${r.name}</td>
-                                    <td style="font-size:0.75rem;color:var(--text-muted)">${r.path}</td>
-                                    <td>${r.type === 'dir' ? 'Folder' : 'File'}</td>
-                                    <td>${r.size||''}</td>
-                                    <td>${r.last_modified}</td>
-                                </tr>`).join('');
-
-                                document.querySelectorAll('.search-result-item').forEach(row => {
-                                    row.addEventListener('dblclick', function() {
-                                        const p = this.dataset.path;
-                                        navigateTo(p.substring(0, p.lastIndexOf('/')));
-                                        bootstrap.Modal.getInstance(document.getElementById(
-                                            'searchModal')).hide();
+                                tbody.replaceChildren();
+                                data.data.forEach(result => {
+                                    const row = document.createElement('tr');
+                                    row.className = 'search-result-item';
+                                    row.tabIndex = 0;
+                                    row.title = 'Open ' + result.name;
+                                    const nameCell = document.createElement('td');
+                                    const name = document.createElement('span');
+                                    name.className = 'search-result-name';
+                                    const label = document.createElement('span');
+                                    label.className = 'search-result-label';
+                                    label.textContent = result.name;
+                                    name.append(createFileIcon(result.name, result.type === 'dir'), label);
+                                    nameCell.append(name);
+                                    row.append(nameCell);
+                                    [result.path, result.type === 'dir' ? 'Folder' : 'File', result.size || '', result.last_modified].forEach((value, index) => {
+                                        const cell = document.createElement('td');
+                                        cell.textContent = value;
+                                        if (index === 0) cell.className = 'search-result-path';
+                                        row.append(cell);
                                     });
+                                    const openResult = () => {
+                                        if (result.type === 'dir') {
+                                            navigateToPath(result.path);
+                                            if (matchMedia('(max-width: 760px)').matches) document.body.classList.add('mobile-file-list');
+                                        } else {
+                                            const directory = result.path.substring(0, result.path.lastIndexOf('/'));
+                                            openFileEditor(result.name, directory);
+                                        }
+                                    };
+                                    const activateResult = () => {
+                                        const modal = document.getElementById('searchModal');
+                                        if (modal.classList.contains('show')) {
+                                            modal.addEventListener('hidden.bs.modal', openResult, {once: true});
+                                            bootstrap.Modal.getOrCreateInstance(modal).hide();
+                                        } else openResult();
+                                    };
+                                    row.addEventListener('click', activateResult);
+                                    row.addEventListener('keydown', event => {
+                                        if (event.key === 'Enter' || event.key === ' ') {
+                                            event.preventDefault();
+                                            activateResult();
+                                        }
+                                    });
+                                    tbody.append(row);
                                 });
                             }
                         } else {
