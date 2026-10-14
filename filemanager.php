@@ -136,6 +136,7 @@ function fmValidateWorkspaceSettings($data)
     $format = $data['date_format'] ?? null;
     $font = $data['font_size'] ?? null;
     if (!is_string($timezone) || !in_array($timezone, timezone_identifiers_list(DateTimeZone::ALL_WITH_BC), true)) throw new RuntimeException('Select a valid timezone.');
+    try { new DateTimeZone($timezone); } catch (Throwable $error) { throw new RuntimeException('This timezone is not supported by the server.'); }
     if (!is_string($format) || $format === '' || strlen($format) > 128 || !preg_match('//u', $format) || preg_match('/[\x00-\x1f\x7f]/', $format)) throw new RuntimeException('Date format must be 1–128 bytes without control characters.');
     if (!is_string($font) || !preg_match('/^(1[0-9]|2[0-9]|3[0-2])px$/D', $font)) throw new RuntimeException('Font size must be between 10px and 32px.');
     return ['timezone' => $timezone, 'date_format' => $format, 'font_size' => $font];
@@ -425,6 +426,20 @@ $workspaceThemeScript = <<<'JS'
     const saved = localStorage.getItem('ke_theme') || (cookie ? decodeURIComponent(cookie.substring(9)) : 'theme_mix');
     applyPalette(saved);
     document.addEventListener('DOMContentLoaded', () => applyPalette(document.documentElement.dataset.workspaceTheme));
+    document.addEventListener('DOMContentLoaded', () => {
+        setTimeout(() => {
+            const files = document.getElementById('files-list');
+            if (!files || window.fmWorkspaceReady) return;
+            const message = 'The page did not finish initializing. Reload the page; if this continues, check the end of the HTML response and the server PHP error log.';
+            const row = document.createElement('tr');
+            const cell = document.createElement('td');
+            cell.colSpan = 7; cell.style.padding = '20px'; cell.textContent = message;
+            row.append(cell); files.replaceChildren(row);
+            const tree = document.querySelector('#directory-tree .file-tree');
+            if (tree) { const item = document.createElement('li'); item.className = 'tree-message'; item.textContent = 'Page initialization incomplete. Please reload.'; tree.replaceChildren(item); }
+            console.error('Pocket Code Studio: initialization incomplete. The HTML response may be truncated or a required script failed.');
+        }, 1500);
+    });
     window.addEventListener('storage', event => {
         if (event.key === 'ke_theme' && event.newValue) {
             applyPalette(event.newValue);
@@ -4415,10 +4430,8 @@ if ($username == null) {
                         <div class="mb-3">
                             <label class="form-label" for="settings-timezone">Timezone</label>
                             <select class="form-select" id="settings-timezone" name="timezone" required aria-describedby="timezone-preview timezone-browser-hint">
-                                <?php foreach (timezone_identifiers_list(DateTimeZone::ALL_WITH_BC) as $zone):
-                                    $offset = (new DateTimeZone($zone))->getOffset(new DateTimeImmutable('now'));
-                                    $offsetLabel = sprintf('UTC%s%02d:%02d', $offset < 0 ? '-' : '+', intdiv(abs($offset), 3600), intdiv(abs($offset) % 3600, 60)); ?>
-                                    <option value="<?= htmlspecialchars($zone, ENT_QUOTES, 'UTF-8') ?>" <?= $config['timezone'] === $zone ? 'selected' : '' ?>><?= htmlspecialchars(str_replace('_', ' ', $zone) . ' (' . $offsetLabel . ')', ENT_QUOTES, 'UTF-8') ?></option>
+                                <?php foreach (array_unique(array_merge(timezone_identifiers_list(DateTimeZone::ALL), [$config['timezone']])) as $zone): ?>
+                                    <option value="<?= htmlspecialchars($zone, ENT_QUOTES, 'UTF-8') ?>" <?= $config['timezone'] === $zone ? 'selected' : '' ?>><?= htmlspecialchars(str_replace('_', ' ', $zone), ENT_QUOTES, 'UTF-8') ?></option>
                                 <?php endforeach; ?>
                             </select>
                             <div class="form-text" id="timezone-preview"></div>
@@ -4742,7 +4755,7 @@ if ($username == null) {
     <!-- ── Scripts ───────────────────────────────────────────────── -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <script>
-        var SERVER_ROOT_PATH = "<?php echo $config['root_path']; ?>";
+        var SERVER_ROOT_PATH = <?= json_encode($config['root_path'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
     </script>
 
     <div class="modal fade" id="aboutPocketModal" tabindex="-1" aria-labelledby="aboutPocketTitle" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
@@ -4824,7 +4837,7 @@ if ($username == null) {
                 try {
                     timezonePreview.textContent = 'Current time: ' + new Intl.DateTimeFormat('en-GB', {
                         timeZone: timezoneSelect.value, year: 'numeric', month: 'short', day: '2-digit',
-                        hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+                        hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZoneName: 'short'
                     }).format(new Date());
                 } catch (_) { timezonePreview.textContent = 'Time preview is unavailable for this timezone.'; }
                 const supported = browserTimezone && [...timezoneSelect.options].some(option => option.value === browserTimezone);
@@ -6161,6 +6174,7 @@ if ($username == null) {
 
             init();
             restoreWorkspaceTabs();
+            window.fmWorkspaceReady = true;
         });
     </script>
 </body>
