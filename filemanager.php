@@ -86,7 +86,7 @@ function fmUpdatePasswordHash($oldHash, $newHash)
 
 // Read the current hash from disk so OPcache cannot keep an old password valid.
 $authHeader = @file_get_contents(__FILE__, false, null, 0, 8192);
-if ($authHeader === false || preg_match('/^\$authPasswordHash = \'([^\']+)\';$/m', $authHeader, $authMatch) !== 1 || password_get_info($authMatch[1])['algoName'] === 'unknown') fmAuthReply(503, 'Pocket Code Studio is not configured. Set a unique password hash in filemanager.php before use. Access denied.');
+if ($authHeader === false || preg_match('/^\$authPasswordHash = \'([^\']+)\';$/m', $authHeader, $authMatch) !== 1 || password_get_info($authMatch[1])['algoName'] === 'unknown') fmAuthReply(503, 'Authentication is not configured. Access denied.');
 $authPasswordHash = $authMatch[1];
 
 header('Cache-Control: no-store, private');
@@ -97,7 +97,7 @@ $authHTTPS = !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
 $authLocal = in_array($_SERVER['REMOTE_ADDR'] ?? '', ['127.0.0.1', '::1'], true);
 if (!$authHTTPS && !$authLocal) {
     http_response_code(403);
-    die('HTTPS is required for this file manager.');
+    die('HTTPS is required.');
 }
 ini_set('session.use_strict_mode', '1');
 ini_set('session.use_only_cookies', '1');
@@ -137,13 +137,13 @@ if (!$authenticated) {
     if ($isDataRequest) fmAuthReply(401, 'Authentication required.');
     if (!$loginError) http_response_code(401);
     ?>
-<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Pocket Code Studio</title>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in</title>
 <style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#21252b;color:#abb2bf;font:14px system-ui}form{width:min(340px,80vw);padding:28px;background:#282c34;border:1px solid #3b4048;border-radius:8px}h1{font-size:20px;margin:0 0 24px}label{display:block;margin-bottom:8px}input,button{box-sizing:border-box;width:100%;padding:10px;border-radius:4px;font:inherit}input{background:#21252b;color:#abb2bf;border:1px solid #495162}button{margin-top:16px;background:#528bff;color:white;border:0;cursor:pointer}.error{color:#ef596f}small{display:block;margin-top:18px;color:#7f848e}</style></head><body>
 <form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME'], ENT_QUOTES, 'UTF-8') ?>">
-<h1>Pocket Code Studio</h1><input type="hidden" name="fm_auth_action" value="login"><input type="hidden" name="fm_csrf" value="<?= htmlspecialchars($fmCSRFToken, ENT_QUOTES, 'UTF-8') ?>">
+<h1>Sign in</h1><input type="hidden" name="fm_auth_action" value="login"><input type="hidden" name="fm_csrf" value="<?= htmlspecialchars($fmCSRFToken, ENT_QUOTES, 'UTF-8') ?>">
 <label for="login-password">Password</label><input type="password" id="login-password" name="password" autocomplete="current-password" maxlength="72" required autofocus>
 <?php if ($loginError): ?><p class="error" role="alert"><?= htmlspecialchars($loginError, ENT_QUOTES, 'UTF-8') ?></p><?php endif; ?>
-<button type="submit">Sign in</button><small>File access requires authentication.</small></form></body></html>
+<button type="submit">Sign in</button></form></body></html>
 <?php session_write_close(); exit;
 }
 $_SESSION['auth_seen'] = $authNow;
@@ -1127,6 +1127,26 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
         .git-added { background: #33995522; color: var(--text-primary); border-left: 3px solid #43a866; }
         .git-removed { background: #dd445522; color: var(--text-primary); border-left: 3px solid #e06c75; }
         .git-hunk { color: var(--text-link); }
+
+        .mobile-code-keys, #mobile-status-toggle, #mobile-keys-toggle { display: none; }
+        @media (max-width: 760px) {
+            html, body { height: var(--mobile-viewport-height, 100dvh); }
+            #statusbar { min-height: 36px; height: auto; padding: 2px 8px; gap: 4px; flex-wrap: wrap; }
+            .statusbar-left, .statusbar-right { gap: 4px; }
+            #statusbar .statusbar-right > .status-item, #status-selection, #fontSize { display: none !important; }
+            body.mobile-status-details #statusbar .statusbar-right > .status-item { display: flex !important; }
+            body.mobile-status-details #fontSize { display: block !important; }
+            .status-language { max-width: 110px; min-height: 32px; font-size: 13px; }
+            #mobile-status-toggle, #mobile-keys-toggle { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 32px; background: transparent; color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 4px; }
+            .mobile-code-keys { display: flex; gap: 4px; padding: 4px 6px; flex-shrink: 0; background: var(--bg-elevated); overflow-x: auto; }
+            body.mobile-keys-hidden .mobile-code-keys { display: none; }
+            .mobile-code-keys button { flex: 1 0 38px; min-height: 36px; padding: 4px 7px; background: var(--bg-main); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 4px; font: 13px monospace; touch-action: manipulation; }
+            #git-diff-dialog { width: 100vw; max-width: 100vw; max-height: 95%; }
+            #git-diff-output { max-height: 75vh; }
+            #editor .ace_search { left: 0 !important; right: 0 !important; max-width: 100% !important; width: 100%; box-sizing: border-box; font-size: 16px; }
+            #editor .ace_search_field { font-size: 16px; max-width: 55vw; }
+            #editor .ace_searchbtn, #editor .ace_replacebtn { padding: 5px; }
+        }
         /* Fit the editor inside narrow internal tabs. */
         body { display: flex; flex-direction: column; overflow: hidden; }
         #topbar { position: static; height: auto; min-height: 36px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-start; gap: 4px; padding: 4px 8px; }
@@ -1196,6 +1216,12 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
         </div>
     </div>
 
+    <div class="mobile-code-keys" role="toolbar" aria-label="Code keyboard shortcuts">
+        <button type="button" data-code-command="indent" aria-label="Indent">Tab</button><button type="button" data-code-command="outdent" aria-label="Outdent">⇤</button>
+        <button type="button" data-code-text="{">{</button><button type="button" data-code-text="}">}</button>
+        <button type="button" data-code-text="(">(</button><button type="button" data-code-text=")">)</button>
+        <button type="button" data-code-command="undo" aria-label="Undo">↶</button><button type="button" data-code-command="redo" aria-label="Redo">↷</button>
+    </div>
     <!-- ── Status Bar ────────────────────────────────────────────── -->
     <div id="statusbar">
         <div class="statusbar-left">
@@ -1209,6 +1235,8 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
             </span>
         </div>
         <div class="statusbar-right">
+            <button type="button" id="mobile-keys-toggle" aria-label="Toggle code keyboard shortcuts" aria-pressed="true">⌨</button>
+            <button type="button" id="mobile-status-toggle" aria-label="More editor settings" aria-expanded="false">…</button>
             <select class="status-language" id="fontSize" onchange="changeFontSize(this.value)" title="Font size" aria-label="Font size">
                 <option value="12px">12px</option>
                 <option value="13px">13px</option>
@@ -1300,7 +1328,43 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         // Remove Ace's default border
         editor.container.style.lineHeight = '1.6';
 
-        var wrapEnabled = false;
+        const mobileEditorQuery = matchMedia('(max-width: 760px)');
+        var wrapEnabled = mobileEditorQuery.matches;
+        editor.session.setUseWrapMode(wrapEnabled);
+        function editorMobileViewport() {
+            if (window.parent === window && window.visualViewport) document.documentElement.style.setProperty('--mobile-viewport-height', window.visualViewport.height + 'px');
+            editor.resize();
+            if (editor.isFocused()) editor.renderer.scrollCursorIntoView();
+        }
+        new ResizeObserver(() => requestAnimationFrame(editorMobileViewport)).observe(document.getElementById('editor-wrap'));
+        if (window.parent === window && window.visualViewport) {
+            visualViewport.addEventListener('resize', editorMobileViewport);
+            visualViewport.addEventListener('scroll', editorMobileViewport);
+        }
+        document.querySelectorAll('[data-code-command], [data-code-text]').forEach(button => {
+            button.addEventListener('pointerdown', event => event.preventDefault());
+            button.addEventListener('click', () => {
+                editor.focus();
+                if (button.dataset.codeCommand) editor.execCommand(button.dataset.codeCommand);
+                else editor.insert(button.dataset.codeText);
+            });
+        });
+        document.getElementById('mobile-status-toggle').addEventListener('click', event => {
+            const expanded = document.body.classList.toggle('mobile-status-details');
+            event.currentTarget.setAttribute('aria-expanded', String(expanded));
+            editor.resize();
+        });
+        function setMobileKeysHidden(hidden) {
+            document.body.classList.toggle('mobile-keys-hidden', hidden);
+            document.getElementById('mobile-keys-toggle').setAttribute('aria-pressed', String(!hidden));
+            editor.resize();
+        }
+        setMobileKeysHidden(localStorage.getItem('pcs_mobile_keys_hidden') === 'true');
+        document.getElementById('mobile-keys-toggle').addEventListener('click', () => {
+            const hidden = !document.body.classList.contains('mobile-keys-hidden');
+            localStorage.setItem('pcs_mobile_keys_hidden', String(hidden));
+            setMobileKeysHidden(hidden);
+        });
         var isFullscreen = false;
         var hasUnsavedChanges = false;
 
@@ -1632,7 +1696,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         function toggleMinimap() {
             minimap.hidden = !minimap.hidden;
             document.body.classList.toggle('minimap-hidden', minimap.hidden);
-            localStorage.setItem('ke_minimap', String(!minimap.hidden));
+            localStorage.setItem(mobileEditorQuery.matches ? 'ke_minimap_mobile' : 'ke_minimap', String(!minimap.hidden));
 
             editor.resize();
             scheduleMinimap();
@@ -1670,12 +1734,18 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         editor.renderer.on('afterRender', scheduleMinimap);
         editor.renderer.on('themeLoaded', () => { mapColors.clear(); scheduleMinimap(); });
         new ResizeObserver(scheduleMinimap).observe(document.getElementById('editor-wrap'));
-        if (localStorage.getItem('ke_minimap') === 'false') {
-            minimap.hidden = true;
-            document.body.classList.add('minimap-hidden');
-
+        function applyResponsiveEditor() {
+            const mobile = mobileEditorQuery.matches;
+            const saved = localStorage.getItem(mobile ? 'ke_minimap_mobile' : 'ke_minimap');
+            minimap.hidden = saved === 'false' || (mobile && saved !== 'true');
+            document.body.classList.toggle('minimap-hidden', minimap.hidden);
+            wrapEnabled = mobile;
+            editor.session.setUseWrapMode(wrapEnabled);
             editor.resize();
+            scheduleMinimap();
         }
+        mobileEditorQuery.addEventListener('change', applyResponsiveEditor);
+        applyResponsiveEditor();
         scheduleMinimap();
 
         // ── Whole-document overview of selected text occurrences ─────────
@@ -3077,60 +3147,11 @@ if ($username == null) {
         .sidebar-resizer:hover, .sidebar-resizer:focus-visible, body.resizing-sidebar .sidebar-resizer { background: var(--accent); }
         body.resizing-sidebar { cursor: col-resize; user-select: none; }
         body.resizing-sidebar iframe { pointer-events: none; }
-        .sidebar-path-bar {
-            padding: 8px 10px;
-            border-bottom: 1px solid var(--border-subtle);
-            display: flex;
-            gap: 4px;
-        }
-
-        .sidebar-path-bar .form-control {
-            background: var(--bg-elevated);
-            border: 1px solid var(--border-default);
-            color: var(--text-primary);
-            font-size: 0.75rem;
-            padding: 3px 7px;
-            border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-            min-width: 0;
-        }
-
-        .sidebar-path-bar .form-control:focus {
-            background: var(--bg-elevated);
-            border-color: var(--accent);
-            color: var(--text-primary);
-            box-shadow: none;
-            outline: none;
-        }
-
-        .sidebar-path-bar .form-control::placeholder {
-            color: var(--text-muted);
-        }
-
-        .sidebar-path-bar .btn-icon {
-            background: var(--bg-elevated);
-            border: 1px solid var(--border-default);
-            color: var(--text-secondary);
-            padding: 3px 8px;
-            font-size: 0.75rem;
-            cursor: pointer;
-            transition: all 0.15s;
-            white-space: nowrap;
-        }
-
-        .sidebar-path-bar .btn-icon:first-child {
-            border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-            border-right: none;
-        }
-
-        .sidebar-path-bar .btn-icon:last-child {
-            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-        }
-
-        .sidebar-path-bar .btn-icon:hover {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: #fff;
-        }
+        .file-path-control { display: flex; flex: 1 1 180px; min-width: 120px; max-width: 460px; gap: 0; margin: 0 6px; }
+        .file-path-control .form-control { min-width: 0; background: var(--bg-elevated); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 4px 0 0 4px; font-size: 0.78rem; padding: 3px 8px; }
+        .file-path-control .form-control:focus { border-color: var(--accent); box-shadow: none; }
+        .file-path-control .btn-icon { background: var(--bg-elevated); color: var(--text-secondary); border: 1px solid var(--border-default); border-left: 0; border-radius: 0 4px 4px 0; font-size: 0.78rem; padding: 3px 9px; }
+        .file-path-control .btn-icon:hover { background: var(--bg-hover); color: var(--text-primary); }
 
         .collapse-all-btn {
             font-size: 0.72rem;
@@ -3321,6 +3342,48 @@ if ($username == null) {
         }
 
         .git-status-badge { margin-left: 8px; font-size: 0.7rem; font-weight: 600; color: var(--text-link); }
+
+        .mobile-workspace-controls { display: none; }
+        @media (max-width: 760px) {
+            html, body { height: var(--mobile-viewport-height, 100dvh); }
+            .main-toolbar { height: auto; min-height: 46px; padding: 4px 8px; flex-wrap: wrap; gap: 4px; }
+            .mobile-workspace-controls { display: flex; align-items: center; gap: 5px; width: 100%; min-width: 0; }
+            .mobile-workspace-controls button, #mobile-tabs-select { min-height: 38px; border: 1px solid var(--border-default); border-radius: 4px; background: var(--bg-main); color: var(--text-primary); padding: 5px 9px; font: inherit; }
+            #mobile-tabs-select { flex: 1; min-width: 0; max-width: 100%; font-size: 16px; }
+            .toolbar-actions { display: none; flex: 1 0 100%; max-height: 40vh; overflow-y: auto; flex-direction: column; align-items: stretch; }
+            .toolbar-utilities { display: none !important; }
+            body.mobile-menu-open .toolbar-actions { display: flex; }
+            body.mobile-menu-open .toolbar-utilities { display: flex !important; width: 100%; margin: 0; padding: 0; flex-wrap: wrap; }
+            .toolbar-utilities .search-container { flex: 1; min-width: 150px; }
+            .toolbar-utilities #workspace-theme, .toolbar-utilities .input-group .form-control { height: 38px; font-size: 16px; }
+            .toolbar-utilities .btn-search { height: 38px; }
+            .toolbar-actions .menu-heading { width: 100%; text-align: left; min-height: 38px; }
+            .toolbar-actions .dropdown-menu { position: static !important; transform: none !important; width: 100%; border: 0; box-shadow: none; }
+            .toolbar-actions .header-btns { min-height: 40px; font-size: 14px; }
+            .sidebar { width: 100% !important; min-width: 0 !important; max-width: none; }
+            .sidebar-resizer, .workspace { display: none; }
+            body.mobile-editor .sidebar, body.mobile-file-list .sidebar { display: none; }
+            body.mobile-editor .workspace, body.mobile-file-list .workspace { display: flex; width: 100%; min-width: 0; }
+            .file-tree .folder-item { min-height: 42px; font-size: 14px; }
+            .file-path-control .form-control, .modal input, .modal select { font-size: 16px; }
+            .file-path-control { flex-basis: 100%; max-width: none; order: 1; margin: 3px 0 0; }
+            .file-path-control .btn-icon, .file-path-control .form-control { min-height: 38px; }
+            .workspace-tabs { min-width: 0; width: 100%; }
+            .workspace-tab button { min-height: 38px; }
+            .workspace-tab .tab-close { min-width: 36px; }
+            .navigation-bar { flex-wrap: wrap; padding: 4px; gap: 3px; }
+            .navigation-bar a { min-height: 36px; }
+            .file-table th:nth-child(n+5), .file-table td:nth-child(n+5) { display: none; }
+            .file-table .file-name { overflow-wrap: anywhere; }
+            .file-table tbody td { padding: 9px 6px; }
+            .fm-footer { font-size: 10px; }
+            .modal-dialog { margin: 8px; max-width: calc(100vw - 16px); }
+            .modal-content { max-height: calc(var(--mobile-viewport-height, 100dvh) - 16px); }
+            .modal-body { overflow-y: auto; min-height: 0; }
+            .modal .table-responsive { max-height: 50vh; }
+            .modal .btn { min-height: 38px; }
+            #context-menu { max-width: 95vw; max-height: 65vh; overflow-y: auto; }
+        }
         /* Match the editor scrollbar in the file list and explorer. */
         .file-table-wrap, .tree-scroll {
             scrollbar-width: thin;
@@ -3809,7 +3872,13 @@ if ($username == null) {
 
     <!-- ── Main Toolbar ─────────────────────────────────────────── -->
     <div class="main-toolbar">
-        <nav class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><button type="button" class="header-btns" id="menu-show-files">File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled>Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled>Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled>Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled>Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled>Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal">Keyboard shortcuts &amp; help</button></div></div><form method="post" id="logout-form" style="margin-left:8px"><input type="hidden" name="fm_auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form></nav>
+        <div class="mobile-workspace-controls">
+            <button type="button" id="mobile-menu-toggle" aria-controls="mobile-app-menus" aria-expanded="false" aria-label="Application menu">☰</button>
+            <button type="button" id="mobile-files-btn">Files</button>
+            <button type="button" id="mobile-list-btn">List</button>
+            <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
+        </div>
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><button type="button" class="header-btns" id="menu-show-files">File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled>Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled>Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled>Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled>Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled>Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal">Keyboard shortcuts &amp; help</button></div></div><form method="post" id="logout-form" style="margin-left:8px"><input type="hidden" name="fm_auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
                 <option value="theme_mix">Theme Mix</option>
@@ -3848,11 +3917,6 @@ if ($username == null) {
 
         <!-- Sidebar -->
         <div class="sidebar" id="file-sidebar" style="--sidebar-width: <?= max(140, min(700, (int) ($_COOKIE['fm_sidebar_width'] ?? 220))) ?>px">
-            <div class="sidebar-path-bar">
-                <button class="btn-icon" id="breadcrumb-home-btn" title="Home"><i class="fas fa-home"></i></button>
-                <input type="text" class="form-control" id="breadcrumb" placeholder="/path">
-                <button class="btn-icon" id="breadcrumb-search-btn">Go</button>
-            </div>
             <div class="collapse-all-btn" id="collapse-all-btn">
                 <i class="fas fa-compress-alt"></i> Collapse All
             </div>
@@ -3880,6 +3944,10 @@ if ($username == null) {
                 <a href="#" class="nav-links" id="home-btn"><i class="fas fa-home"></i> Home</a>
                 <a href="#" class="nav-links" id="up-btn"><i class="fas fa-level-up-alt"></i> Up</a>
                 <a href="#" class="nav-links" id="reload-btn"><i class="fas fa-sync-alt"></i> Reload</a>
+                <div class="file-path-control" role="group" aria-label="Current folder">
+                    <input type="text" class="form-control" id="breadcrumb" value="/" placeholder="/" aria-label="Current folder path" title="Current folder — enter a path and press Enter" autocomplete="off" spellcheck="false">
+                    <button type="button" class="btn-icon" id="breadcrumb-search-btn" title="Open folder path">Go</button>
+                </div>
                 <a href="#" class="nav-links" id="select-all-btn"><i class="fas fa-check-square"></i> Select All</a>
                 <a href="#" class="nav-links disabled" id="unselect-all-btn"><i class="fas fa-square"></i> Unselect</a>
                 <a href="#" class="nav-links" id="view-trash-btn"><i class="fas fa-trash-alt"></i> Trash</a>
@@ -4612,7 +4680,7 @@ if ($username == null) {
             }
 
             function updateBreadcrumb(path) {
-                document.getElementById('breadcrumb').value = path;
+                document.getElementById('breadcrumb').value = path || '/';
             }
 
             function getMimeType(filename) {
@@ -4996,10 +5064,6 @@ if ($username == null) {
             }
 
             document.getElementById('home-btn').addEventListener('click', e => {
-                e.preventDefault();
-                navigateToPath('');
-            });
-            document.getElementById('breadcrumb-home-btn').addEventListener('click', e => {
                 e.preventDefault();
                 navigateToPath('');
             });
@@ -5410,10 +5474,58 @@ if ($username == null) {
             window.addEventListener('pagehide', saveWorkspaceTabs);
 
 
+            const mobileTabsSelect = document.getElementById('mobile-tabs-select');
+            function refreshMobileTabs() {
+                const placeholder = document.createElement('option');
+                placeholder.value = ''; placeholder.textContent = 'Open files (' + editorTabs.size + ')';
+                mobileTabsSelect.replaceChildren(placeholder);
+                editorTabs.forEach((tab, path) => {
+                    const option = document.createElement('option');
+                    option.value = path;
+                    option.textContent = (tab.dirty ? '● ' : '') + path.split('/').pop();
+                    mobileTabsSelect.append(option);
+                });
+                mobileTabsSelect.value = activeEditorPath || '';
+            }
+            function closeMobileMenu() {
+                document.body.classList.remove('mobile-menu-open');
+                document.getElementById('mobile-menu-toggle').setAttribute('aria-expanded','false');
+                document.querySelectorAll('.toolbar-actions .dropdown-menu.show').forEach(menu => {
+                    const heading = menu.parentElement.querySelector('[data-bs-toggle="dropdown"]');
+                    if (heading && window.bootstrap) bootstrap.Dropdown.getInstance(heading)?.hide();
+                });
+            }
+            mobileTabsSelect.addEventListener('change', () => activateTab(mobileTabsSelect.value || null));
+            document.getElementById('mobile-files-btn').addEventListener('click', () => activateTab(null));
+            document.getElementById('mobile-list-btn').addEventListener('click', () => {
+                activateTab(null);
+                document.body.classList.add('mobile-file-list');
+            });
+            document.getElementById('mobile-menu-toggle').addEventListener('click', event => {
+                const expanded = document.body.classList.toggle('mobile-menu-open');
+                event.currentTarget.setAttribute('aria-expanded',String(expanded));
+            });
+            document.querySelectorAll('.toolbar-actions .header-btns').forEach(button => button.addEventListener('click',closeMobileMenu));
+            document.addEventListener('keydown', event => { if (event.key === 'Escape') closeMobileMenu(); });
+            function resizeMobileWorkspace() {
+                if (window.visualViewport) document.documentElement.style.setProperty('--mobile-viewport-height', visualViewport.height + 'px');
+                const target = editorTabs.get(activeEditorPath)?.frame.contentWindow;
+                requestAnimationFrame(() => { if (target?.editor) { target.editor.resize(); if (target.editor.isFocused()) target.editor.renderer.scrollCursorIntoView(); } });
+            }
+            if (window.visualViewport) {
+                visualViewport.addEventListener('resize', resizeMobileWorkspace);
+                visualViewport.addEventListener('scroll', resizeMobileWorkspace);
+            }
+            window.addEventListener('resize', resizeMobileWorkspace);
+            resizeMobileWorkspace();
             function activateTab(path) {
+                document.body.classList.toggle('mobile-editor', path !== null);
+                document.body.classList.remove('mobile-file-list');
+                closeMobileMenu();
                 activeEditorPath = path;
                 scheduleSaveTabs();
                 updateEditorMenu();
+                refreshMobileTabs();
                 filesPanel.hidden = path !== null;
                 filesTab.setAttribute('aria-selected', String(path === null));
                 filesTab.parentElement.classList.toggle('active', path === null);
@@ -5474,6 +5586,7 @@ if ($username == null) {
                         tab.dirty = dirty;
                         tab.dot.hidden = !dirty;
                         tab.close.title = dirty ? 'Close — unsaved changes' : 'Close';
+                        refreshMobileTabs();
                     }
                 });
             };
@@ -5526,6 +5639,7 @@ if ($username == null) {
                     const keys = [...editorTabs.keys()];
                     const index = keys.indexOf(path);
                     editorTabs.delete(path);
+                    refreshMobileTabs();
                     element.remove();
                     frame.remove();
                     scheduleSaveTabs();
@@ -5539,6 +5653,7 @@ if ($username == null) {
                     if (!source) {
                         if (frame.contentDocument.body.textContent.trim() === 'Invalid file specified.') {
                             editorTabs.delete(path);
+                            refreshMobileTabs();
                             element.remove();
                             frame.remove();
                             if (activeEditorPath === path) activateTab(null);
