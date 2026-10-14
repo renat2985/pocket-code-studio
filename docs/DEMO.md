@@ -28,4 +28,4 @@ Description:
 
 Suggested topics: `php`, `file-manager`, `code-editor`, `self-hosted`, `single-file`, `web-editor`, `ace-editor`, `git-diff`.
 
-Enable Issues. Upload the source with the documented initial password, both READMEs, license/credits/notices, docs, tests, and tools. The legacy `logo.png`, `icon.png`, and old screenshots are not used by the new README or application and need not be included. Do not upload a copy containing a personal deployment password or runtime files.
+Enable Issues. Upload the source with the documented initial password, both READMEs, license/credits/notices, docs, screenshots, tests, and tools. Do not upload a copy containing a personal deployment password or runtime files.

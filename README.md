@@ -99,17 +99,6 @@ Ace, Prettier and its PHP plugin, Bootstrap, Font Awesome, CoolAlert, and HTMX c
 
 Pocket Code Studio additions are MIT-licensed; see [LICENSE](LICENSE). The original file-manager README declares MIT but its repository did not contain a separate license file when checked. That provenance limitation is documented in the notices rather than silently inventing an upstream license file.
 
-## Development and checks
-
-```sh
-php -l filemanager.php
-python3 tests/authentication.py
-python3 tests/editor_save.py
-python3 tests/git_readonly.py
-```
-
-Tests use temporary application copies and require PHP, Node.js for embedded JavaScript syntax checks, Python 3, and local listening sockets. Git HTTP tests use a deterministic Git stub; they do not verify compatibility with a real Git installation.
-
 ## Support and contributions
 
 Report reproducible issues and feature requests in [GitHub Issues](https://github.com/Renat2985/pocket-code-studio/issues). Never include passwords, session cookies, private file contents, or a configured deployment copy.
