@@ -1537,7 +1537,10 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         });
         editor.setTheme("ace/theme/theme_mix");
         editor.session.setMode("ace/mode/<?= $editorMode ?>");
+        // Ace 1.4.12 includes multi_select: Ctrl-click (Cmd-click on macOS), Escape to exit.
+        ace.require('ace/multi_select');
         editor.setOptions({
+            enableMultiselect: true,
             enableBasicAutocompletion: true,
             enableSnippets: true,
             enableLiveAutocompletion: true,
@@ -4254,7 +4257,7 @@ if ($username == null) {
             <div class="modal-header"><h5 class="modal-title" id="editorHelpTitle">Editor help</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
             <div class="modal-body">
                 <p>Click a folder in the sidebar to expand it; click a file to open an editor tab. Drag the sidebar border to resize it.</p>
-                <p><strong>Ctrl / ⌘ S</strong> — Save<br><strong>Ctrl / ⌘ Z</strong> — Undo<br><strong>Ctrl H</strong> — Find / Replace<br><strong>Shift Alt F</strong> — Format<br><strong>F11</strong> — Fullscreen</p>
+                <p><strong>Ctrl / ⌘ S</strong> — Save<br><strong>Ctrl / ⌘ Z</strong> — Undo<br><strong>Ctrl / ⌘ + click</strong> — Add cursor<br><strong>Escape</strong> — Return to one cursor<br><strong>Ctrl H</strong> — Find / Replace<br><strong>Shift Alt F</strong> — Format<br><strong>F11</strong> — Fullscreen</p>
                 <p>Choose a color theme in View. Use View to toggle the minimap and word wrap. Unsaved tabs show a dot.</p>
             </div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>

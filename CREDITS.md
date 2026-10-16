@@ -16,3 +16,7 @@ Pocket Code Studio adds the single-file workspace, internal tabs and restoration
 - [HTMX](https://github.com/bigskysoftware/htmx): existing client dependency.
 
 The interface is inspired by Visual Studio Code. Pocket Code Studio is an independent project and is not affiliated with, endorsed by, or built on Microsoft Visual Studio Code. Its application favicon is an original simple code-brackets design.
+
+## Additional dark theme palettes
+
+Pocket Code Studio includes Ace adaptations of [Tokyo Night](https://github.com/enkia/tokyo-night-vscode-theme) by Enkia, [Night Owl](https://github.com/sdras/night-owl-vscode-theme) by Sarah Drasner, and [Ayu Dark](https://github.com/ayu-theme/vscode-ayu) from the Ayu project. Token colors are mapped to Ace scopes; exact semantic highlighting may differ from Visual Studio Code. The palettes also style the workspace. All three upstream MIT license notices are retained in the application source and `docs/*-LICENSE.txt`.

@@ -1,125 +1,66 @@
 # Pocket Code Studio
 
-**Your server files. A familiar coding workspace. One PHP file.**
+A single-file PHP file manager and code editor with a Visual Studio Code-inspired interface.
 
-A self-hosted PHP file manager and browser-based code editor with a Visual Studio Code-inspired interface. Upload `filemanager.php`, sign in and change the initial password, and manage your website through your browser.
+[Русский](README.ru.md) · [Issues](https://github.com/Renat2985/pocket-code-studio/issues)
 
-[Русская версия](README.ru.md) · [Setup](#quick-start) · [Security](#security-and-file-saving) · [Credits](CREDITS.md) · [Report an issue](https://github.com/Renat2985/pocket-code-studio/issues)
-
-![Pocket Code Studio — file explorer and code editor](screenshots/screen.png)
-
-## Why Pocket Code Studio?
-
-- **One application file:** no database, Composer, Node.js build, or application installation wizard.
-- **Familiar workspace:** file tree, internal tabs, compact File / Edit / View / Tools / Help menus, minimap, and status bar.
-- **Themes across the interface:** editor, file list, menus, dialogs, and scrollbars follow the selected palette.
-- **Careful file saving:** revision checks, verified writes, and a private backup before replacing an edited file.
-- **Read-only Git tools:** see changed files and compare editor text with the latest commit.
-
-The application is independent of Microsoft. It uses Ace, not the Visual Studio Code engine, and does not run VS Code extensions.
+![Pocket Code Studio](screenshots/screen.png)
 
 ## Features
 
-| Area | Included |
-| --- | --- |
-| Workspace | Internal editor tabs; unsaved indicators and discard confirmation; tab/order/active-file restoration with cursor and scroll position in a bounded cookie |
-| Explorer | Expandable folders; resizable sidebar with width stored in a cookie; file search, sorting, selection, context menus |
-| Editing | Syntax highlighting; language selection in the status bar; font size; undo/redo; find/replace; word wrap; copy document text; formatting for supported languages |
-| Navigation | Syntax-colored minimap with click/drag navigation; selected-text occurrence markers; keyboard shortcuts |
-| Appearance | Theme Mix, Tokyo Night, Night Owl, Ayu Dark, One Dark, Nord Dark, Tomorrow variants, Cobalt, Monokai, Dracula, GitHub variants, Kuroir; themed menus, popups, and scrollbars |
-| Icons | Embedded Material Icon Theme SVGs for common file types and named folders; embedded Seti fallback icons |
-| File operations | Create, rename, copy, move, upload, download, trash/restore, permissions, compression/extraction where server capabilities permit |
-| Git | `M` modified, `U` untracked, `A` added; comparison against HEAD including unsaved editor text; added/deleted lines highlighted in a dialog |
-| Authentication | Password hash in the PHP file; change password through Settings; protected requests; CSRF tokens; session expiry; login attempt limits |
-| Mobile | Full-width explorer/editor switching; compact menu; open-file selector; hideable code shortcut row; keyboard-aware viewport |
+- File tree, resizable sidebar, tabs, and restoration of cursor/scroll positions.
+- Syntax highlighting, find/replace, formatting, word wrap, and multi-cursor editing.
+- Minimap, occurrence markers, file icons, and themes for the entire interface.
+- Create, rename, copy, move, upload/download, trash/restore, permissions, and archives where supported.
+- Read-only Git status and comparison with HEAD, including unsaved changes.
+- Mobile layout with compact menus and code shortcut buttons.
+- Password authentication, CSRF protection, login attempt limits, and verified saves with backups.
 
 ## Requirements
 
-- PHP **7.4+** with sessions and standard filesystem/hash/JSON functions; a maintained PHP release is recommended.
-- Apache, Nginx, or another PHP-capable server. HTTPS is required except for loopback development.
-- A writable workspace and private writable PHP temporary/session storage.
-- Internet access in the browser for the current CDN-loaded JavaScript/CSS dependencies. **Single-file deployment does not mean fully offline.**
-- Optional: Git on the server PATH and enabled PHP `proc_open` for Git status/comparison.
-- Optional: archive extensions/tools appropriate to the archive format. Availability depends on the host.
+- PHP **7.4+**, sessions, and writable workspace and temporary storage. A maintained PHP version is recommended.
+- HTTPS; loopback development is exempt. On Apache/Nginx, PHP must receive `HTTPS=on` for TLS requests.
+- Browser internet access: JavaScript/CSS libraries load from CDNs.
+- Optional: Git and PHP `proc_open`; appropriate extensions/tools for archives.
 
-## Quick start
+No database, Composer, or Node.js build is required.
 
-1. Download `filemanager.php` from this repository. It is the **only application file** to upload.
-2. The initial password is **`admin123`**. Sign in and immediately change it through **File → Settings → Change password** before making the manager publicly accessible. The file stores a hash, not the plain password. There is no username field.
+## Installation
 
-   For a unique password before deployment, generate a hash locally and replace `$authPasswordHash` near the beginning of the PHP file:
+1. Upload **`filemanager.php`** — no other application files are needed.
+2. Check `$config['root_path']`: by default, it is the web server document root.
+3. Open the file over HTTPS. The initial password is **`admin123`**, with no username.
+4. Immediately change it in **File → Settings** before allowing public access to the manager.
 
-   ```sh
-   php -r 'echo password_hash(readline("New password (input is visible): "), PASSWORD_DEFAULT), PHP_EOL;'
-   ```
-
-   Do not commit your personal deployment hash to the public repository.
-
-3. Review `$config['root_path']`. By default it uses the web server document root. Restrict it to the directory you intend to administer.
-4. Upload the configured PHP file. Grant the web-server account only the filesystem access it needs.
-5. Open it over HTTPS and sign in with the password used in step 2.
-
-On Apache/Nginx TLS deployments, PHP must receive the correct `HTTPS=on` server setting. Arbitrary client forwarding headers are not trusted.
-
-Local development example, with the initial password or your own configured password:
+For a unique password before deployment, generate a hash locally and paste it into `$authPasswordHash`:
 
 ```sh
-php -S 127.0.0.1:8080
+php -r 'echo password_hash(readline("New password (input is visible): "), PASSWORD_DEFAULT), PHP_EOL;'
 ```
 
-Open `http://127.0.0.1:8080/filemanager.php`. Change the password later through **File → Settings → Change password**. This requires the web-server account to be able to replace `filemanager.php`; failure leaves the previous password intact.
+Keep your personal password hash and settings when replacing the PHP file. Do not publish your configured deployment copy.
 
-## Working with files
+## Controls and settings
 
-Expand folders in the left explorer and click a file to open an internal tab. Resize the sidebar by dragging its boundary. Tabs and cursor positions are restored after reload; **unsaved document contents are not stored in cookies**.
+- **Ctrl/⌘ S:** save. **Ctrl/⌘ + click:** add cursors. **Escape:** return to one cursor.
+- **View → Color theme:** choose a theme. Language and editor font size are in the bottom status bar.
+- **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.
+- **Save Settings** saves all changes together; **Cancel** discards them. Leave password fields empty to keep the current password.
 
-Use **File → Save** or Ctrl/⌘ S to save, **Edit → Find / Replace** to search, and **View** to toggle the minimap or word wrap. Formatting is an explicit **Tools → Format document** action; saving does not automatically format code. Language and font size are selected in the bottom status bar. Choose the interface theme under **View → Color theme**. File search is centered in the top bar; **Sign out** is at the far right.
+Settings are stored in `filemanager.php`; PHP needs permission to replace it. Legacy `.fm-config` values migrate on the next Settings save.
 
-## Saved settings
+## Important limits
 
-The timezone dropdown shows UTC offsets and a live time preview. The browser-detected timezone is offered through **Use browser timezone**, never applied automatically. Confirm the choice with **Save Settings**, or use **Cancel** to discard it.
+- Only requests through this manager are password-protected; public website URLs remain public.
+- The editor accepts UTF-8 text up to **8 MB**. Binary files, mixed line endings, and hard links are refused. UTF-8 BOM and uniform LF/CRLF/CR endings are preserved.
+- Saves check disk revisions and create verified private backups. Temporary backups may be cleared by the host and do not replace permanent backups. External writes can still race with saves; filesystem ACLs/extended attributes may not survive replacement.
+- Saving does not validate code syntax. Unsaved document text is not restored after reload.
+- Git requires the workspace root to match the repository root. No commits, resets, branch switching, or inline Git change bars are provided.
 
-Settings and the optional password change share one form and the **Cancel / Save Settings** buttons. Leave all password fields empty to keep the current password. If changing it, supply the current password and matching new passwords. All values are validated before a single configuration replacement; an invalid field leaves both settings and password unchanged. Cancel discards the form edits. Saving does not reload the workspace or discard open editor changes.
+## Credits and support
 
-**File → Settings** stores the timezone, PHP date format, and interface font size directly in `filemanager.php`, alongside the password configuration. Values are held as base64-encoded JSON data, not executable PHP. Font size accepts 10px–32px; timezones and date formats are validated before saving.
+Based on [Joseph Chuks’ PHP File Manager](https://github.com/JosephChuks/php-file-manager-with-code-editor) and [CWP Code Editor](https://github.com/JosephChuks/cwp-codeEditor). Powered by Ace. Independent of Microsoft; VS Code extensions are not supported.
 
-Saving settings requires permission to replace the application file. Password and settings updates share a lock and use a verified private backup, checked temporary file, and atomic replacement. If writing fails, the original remains intact. Keep a separate copy of your personal settings and password configuration when upgrading the application.
+[Credits](CREDITS.md) · [License](LICENSE) · [Third-party notices and upstream license details](THIRD_PARTY_NOTICES.md)
 
-Existing `.fm-config` files are read for compatibility until settings are saved in the PHP file. The next successful Settings save migrates the effective values into `filemanager.php`; no new `.fm-config` is created. The old file is left untouched and can be removed after confirming the migrated settings.
-
-## Mobile layout
-
-On screens up to 760 px wide, **Files** opens the full-width explorer, **List** opens the file table, and an editor tab fills the available width. The compact **☰** menu contains the existing actions, theme selector, and file search. Open files remain accessible through horizontal tabs and a dropdown; returning to the explorer preserves its scroll position.
-
-Mobile editors default to word wrap and a hidden minimap; the mobile minimap preference is stored separately from the desktop preference. A hideable shortcut row provides Tab, outdent, braces, parentheses, undo, and redo. Use **⌨** to toggle it and **…** in the status bar to show additional editor settings. Viewport resize events adjust the workspace when the on-screen keyboard opens and keep the focused cursor in view. Dialogs and editor search fit the narrow layout. Desktop navigation remains available on wider screens.
-
-## Git comparison
-
-The configured workspace root must also be the Git repository root. File lists show status badges; open a file and choose **Tools → Git: View changes against HEAD** for a unified comparison with the latest commit, including unsaved text. New files are compared with an empty document.
-
-This integration exposes **no stage, commit, checkout, reset, push, or pull actions**. If Git or `proc_open` is unavailable, file browsing still works and the comparison dialog displays an explanation. Parent repositories and inline change bars in the code gutter are not currently supported.
-
-## Security and file saving
-
-All access **through `filemanager.php`** requires authentication: listings, searches, downloads, uploads, editor reads, and writes. This deliberately leaves the ordinary public website public; direct URLs are governed by your web server configuration.
-
-- The PHP file stores a `password_hash()` result. Sessions regenerate on login/password change; changing the password invalidates other sessions.
-- Cookies use HttpOnly, SameSite=Strict, and Secure over HTTPS. Sessions expire after 30 minutes idle or 12 hours total.
-- Every POST requires a session-bound CSRF token. Mutating requests via GET are refused. Login attempts are limited per address and globally.
-- Saves verify the submitted byte count and SHA-256 disk revision. A revision conflict blocks replacement and leaves editor text available.
-- Before replacing a changed file, a private backup is verified outside the web root. New bytes are written and verified in a sibling temporary file before rename. Editor saves are serialized.
-- UTF-8 BOM and uniform LF/CRLF/CR endings are preserved. Binary/non-UTF-8 text, mixed line endings, hard links, and files above 8 MB are refused by the editor.
-
-Private runtime backups are stored under `sys_get_temp_dir()/fm-editor-<workspace hash>/`; authentication state uses a separate private temporary directory. Hosts may clean temporary storage. These backups are **not a substitute for permanent backups**. External writers that ignore the editor lock can still race with replacement; filesystem-specific ACLs and extended attributes may not survive replacement. Saving does not validate the syntax of your code.
-
-## Dependencies and licensing
-
-Ace, Prettier and its PHP plugin, Bootstrap, Font Awesome, CoolAlert, and HTMX currently load from CDNs. Icons and their associations are embedded. Attribution and license details are in [CREDITS.md](CREDITS.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-Pocket Code Studio additions are MIT-licensed; see [LICENSE](LICENSE). The original file-manager README declares MIT but its repository did not contain a separate license file when checked. That provenance limitation is documented in the notices rather than silently inventing an upstream license file.
-
-## Support and contributions
-
-Report reproducible issues and feature requests in [GitHub Issues](https://github.com/Renat2985/pocket-code-studio/issues). Never include passwords, session cookies, private file contents, or a configured deployment copy.
-
-For installation help or custom development, contact [Renat2985](https://github.com/Renat2985). Pull requests are welcome; keep deployment to one PHP file and preserve existing file-saving and authentication protections.
+Bugs and requests: [GitHub Issues](https://github.com/Renat2985/pocket-code-studio/issues). Installation and custom development: [Renat2985](https://github.com/Renat2985).
