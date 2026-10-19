@@ -42,6 +42,8 @@ Keep your personal password hash and settings when replacing the PHP file. Do no
 
 ## Controls and settings
 
+**Edit → Copy / Move / Rename / Delete** applies to the active editor file, or to selected items in Files. Save unsaved editor changes before using these operations.
+
 - **Ctrl/⌘ S:** save. **Ctrl/⌘ + click:** add cursors. **Escape:** return to one cursor.
 - **View → Color theme:** choose a theme. Language and editor font size are in the bottom status bar.
 - **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.

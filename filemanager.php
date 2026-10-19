@@ -410,11 +410,31 @@ $workspaceThemeScript = <<<'JS'
             if (typeof frame.contentWindow.applySelectedTheme === 'function') frame.contentWindow.applySelectedTheme(theme);
         });
     };
-    window.workspaceAlert = function(message, title = 'Editor') {
-        if (window.parent !== window && typeof window.parent.workspaceAlert === 'function') return window.parent.workspaceAlert(message, title);
-        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title, text: String(message), icon: 'info', showCancelButton: false, confirmButtonText: 'OK'});
+    window.workspaceAlert = function(message, title = 'Editor', icon = /error|failed/i.test(title) ? 'error' : 'info') {
+        if (window.parent !== window && typeof window.parent.workspaceAlert === 'function') return window.parent.workspaceAlert(message, title, icon);
+        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title, text: String(message), icon, showCancelButton: false, confirmButtonText: 'OK'});
         window.alert(message);
         return Promise.resolve({isConfirmed: true});
+    };
+    window.workspaceToast = function(message, title = 'Saved', type = 'success') {
+        if (window.parent !== window && typeof window.parent.workspaceToast === 'function') return window.parent.workspaceToast(message, title, type);
+        if (typeof CoolAlert !== 'undefined') {
+            try { return CoolAlert.show({toast: true, icon: type, title, text: String(message)}); } catch (_) {}
+        }
+        let toast = document.getElementById('save-toast');
+        if (!toast) { toast = document.createElement('div'); toast.id = 'save-toast'; document.body.append(toast); }
+        toast.classList.add('workspace-toast');
+        toast.dataset.type = type;
+        toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+        toast.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
+        const icon = document.createElement('i');
+        icon.className = 'fas ' + ({success: 'fa-check-circle', error: 'fa-times-circle', warning: 'fa-exclamation-triangle', info: 'fa-info-circle'}[type] || 'fa-info-circle'); icon.setAttribute('aria-hidden', 'true');
+        const text = document.createElement('span'); text.textContent = title + ': ' + String(message);
+        toast.replaceChildren(icon, text);
+        clearTimeout(window.workspaceToastTimer);
+        toast.style.display = 'flex';
+        window.workspaceToastTimer = setTimeout(() => { toast.style.display = 'none'; }, type === 'success' ? 2500 : 5000);
+        return Promise.resolve();
     };
     window.workspaceConfirm = function(message) {
         if (window.parent !== window && typeof window.parent.workspaceConfirm === 'function') return window.parent.workspaceConfirm(message);
@@ -464,6 +484,11 @@ $workspaceThemeScript = <<<'JS'
         /* Avoid browser zoom while typing in mobile dialogs. */
         .modal :is(input.form-control, textarea.form-control, select.form-select) { font-size: 16px !important; }
     }
+    .workspace-toast { position: fixed; top: 48px; right: 16px; max-width: min(380px, calc(100vw - 32px)); padding: 12px 16px; gap: 10px; align-items: center; z-index: 9999; background: var(--bg-main); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 6px; box-shadow: 0 8px 32px #00000040; font: 400 var(--workspace-ui-font-size)/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .workspace-toast > i { color: var(--accent-success); }
+    .workspace-toast[data-type="error"] > i { color: var(--accent-danger); }
+    .workspace-toast[data-type="warning"] > i { color: var(--accent-warning); }
+    .workspace-toast[data-type="info"] > i { color: var(--accent); }
     /* Shared floating surfaces follow the workspace theme, including light palettes. */
     .modal { --bs-body-color: var(--text-primary); --bs-body-bg: var(--bg-main); --bs-border-color: var(--border-default); }
     .modal .table {
@@ -770,6 +795,45 @@ if (!$editorRoot || !$filename || !is_file($filename) || ($filename !== $editorR
     die('Invalid file specified.');
 }
 header('Cache-Control: no-store');
+$imageTypes = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'bmp' => 'image/bmp', 'ico' => 'image/x-icon', 'avif' => 'image/avif', 'svg' => 'image/svg+xml'];
+$imageExtension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+if (isset($imageTypes[$imageExtension])) {
+    if ($isEditorSave) editorReply(405, 'error', 'Images are available for preview only.');
+    if (!is_readable($filename)) { http_response_code(403); die('Cannot read image.'); }
+    if (isset($_GET['image'])) {
+        header('Content-Type: ' . $imageTypes[$imageExtension]);
+        header('X-Content-Type-Options: nosniff');
+        header("Content-Security-Policy: sandbox; default-src 'none'; style-src 'unsafe-inline'");
+        readfile($filename);
+        exit;
+    }
+    $imageName = htmlspecialchars(basename($filename), ENT_QUOTES, 'UTF-8');
+    $imageURL = htmlspecialchars('?editor=1&image=1&filename=' . rawurlencode($filename), ENT_QUOTES, 'UTF-8');
+    ?>
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title><?= $imageName ?> — Image preview</title>
+<?= $workspaceThemeScript ?>
+<style>
+html,body { margin:0; height:100%; background:var(--bg-deep); color:var(--text-primary); font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+body { display:flex; flex-direction:column; }
+header { padding:10px 16px; background:var(--bg-main); border-bottom:1px solid var(--border-default); overflow-wrap:anywhere; }
+main { flex:1; min-height:0; overflow:auto; display:flex; align-items:center; justify-content:center; padding:20px; }
+img { display:block; max-width:100%; max-height:100%; object-fit:contain; background:repeating-conic-gradient(#ffffff14 0% 25%,transparent 0% 50%) 0/20px 20px; }
+#image-error { color:var(--accent-danger); }
+</style></head><body><header><?= $imageName ?> <span id="image-size"></span></header>
+<main><img id="image-preview" src="<?= $imageURL ?>" alt="<?= $imageName ?>"><p id="image-error" hidden>Cannot display this image. The file may be damaged or its format is not supported by your browser.</p></main>
+<script>
+const preview = document.getElementById('image-preview');
+function imageLoaded() { document.getElementById('image-size').textContent = ' · ' + preview.naturalWidth + ' × ' + preview.naturalHeight; }
+preview.addEventListener('load', imageLoaded);
+preview.addEventListener('error', () => { preview.hidden = true; preview.style.display = 'none'; document.getElementById('image-error').hidden = false; });
+if (preview.complete && preview.naturalWidth) imageLoaded();
+window.fmImagePreview = true;
+</script></body></html>
+    <?php
+    exit;
+}
 $maxEditorBytes = 8 * 1024 * 1024;
 if ($isEditorSave) {
     $payloadLimit = 12 * 1024 * 1024;
@@ -1239,24 +1303,7 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
         }
 
         /* ── Save notification toast ─────────────────────────────── */
-        #save-toast {
-            position: fixed;
-            top: 56px;
-            right: 16px;
-            background: var(--bg-elevated);
-            border: 1px solid var(--accent-success);
-            border-radius: var(--radius-md);
-            color: var(--accent-success);
-            padding: 8px 16px;
-            font-size: 0.8rem;
-            font-weight: 600;
-            display: none;
-            align-items: center;
-            gap: 8px;
-            z-index: 9999;
-            box-shadow: var(--shadow-lg);
-            animation: slideIn 0.2s ease;
-        }
+        #save-toast { display: none; animation: slideIn 0.2s ease; }
 
         @keyframes slideIn {
             from {
@@ -1395,7 +1442,7 @@ $lineCount = substr_count(file_get_contents($filename), "\n") + 1;
     </div>
 
     <!-- ── Save Toast ────────────────────────────────────────────── -->
-    <div id="save-toast">
+    <div id="save-toast" class="workspace-toast" role="status" aria-live="polite">
         <i class="fas fa-check-circle"></i> File saved successfully
     </div>
 
@@ -1701,10 +1748,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
                 hasUnsavedChanges = editor.getValue() !== savedEditorValue;
                 notifyWorkspace();
                 document.title = (hasUnsavedChanges ? '● ' : '') + editorFilename + ' — Pocket Code Studio';
-                const toast = document.getElementById('save-toast');
-                toast.innerHTML = '<i class="fas fa-check-circle"></i> File saved and verified';
-                toast.style.display = 'flex';
-                setTimeout(() => { toast.style.display = 'none'; }, 2000);
+                window.workspaceToast('File saved and verified.', 'Saved');
                 const savedEl = document.getElementById('status-saved');
                 savedEl.style.display = 'flex';
                 setTimeout(() => { savedEl.style.display = 'none'; }, 3000);
@@ -1778,17 +1822,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         // ── Copy all ──────────────────────────────────────────────────
         function copyAll() {
             navigator.clipboard.writeText(editor.getValue()).then(() => {
-                const toast = document.getElementById('save-toast');
-                toast.innerHTML = '<i class="fas fa-check-circle"></i> Copied to clipboard';
-                toast.style.borderColor = 'var(--accent)';
-                toast.style.color = 'var(--text-link)';
-                toast.style.display = 'flex';
-                setTimeout(() => {
-                    toast.style.display = 'none';
-                    toast.innerHTML = '<i class="fas fa-check-circle"></i> File saved successfully';
-                    toast.style.borderColor = 'var(--accent-success)';
-                    toast.style.color = 'var(--accent-success)';
-                }, 1800);
+                window.workspaceToast('Copied to clipboard.', 'Copied');
             });
         }
 
@@ -3494,6 +3528,7 @@ if ($username == null) {
         #workspace-theme { max-width: 130px; background: var(--bg-elevated); color: var(--text-primary); }
         .menu-heading { background: transparent; border: 0; border-radius: 4px; padding: 3px 8px; color: var(--text-primary); font-size: var(--workspace-ui-font-size); }
         .menu-heading:hover, .menu-heading[aria-expanded="true"] { background: var(--bg-hover); }
+        .toolbar-more .header-btns > i, .workspace-theme-choice > span > i { width: 16px; flex: 0 0 16px; text-align: center; font-size: var(--workspace-ui-font-size); }
         .menu-shortcut { margin-left: auto; padding-left: 20px; font-size: 0.7rem; color: var(--text-muted); }
         .editor-menu-action:disabled { opacity: 0.45; cursor: default; }
         .toolbar-more .dropdown-divider { border-color: var(--border-subtle); }
@@ -4098,12 +4133,6 @@ if ($username == null) {
             display: inline;
         }
 
-        /* CoolAlert override */
-        .cool-alert-toast {
-            background-color: var(--bg-elevated) !important;
-            color: var(--text-primary) !important;
-        }
-
         /* Empty state */
         .empty-state {
             text-align: center;
@@ -4133,7 +4162,7 @@ if ($username == null) {
             <button type="button" id="mobile-list-btn">List</button>
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled>Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal">Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled>Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled>Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled>Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled>Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme">Color theme<select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" title="Workspace theme" aria-label="Workspace theme" onchange="setWorkspaceTheme(this.value)">
                 <option value="theme_mix">Theme Mix</option>
                 <option value="tokyo_night">Tokyo Night</option>
                 <option value="night_owl">Night Owl</option>
@@ -4149,7 +4178,7 @@ if ($username == null) {
                 <option value="github">GitHub Light</option>
                 <option value="tomorrow">Tomorrow</option>
                 <option value="kuroir">Kuroir</option>
-            </select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files">File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled>Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled>Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled>Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled>Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled>Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal">Keyboard shortcuts &amp; help</button></div></div></nav>
+            </select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
@@ -5197,6 +5226,10 @@ if ($username == null) {
                     'restore-btn': n > 0 && inTrash,
                     'unselect-all-btn': n > 0,
                 };
+                if (activeEditorPath !== null) {
+                    const ready = !!editorTabs.get(activeEditorPath)?.frame.contentWindow.editor;
+                    ['copy-btn', 'move-btn', 'rename-btn', 'delete-btn'].forEach(id => { states[id] = ready; });
+                }
                 Object.entries(states).forEach(([id, on]) => {
                     document.getElementById(id)?.classList.toggle('disabled', !on);
                 });
@@ -5301,28 +5334,14 @@ if ($username == null) {
 
             // ── Alert ─────────────────────────────────────────────────
             function showAlert(title, message, confirm = null) {
+                const type = title === 'Success' ? 'success' : title === 'Error' ? 'error' : 'warning';
                 if (confirm !== null) {
-                    CoolAlert.show({
-                        title: title,
-                        text: message,
-                        icon: "success",
-                        confirmButtonText: "Ok",
-                        showCancelButton: false,
-                    }).then((result) => {
-                        if (result.isConfirmed) {
-                            window.location.reload();
-                        }
+                    window.workspaceAlert(message, title, type).then(result => {
+                        if (result.isConfirmed) window.location.reload();
                     });
-
                 } else {
-                    CoolAlert.show({
-                        toast: true,
-                        icon: title === 'Error' ? 'error' : 'success',
-                        title,
-                        text: message
-                    });
+                    window.workspaceToast(message, title, type);
                 }
-
 
                 document.querySelectorAll('.modal.show').forEach(el => {
                     const m = bootstrap.Modal.getInstance(el);
@@ -5474,14 +5493,34 @@ if ($username == null) {
                 }
             });
 
+            function fileActionSelection() {
+                if (activeEditorPath === null) return {directory: currentPath, names: [...selectedItems], target: null};
+                const path = activeEditorPath;
+                const tab = editorTabs.get(path);
+                if (!tab?.frame.contentWindow.editor) return null;
+                if (tab.dirty || tab.frame.contentWindow.hasUnsavedChanges) {
+                    showAlert('Unsaved changes', 'Save this file before copying, moving, renaming or deleting it.');
+                    return null;
+                }
+                const relative = path.substring(workspaceRoot.length);
+                const directory = relative.substring(0, relative.lastIndexOf('/'));
+                const name = relative.substring(relative.lastIndexOf('/') + 1);
+                return {directory, names: [name], target: {path, tab, directory, name}};
+            }
+            function setEditorFileTarget(modalId, selection) {
+                document.getElementById(modalId).querySelector('form').fmEditorFileTarget = selection.target;
+            }
+
             document.getElementById('rename-btn').addEventListener('click', e => {
                 e.preventDefault();
-                if (!e.currentTarget.classList.contains('disabled') && selectedItems.length === 1) {
-                    document.getElementById('oldName').value = selectedItems[0];
-                    document.getElementById('newName').value = selectedItems[0];
-                    document.getElementById('renamePath').value = currentPath;
-                    new bootstrap.Modal(document.getElementById('renameModal')).show();
-                }
+                if (e.currentTarget.classList.contains('disabled')) return;
+                const selection = fileActionSelection();
+                if (!selection || selection.names.length !== 1) return;
+                setEditorFileTarget('renameModal', selection);
+                document.getElementById('oldName').value = selection.names[0];
+                document.getElementById('newName').value = selection.names[0];
+                document.getElementById('renamePath').value = selection.directory;
+                new bootstrap.Modal(document.getElementById('renameModal')).show();
             });
 
             document.getElementById('permissions-btn').addEventListener('click', e => {
@@ -5531,9 +5570,13 @@ if ($username == null) {
 
             document.getElementById('delete-btn').addEventListener('click', function(e) {
                 e.preventDefault();
-                if (this.classList.contains('disabled') || selectedItems.length === 0) return;
-                document.getElementById('deletePath').value = currentPath;
-                document.getElementById('deleteItems').value = selectedItems;
+                if (this.classList.contains('disabled')) return;
+                const selection = fileActionSelection();
+                if (!selection || !selection.names.length) return;
+                if (selection.target && selection.names[0].includes(',')) { showAlert('Cannot delete', 'Files containing commas cannot use this operation.'); return; }
+                setEditorFileTarget('deleteModal', selection);
+                document.getElementById('deletePath').value = selection.directory;
+                document.getElementById('deleteItems').value = selection.names.join(',');
                 document.getElementById('deleteAction').value = 'trash';
                 document.getElementById('deleteButtonText').textContent = 'Move to Trash';
                 document.getElementById('deleteInfoAlert').style.display = 'block';
@@ -5568,15 +5611,17 @@ if ($username == null) {
 
             // ── Copy / Move ───────────────────────────────────────────
             function performFileOperation(op) {
-                if (selectedItems.length === 0) return;
-                document.getElementById('fileOpTitle').textContent = op === 'copy' ? '📋 Copy Items' :
-                    '✂️ Move Items';
+                const selection = fileActionSelection();
+                if (!selection || !selection.names.length) return;
+                if (selection.target && selection.names[0].includes(',')) { showAlert('Cannot ' + op, 'Files containing commas cannot use this operation.'); return; }
+                setEditorFileTarget('fileOperationModal', selection);
+                document.getElementById('fileOpTitle').textContent = op === 'copy' ? 'Copy Items' : 'Move Items';
                 document.getElementById('fileOpType').value = op;
-                document.getElementById('destinationPath').value = currentPath;
-                document.getElementById('copyPath').value = currentPath;
-                document.getElementById('copyItems').value = selectedItems;
-                document.getElementById('fileOpItems').textContent = `Selected: ${selectedItems.length} item(s)`;
-                document.getElementById('currentPathDisplay').textContent = currentPath || '/';
+                document.getElementById('destinationPath').value = selection.directory || '/';
+                document.getElementById('copyPath').value = selection.directory;
+                document.getElementById('copyItems').value = selection.names.join(',');
+                document.getElementById('fileOpItems').textContent = selection.target ? selection.target.name : `Selected: ${selection.names.length} item(s)`;
+                document.getElementById('currentPathDisplay').textContent = selection.directory || '/';
                 new bootstrap.Modal(document.getElementById('fileOperationModal')).show();
             }
 
@@ -5891,9 +5936,66 @@ if ($username == null) {
                     }
                 });
             }
+            function removeOperatedEditor(target) {
+                if (editorTabs.get(target.path) !== target.tab) return;
+                editorTabs.delete(target.path);
+                target.tab.element.remove();
+                target.tab.frame.remove();
+                if (activeEditorPath === target.path) activateTab(null);
+                refreshMobileTabs();
+                scheduleSaveTabs();
+            }
+            ['renameModal', 'deleteModal', 'fileOperationModal'].forEach(modalId => {
+                const modal = document.getElementById(modalId);
+                const form = modal.querySelector('form');
+                modal.addEventListener('hidden.bs.modal', () => { form.fmEditorFileTarget = null; });
+                form.addEventListener('submit', async event => {
+                    const target = form.fmEditorFileTarget;
+                    if (!target) return;
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    if (form.fmEditorFileBusy) return;
+                    if (target.tab.dirty || target.tab.frame.contentWindow.hasUnsavedChanges) {
+                        showAlert('Unsaved changes', 'Save the file before applying this operation.');
+                        return;
+                    }
+                    if (!form.reportValidity()) return;
+                    const body = new FormData(form);
+                    // Always bind the request to the file chosen when this dialog opened.
+                    body.set('path', target.directory);
+                    if (body.get('action') === 'rename') body.set('old_name', target.name);
+                    else body.set('items', target.name);
+                    const action = body.get('action');
+                    const buttons = [...form.querySelectorAll('button')];
+                    form.fmEditorFileBusy = true;
+                    buttons.forEach(button => { button.disabled = true; });
+                    try {
+                        const response = await fetch(location.pathname, {method: 'POST', body});
+                        const data = await response.json();
+                        if (!response.ok || data.status !== 'success') throw new Error(data.message || 'File operation failed.');
+                        const point = tabLocation(target.tab);
+                        const changedPath = ['rename', 'move', 'trash', 'delete'].includes(action);
+                        if (changedPath && (target.tab.dirty || target.tab.frame.contentWindow.hasUnsavedChanges)) {
+                            // An unexpected edit during the request must never be silently discarded.
+                            target.tab.frame.contentWindow.saveFile = () => window.workspaceAlert('The file path changed. Copy your edits into the new file before saving.');
+                            showAlert('File path changed', 'Your unsaved text remains in the old tab. Copy it before closing.');
+                        } else if (changedPath) {
+                            removeOperatedEditor(target);
+                            if (action === 'rename') openFileEditor(body.get('new_name'), target.directory, point);
+                            else if (action === 'move') openFileEditor(target.name, body.get('destination').replace(/\/+$/, ''), point);
+                        }
+                        bootstrap.Modal.getOrCreateInstance(modal).hide();
+                        loadFileList();
+                        loadDirectoryTree();
+                        showAlert('Success', data.message);
+                    } catch (error) { showAlert('Error', error.message || 'Could not confirm the file operation.'); }
+                    finally { form.fmEditorFileBusy = false; buttons.forEach(button => { button.disabled = false; }); }
+                }, true);
+            });
             function updateEditorMenu() {
                 const ready = activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.frame.contentWindow.editor;
                 document.querySelectorAll('.editor-menu-action').forEach(button => { button.disabled = !ready; });
+                updateButtonStates();
             }
             document.getElementById('menu-show-files').addEventListener('click', () => activateTab(null));
             document.querySelectorAll('.editor-menu-action').forEach(button => {
@@ -6002,6 +6104,7 @@ if ($username == null) {
                 frame.addEventListener('load', () => {
                     const source = frame.contentWindow.editor;
                     if (!source) {
+                        if (frame.contentWindow.fmImagePreview) { tab.loaded = true; updateEditorMenu(); scheduleSaveTabs(); }
                         if (frame.contentDocument.body.textContent.trim() === 'Invalid file specified.') {
                             editorTabs.delete(path);
                             refreshMobileTabs();
@@ -6159,19 +6262,9 @@ if ($username == null) {
                 });
                 try {
                     const data = JSON.parse(e.detail.xhr.response);
-                    CoolAlert.show({
-                        icon: 'error',
-                        title: data.title || 'Error',
-                        text: data.text || data.message || 'Something went wrong!',
-                        toast: true
-                    });
+                    window.workspaceToast(data.text || data.message || 'Something went wrong!', data.title || 'Error', 'error');
                 } catch {
-                    CoolAlert.show({
-                        icon: 'error',
-                        title: 'Error',
-                        text: 'Request failed',
-                        toast: true
-                    });
+                    window.workspaceToast('Request failed', 'Error', 'error');
                 }
             });
 
