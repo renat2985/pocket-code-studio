@@ -31,3 +31,7 @@ Visual Studio Code and related marks belong to their respective owners. No Micro
 - Ayu Dark: MIT, Copyright (c) 2016 Ike Kurghinyan. Source: https://github.com/ayu-theme/vscode-ayu. Original license: [docs/AYU-DARK-LICENSE.txt](docs/AYU-DARK-LICENSE.txt).
 
 These are embedded Ace/workspace adaptations of upstream palettes. Full notices are also included in `filemanager.php` for single-file deployment.
+
+## QR code generation
+
+Embedded qrcode-generator 1.4.4 by Kazuhiko Arase (MIT). Source: https://github.com/kazuhikoarase/qrcode-generator. License: [docs/QRCODE-GENERATOR-LICENSE.txt](docs/QRCODE-GENERATOR-LICENSE.txt). QR codes are generated locally in the browser.
