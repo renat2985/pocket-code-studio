@@ -416,10 +416,34 @@ $workspaceThemeScript = <<<'JS'
         window.alert(message);
         return Promise.resolve({isConfirmed: true});
     };
+    function startToastCountdown(toast, duration) {
+        if (!toast) return;
+        const timer = toast.querySelector('.cool-alert-toast-progress, .workspace-toast-timer');
+        if (!timer) return;
+        timer.setAttribute('aria-hidden', 'true');
+        const deadline = performance.now() + duration;
+        clearInterval(toast.fmCountdownInterval);
+        const update = () => {
+            if (!toast.isConnected || toast.style.display === 'none' || toast.classList.contains('hide')) {
+                clearInterval(toast.fmCountdownInterval);
+                return;
+            }
+            const remaining = Math.max(0, Math.ceil((deadline - performance.now()) / 1000));
+            timer.textContent = remaining + 's';
+            if (!remaining) clearInterval(toast.fmCountdownInterval);
+        };
+        update();
+        toast.fmCountdownInterval = setInterval(update, 200);
+    }
     window.workspaceToast = function(message, title = 'Saved', type = 'success') {
         if (window.parent !== window && typeof window.parent.workspaceToast === 'function') return window.parent.workspaceToast(message, title, type);
+        const duration = type === 'success' ? 3000 : 5000;
         if (typeof CoolAlert !== 'undefined') {
-            try { return CoolAlert.show({toast: true, icon: type, title, text: String(message)}); } catch (_) {}
+            try {
+                const result = CoolAlert.show({toast: true, icon: type, title, text: String(message), duration});
+                startToastCountdown(document.querySelector('#cool-alert-toast-container .cool-alert-toast:last-child'), duration);
+                return result;
+            } catch (_) {}
         }
         let toast = document.getElementById('save-toast');
         if (!toast) { toast = document.createElement('div'); toast.id = 'save-toast'; document.body.append(toast); }
@@ -430,10 +454,12 @@ $workspaceThemeScript = <<<'JS'
         const icon = document.createElement('i');
         icon.className = 'fas ' + ({success: 'fa-check-circle', error: 'fa-times-circle', warning: 'fa-exclamation-triangle', info: 'fa-info-circle'}[type] || 'fa-info-circle'); icon.setAttribute('aria-hidden', 'true');
         const text = document.createElement('span'); text.textContent = title + ': ' + String(message);
-        toast.replaceChildren(icon, text);
+        const timer = document.createElement('span'); timer.className = 'workspace-toast-timer'; timer.setAttribute('aria-hidden', 'true');
+        toast.replaceChildren(icon, text, timer);
         clearTimeout(window.workspaceToastTimer);
         toast.style.display = 'flex';
-        window.workspaceToastTimer = setTimeout(() => { toast.style.display = 'none'; }, type === 'success' ? 2500 : 5000);
+        startToastCountdown(toast, duration);
+        window.workspaceToastTimer = setTimeout(() => { toast.style.display = 'none'; clearInterval(toast.fmCountdownInterval); }, duration);
         return Promise.resolve();
     };
     window.workspaceConfirm = function(message) {
@@ -529,6 +555,19 @@ $workspaceThemeScript = <<<'JS'
     .cool-alert-modal-btn.cool-alert-secondary { background: var(--bg-elevated) !important; color: var(--text-secondary) !important; border: 1px solid var(--border-default) !important; }
     .cool-alert-modal-btn.cool-alert-danger { background: var(--accent-danger) !important; color: var(--danger-contrast) !important; }
     .cool-alert-close, .cool-alert-toast-close { background: transparent !important; color: var(--text-secondary) !important; }
+    /* Quiet notification chrome: no colored edge or sweeping timer bar. */
+    .cool-alert-toast::before, .cool-alert-modal::after { content: none !important; display: none !important; }
+    .cool-alert-toast { padding-bottom: 22px !important; }
+    .cool-alert-toast-progress, .workspace-toast-timer {
+        position: absolute !important; left: auto !important; right: 12px !important; bottom: 5px !important;
+        width: auto !important; min-width: 22px; height: 14px !important; background: none !important;
+        border: 0 !important; transition: none !important; pointer-events: none;
+        color: var(--text-muted); font: 11px/14px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        font-variant-numeric: tabular-nums; text-align: right;
+    }
+    .cool-alert-toast-progress::after, .workspace-toast-timer::after { content: none !important; }
+    .workspace-toast { padding-bottom: 22px; }
+    .cool-alert-spinner { border-color: var(--border-default) !important; border-top-color: var(--text-secondary) !important; }
     .modal .alert-info { background: var(--bg-selected); color: var(--text-primary); border-color: var(--border-default); }
     .modal .alert-warning, .modal .alert-danger { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default); }
     .modal .alert-warning { border-left: 3px solid var(--accent-warning); }
@@ -4305,6 +4344,7 @@ if ($username == null) {
         <div class="context-menu-item" id="ctx-rename"><i class="fas fa-tag"></i> Rename</div>
         <div class="context-menu-item" id="ctx-permissions"><i class="fas fa-shield-alt"></i> Permissions</div>
         <div class="context-menu-item" id="ctx-compress"><i class="fas fa-file-archive"></i> Compress</div>
+        <div class="context-menu-item" id="ctx-extract"><i class="fas fa-box-open"></i> Extract</div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item danger" id="ctx-delete"><i class="fas fa-trash"></i> Delete</div>
     </div>
@@ -4648,6 +4688,7 @@ if ($username == null) {
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Are you sure you want to delete the
                             selected item(s)?</p>
+                        <ul id="delete-item-names" aria-label="Items to delete" style="max-height:180px;overflow:auto;padding-left:20px;overflow-wrap:anywhere;color:var(--text-primary)"></ul>
                         <input type="hidden" name="items" id="deleteItems">
                         <input type="hidden" name="path" id="deletePath">
                         <input type="hidden" name="action" id="deleteAction" value="trash">
@@ -5014,6 +5055,7 @@ if ($username == null) {
                 tbody.innerHTML = `<tr><td colspan="7" style="padding:32px;text-align:center;color:var(--text-muted)">
                 <i class="fas fa-spinner fa-spin me-2"></i> Loading files…</td></tr>`;
                 selectedItems = [];
+                fileList = [];
                 updateButtonStates();
                 try {
                     const data = await requestWorkspace('list', {path: currentPath, sort: currentSort, order: currentOrder}, {signal: fileListController.signal});
@@ -5155,15 +5197,14 @@ if ($username == null) {
 
                     row.addEventListener('contextmenu', function(e) {
                         e.preventDefault();
-                        contextTarget = {
-                            name: this.dataset.name,
-                            type: this.dataset.type
-                        };
-                        const cb = this.querySelector('.item-check');
-                        if (!cb.checked) {
-                            cb.checked = true;
-                            cb.dispatchEvent(new Event('change'));
-                        }
+                        selectedItems = [this.dataset.name];
+                        document.querySelectorAll('#files-list .file-item').forEach(row => {
+                            const selected = row === this;
+                            row.classList.toggle('selected', selected);
+                            row.querySelector('.item-check').checked = selected;
+                        });
+                        updateButtonStates();
+                        contextTarget = {name: this.dataset.name, type: this.dataset.type, directory: currentPath};
                         showContextMenu(e.clientX, e.clientY, this.dataset.type);
                     });
 
@@ -5185,13 +5226,17 @@ if ($username == null) {
 
             function showContextMenu(x, y, type) {
                 const menu = document.getElementById('context-menu');
+                document.getElementById('ctx-download').style.display = type === 'file' ? 'flex' : 'none';
+                document.getElementById('ctx-extract').style.display = type === 'file' && /\.(zip|tar|gz|gzip|bz2|bzip2|rar|7z)$/i.test(contextTarget.name) ? 'flex' : 'none';
+                document.getElementById('ctx-edit').style.display = type === 'file' ? 'flex' : 'none';
+                document.getElementById('ctx-open').style.display = type === 'dir' ? 'flex' : 'none';
                 menu.style.visibility = 'hidden';
                 menu.style.display = 'block';
                 const mw = menu.offsetWidth,
                     mh = menu.offsetHeight;
                 const vw = window.innerWidth,
                     vh = window.innerHeight;
-                if (x + mw > vw) x = vw - mw - 8;
+                if (x + mw > vw) x = Math.max(8, vw - mw - 8);
                 if (y + mh > vh) y = Math.max(8, y - mh);
                 menu.style.left = x + 'px';
                 menu.style.top = y + 'px';
@@ -5200,14 +5245,22 @@ if ($username == null) {
                 document.getElementById('ctx-edit').style.display = type === 'file' ? 'flex' : 'none';
                 document.getElementById('ctx-open').style.display = type === 'dir' ? 'flex' : 'none';
 
-                setTimeout(() => {
-                    document.addEventListener('click', function close(e) {
-                        if (!menu.contains(e.target)) {
-                            menu.style.display = 'none';
-                            document.removeEventListener('click', close);
-                        }
-                    });
-                }, 0);
+            }
+            function hideContextMenu() {
+                document.getElementById('context-menu').style.display = 'none';
+            }
+            document.addEventListener('click', event => {
+                if (!event.target.closest('#context-menu')) hideContextMenu();
+            });
+            document.addEventListener('keydown', event => { if (event.key === 'Escape') hideContextMenu(); });
+            window.addEventListener('resize', hideContextMenu);
+
+            function closeWorkspaceMenus() {
+                hideContextMenu();
+                document.querySelectorAll('.toolbar-actions .menu-heading[data-bs-toggle="dropdown"][aria-expanded="true"]').forEach(heading => {
+                    bootstrap.Dropdown.getInstance(heading)?.hide();
+                });
+                closeMobileMenu();
             }
 
             function updateButtonStates() {
@@ -5266,6 +5319,14 @@ if ($username == null) {
                         button.className = 'folder-item';
                         button.dataset.path = item.path;
                         button.title = item.path;
+                        button.addEventListener('contextmenu', event => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            document.querySelectorAll('#directory-tree .folder-item.active').forEach(el => el.classList.remove('active'));
+                            button.classList.add('active');
+                            contextTarget = {name: item.name, type: item.type, directory: item.path.substring(0, item.path.lastIndexOf('/'))};
+                            showContextMenu(event.clientX, event.clientY, item.type);
+                        });
                         const icon = createFileIcon(item.name, item.type === 'dir');
                         const label = document.createElement('span');
                         label.className = 'tree-name';
@@ -5299,7 +5360,7 @@ if ($username == null) {
                             button.classList.add('tree-file');
                             button.append(icon, label);
                             button.addEventListener('click', () => {
-                                document.querySelectorAll('#directory-tree .tree-file.active').forEach(el => el.classList.remove('active'));
+                                document.querySelectorAll('#directory-tree .folder-item.active').forEach(el => el.classList.remove('active'));
                                 button.classList.add('active');
                                 openFileEditor(item.name, item.path.substring(0, item.path.lastIndexOf('/')));
                             });
@@ -5577,6 +5638,12 @@ if ($username == null) {
                 setEditorFileTarget('deleteModal', selection);
                 document.getElementById('deletePath').value = selection.directory;
                 document.getElementById('deleteItems').value = selection.names.join(',');
+                const names = document.getElementById('delete-item-names');
+                names.replaceChildren(...selection.names.map(name => {
+                    const item = document.createElement('li');
+                    item.textContent = name;
+                    return item;
+                }));
                 document.getElementById('deleteAction').value = 'trash';
                 document.getElementById('deleteButtonText').textContent = 'Move to Trash';
                 document.getElementById('deleteInfoAlert').style.display = 'block';
@@ -6117,6 +6184,11 @@ if ($username == null) {
                 tabsBar.append(element);
                 panels.append(frame);
                 frame.addEventListener('load', () => {
+                    // Events inside an iframe do not bubble to the workspace document.
+                    frame.contentDocument.addEventListener('pointerdown', closeWorkspaceMenus, true);
+                    frame.contentDocument.addEventListener('keydown', event => {
+                        if (event.key === 'Escape') closeWorkspaceMenus();
+                    }, true);
                     const source = frame.contentWindow.editor;
                     if (!source) {
                         if (frame.contentWindow.fmImagePreview) { tab.loaded = true; updateEditorMenu(); scheduleSaveTabs(); }
@@ -6157,62 +6229,47 @@ if ($username == null) {
             });
 
             // ── Context menu actions ──────────────────────────────────
-            document.getElementById('ctx-open').addEventListener('click', () => {
-                if (contextTarget?.type === 'dir') navigateTo(currentPath + '/' + contextTarget.name);
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-download').addEventListener('click', () => {
-                if (contextTarget) window.location.href =
-                    `${window.location.pathname}?action=download&path=${encodeURIComponent(currentPath)}&file=${encodeURIComponent(contextTarget.name)}`;
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-edit').addEventListener('click', () => {
-                if (contextTarget?.type === 'file') openFileEditor(contextTarget.name);
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-copy').addEventListener('click', () => {
-                if (contextTarget) {
-                    selectedItems = [contextTarget.name];
-                    performFileOperation('copy');
+            const contextActions = {
+                'ctx-copy': 'copy-btn', 'ctx-cut': 'move-btn', 'ctx-rename': 'rename-btn',
+                'ctx-delete': 'delete-btn', 'ctx-permissions': 'permissions-btn', 'ctx-compress': 'compress-btn', 'ctx-extract': 'extract-btn'
+            };
+            let contextActionBusy = false;
+            document.getElementById('context-menu').addEventListener('click', async event => {
+                const id = event.target.closest('.context-menu-item')?.id;
+                const target = contextTarget;
+                if (!id || !target || contextActionBusy) return;
+                hideContextMenu();
+                const path = (target.directory + '/' + target.name).replace(/\/+/g, '/');
+                if (id === 'ctx-open') { activateTab(null); navigateTo(path); return; }
+                if (id === 'ctx-edit') { openFileEditor(target.name, target.directory); return; }
+                if (id === 'ctx-download') {
+                    if (target.type === 'file') window.location.href = window.location.pathname + '?action=download&path=' + encodeURIComponent(target.directory) + '&file=' + encodeURIComponent(target.name);
+                    return;
                 }
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-cut').addEventListener('click', () => {
-                if (contextTarget) {
-                    selectedItems = [contextTarget.name];
-                    performFileOperation('move');
-                }
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-rename').addEventListener('click', () => {
-                if (contextTarget) {
-                    document.getElementById('oldName').value = contextTarget.name;
-                    document.getElementById('newName').value = contextTarget.name;
-                    document.getElementById('renamePath').value = currentPath;
-                    new bootstrap.Modal(document.getElementById('renameModal')).show();
-                }
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-permissions').addEventListener('click', () => {
-                if (contextTarget) {
-                    selectedItems = [contextTarget.name];
-                    document.getElementById('permissions-btn').click();
-                }
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-compress').addEventListener('click', () => {
-                if (contextTarget) {
-                    selectedItems = [contextTarget.name];
-                    document.getElementById('compress-btn').click();
-                }
-                document.getElementById('context-menu').style.display = 'none';
-            });
-            document.getElementById('ctx-delete').addEventListener('click', () => {
-                if (contextTarget) {
-                    selectedItems = [contextTarget.name];
-                    document.getElementById('delete-btn').click();
-                }
-                document.getElementById('context-menu').style.display = 'none';
+                const action = contextActions[id];
+                if (!action) return;
+                contextActionBusy = true;
+                try {
+                    const editorPath = workspaceRoot + path;
+                    const tab = editorTabs.get(editorPath);
+                    if (tabHasChanges(tab)) { showAlert('Unsaved changes', 'Save this file before applying this operation.'); return; }
+                    activateTab(null);
+                    currentPath = target.directory;
+                    await loadFileList();
+                    // Do not apply a late menu action after navigation to another folder.
+                    if ((currentPath || '/') !== (target.directory || '/')) return;
+                    if (!fileList.some(item => item.name === target.name)) throw new Error('The selected file is no longer available.');
+                    selectedItems = [target.name];
+                    document.querySelectorAll('#files-list .file-item').forEach(row => {
+                        const selected = row.dataset.name === target.name;
+                        row.classList.toggle('selected', selected);
+                        row.querySelector('.item-check').checked = selected;
+                    });
+                    updateButtonStates();
+                    if (tab && ['ctx-copy', 'ctx-cut', 'ctx-rename', 'ctx-delete'].includes(id)) activateTab(editorPath);
+                    document.getElementById(action).click();
+                } catch (error) { showAlert('Error', error.message || 'Could not open file action.'); }
+                finally { contextActionBusy = false; }
             });
 
             // ── HTMX hooks ────────────────────────────────────────────
