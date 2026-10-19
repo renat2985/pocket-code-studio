@@ -958,9 +958,9 @@ $modeOptions = [
     "apache_conf" => "Apache Config",
 ];
 
-$fileSize = filesize($filename);
+$fileSize = strlen($fileContents);
 $lastModified = date("M j Y, H:i:s", filemtime($filename));
-$lineCount = substr_count(file_get_contents($filename), "\n") + 1;
+$lineCount = substr_count($fileContents, "\n") + 1;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -4991,45 +4991,53 @@ if ($username == null) {
             let hasResponseError = false;
 
             // ── File list ─────────────────────────────────────────────
-            function loadFileList() {
+            async function requestWorkspace(action, fields = {}, options = {}) {
+                const body = fields instanceof FormData ? fields : new FormData();
+                body.set('action', action);
+                if (!(fields instanceof FormData)) for (const [key, value] of Object.entries(fields)) body.set(key, value);
+                const response = await fetch(window.location.pathname, {...options, method: 'POST', body});
+                let data;
+                try { data = await response.json(); }
+                catch (_) { throw new Error('The server returned an invalid response (HTTP ' + response.status + '). Reload the page and try again.'); }
+                if (!response.ok || data?.status !== 'success') throw new Error(data?.message || 'Request failed (HTTP ' + response.status + ')');
+                return data;
+            }
+
+            let fileListController = null;
+            let fileListRequest = 0;
+            async function loadFileList() {
+                const request = ++fileListRequest;
+                fileListController?.abort();
+                fileListController = new AbortController();
                 refreshGitStatus();
                 const tbody = document.getElementById('files-list');
                 tbody.innerHTML = `<tr><td colspan="7" style="padding:32px;text-align:center;color:var(--text-muted)">
                 <i class="fas fa-spinner fa-spin me-2"></i> Loading files…</td></tr>`;
                 selectedItems = [];
                 updateButtonStates();
-
-                const fd = new FormData();
-                fd.append('action', 'list');
-                fd.append('path', currentPath);
-                fd.append('sort', currentSort);
-                fd.append('order', currentOrder);
-
-                fetch(window.location.pathname, {
-                        method: 'POST',
-                        body: fd
-                    })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'success') {
-                            fileList = data.data;
-                            updateBreadcrumb(data.current_path);
-                            showFiles(fileList);
-                            if (data.current_path !== undefined) currentPath = data.current_path;
-                        } else {
-                            showAlert('Error', data.message);
-                        }
-                    })
-                    .catch(() => showAlert('Error', 'Failed to load file list'));
+                try {
+                    const data = await requestWorkspace('list', {path: currentPath, sort: currentSort, order: currentOrder}, {signal: fileListController.signal});
+                    if (request !== fileListRequest) return;
+                    fileList = data.data;
+                    if (data.current_path !== undefined) currentPath = data.current_path;
+                    updateBreadcrumb(currentPath);
+                    showFiles(fileList);
+                } catch (error) {
+                    if (request !== fileListRequest || error.name === 'AbortError') return;
+                    const row = document.createElement('tr');
+                    const cell = document.createElement('td');
+                    cell.colSpan = 7; cell.style.padding = '20px';
+                    cell.textContent = error.message || 'Failed to load file list';
+                    row.append(cell); tbody.replaceChildren(row);
+                    showAlert('Error', cell.textContent);
+                }
             }
 
             function updateBreadcrumb(path) {
                 document.getElementById('breadcrumb').value = path || '/';
             }
 
-            function getMimeType(filename) {
-                const ext = filename.split('.').pop().toLowerCase();
-                const map = {
+            const fileMimeTypes = {
                     txt: 'text/plain',
                     html: 'text/html',
                     htm: 'text/html',
@@ -5069,7 +5077,8 @@ if ($username == null) {
                     cpp: 'text/x-c++',
                     java: 'text/x-java-source',
                 };
-                return map[ext] || 'application/octet-stream';
+            function getMimeType(filename) {
+                return fileMimeTypes[filename.split('.').pop().toLowerCase()] || 'application/octet-stream';
             }
 
             let gitStatusRequest = 0;
@@ -5205,13 +5214,9 @@ if ($username == null) {
                 const n = selectedItems.length;
                 const inTrash = currentPath === '/.trash';
 
-                const isArchive = n === 1 && (() => {
-                    const f = fileList.find(i => i.name === selectedItems[0]);
-                    if (!f || f.type !== 'file') return false;
-                    return ['zip', 'tar', 'gz', 'gzip', 'bz2', 'bzip2', 'rar', '7z'].includes((f
-                        .extension || '').toLowerCase());
-                })();
-                const isFile = n === 1 && fileList.find(i => i.name === selectedItems[0])?.type === 'file';
+                const selectedFile = n === 1 ? fileList.find(item => item.name === selectedItems[0]) : null;
+                const isFile = selectedFile?.type === 'file';
+                const isArchive = isFile && ['zip', 'tar', 'gz', 'gzip', 'bz2', 'bzip2', 'rar', '7z'].includes((selectedFile.extension || '').toLowerCase());
 
                 const states = {
                     'permissions-btn': n === 1 && !inTrash,
@@ -5227,7 +5232,7 @@ if ($username == null) {
                     'unselect-all-btn': n > 0,
                 };
                 if (activeEditorPath !== null) {
-                    const ready = !!editorTabs.get(activeEditorPath)?.frame.contentWindow.editor;
+                    const ready = tabCanManageFile(editorTabs.get(activeEditorPath));
                     ['copy-btn', 'move-btn', 'rename-btn', 'delete-btn'].forEach(id => { states[id] = ready; });
                 }
                 Object.entries(states).forEach(([id, on]) => {
@@ -5245,13 +5250,8 @@ if ($username == null) {
                 spinner.setAttribute('aria-hidden', 'true');
                 loading.append(spinner, document.createTextNode('Loading…'));
                 container.replaceChildren(loading);
-                const fd = new FormData();
-                fd.append('action', 'tree');
-                fd.append('path', path);
                 try {
-                    const response = await fetch(window.location.pathname, {method: 'POST', body: fd});
-                    const data = await response.json();
-                    if (data.status !== 'success') throw new Error(data.message || 'Failed to load folder');
+                    const data = await requestWorkspace('tree', {path});
                     container.replaceChildren();
                     if (!data.data.length) {
                         const empty = document.createElement('li');
@@ -5497,8 +5497,8 @@ if ($username == null) {
                 if (activeEditorPath === null) return {directory: currentPath, names: [...selectedItems], target: null};
                 const path = activeEditorPath;
                 const tab = editorTabs.get(path);
-                if (!tab?.frame.contentWindow.editor) return null;
-                if (tab.dirty || tab.frame.contentWindow.hasUnsavedChanges) {
+                if (!tabCanManageFile(tab)) return null;
+                if (tabHasChanges(tab)) {
                     showAlert('Unsaved changes', 'Save this file before copying, moving, renaming or deleting it.');
                     return null;
                 }
@@ -5707,6 +5707,8 @@ if ($username == null) {
             });
 
             // ── Search ────────────────────────────────────────────────
+            let searchRequest = 0;
+            let searchController = null;
             function searchFiles() {
                 const q = document.getElementById('search-input').value.trim();
                 if (!q) {
@@ -5718,17 +5720,12 @@ if ($username == null) {
                 tbody.innerHTML =
                     `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)"><i class="fas fa-spinner fa-spin me-2"></i>Searching…</td></tr>`;
 
-                const fd = new FormData();
-                fd.append('action', 'search');
-                fd.append('path', currentPath);
-                fd.append('query', q);
-
-                fetch(window.location.pathname, {
-                        method: 'POST',
-                        body: fd
-                    })
-                    .then(r => r.json())
+                const request = ++searchRequest;
+                searchController?.abort();
+                searchController = new AbortController();
+                requestWorkspace('search', {path: currentPath, query: q}, {signal: searchController.signal})
                     .then(data => {
+                        if (request !== searchRequest) return;
                         if (data.status === 'success') {
                             if (!data.data.length) {
                                 tbody.innerHTML =
@@ -5781,13 +5778,17 @@ if ($username == null) {
                                     tbody.append(row);
                                 });
                             }
-                        } else {
-                            tbody.innerHTML =
-                                `<tr><td colspan="5" style="color:var(--accent-danger)">Error: ${data.message}</td></tr>`;
                         }
+                    }).catch(error => {
+                        if (request !== searchRequest || error.name === 'AbortError') return;
+                        const row = document.createElement('tr');
+                        const cell = document.createElement('td');
+                        cell.colSpan = 5; cell.style.padding = '24px'; cell.style.color = 'var(--accent-danger)';
+                        cell.textContent = error.message || 'Search failed';
+                        row.append(cell); tbody.replaceChildren(row);
                     });
 
-                new bootstrap.Modal(document.getElementById('searchModal')).show();
+                bootstrap.Modal.getOrCreateInstance(document.getElementById('searchModal')).show();
             }
 
             document.getElementById('search-btn').addEventListener('click', e => {
@@ -5936,12 +5937,23 @@ if ($username == null) {
                     }
                 });
             }
-            function removeOperatedEditor(target) {
-                if (editorTabs.get(target.path) !== target.tab) return;
-                editorTabs.delete(target.path);
-                target.tab.element.remove();
-                target.tab.frame.remove();
-                if (activeEditorPath === target.path) activateTab(null);
+            function tabHasChanges(tab) {
+                return !!tab && (tab.dirty || !!tab.frame.contentWindow.hasUnsavedChanges);
+            }
+            function tabCanManageFile(tab) {
+                const content = tab?.frame.contentWindow;
+                return !!content && (!!content.editor || content.fmImagePreview === true);
+            }
+            function removeEditorTab(path, expectedTab, activateNeighbor = false) {
+                const tab = editorTabs.get(path);
+                if (!tab || tab !== expectedTab) return;
+                const keys = [...editorTabs.keys()];
+                const index = keys.indexOf(path);
+                const next = activateNeighbor ? keys[index - 1] || keys[index + 1] || null : null;
+                editorTabs.delete(path);
+                tab.element.remove();
+                tab.frame.remove();
+                if (activeEditorPath === path) activateTab(next);
                 refreshMobileTabs();
                 scheduleSaveTabs();
             }
@@ -5955,7 +5967,7 @@ if ($username == null) {
                     event.preventDefault();
                     event.stopImmediatePropagation();
                     if (form.fmEditorFileBusy) return;
-                    if (target.tab.dirty || target.tab.frame.contentWindow.hasUnsavedChanges) {
+                    if (tabHasChanges(target.tab)) {
                         showAlert('Unsaved changes', 'Save the file before applying this operation.');
                         return;
                     }
@@ -5970,17 +5982,15 @@ if ($username == null) {
                     form.fmEditorFileBusy = true;
                     buttons.forEach(button => { button.disabled = true; });
                     try {
-                        const response = await fetch(location.pathname, {method: 'POST', body});
-                        const data = await response.json();
-                        if (!response.ok || data.status !== 'success') throw new Error(data.message || 'File operation failed.');
+                        const data = await requestWorkspace(action, body);
                         const point = tabLocation(target.tab);
                         const changedPath = ['rename', 'move', 'trash', 'delete'].includes(action);
-                        if (changedPath && (target.tab.dirty || target.tab.frame.contentWindow.hasUnsavedChanges)) {
+                        if (changedPath && tabHasChanges(target.tab)) {
                             // An unexpected edit during the request must never be silently discarded.
                             target.tab.frame.contentWindow.saveFile = () => window.workspaceAlert('The file path changed. Copy your edits into the new file before saving.');
                             showAlert('File path changed', 'Your unsaved text remains in the old tab. Copy it before closing.');
                         } else if (changedPath) {
-                            removeOperatedEditor(target);
+                            removeEditorTab(target.path, target.tab);
                             if (action === 'rename') openFileEditor(body.get('new_name'), target.directory, point);
                             else if (action === 'move') openFileEditor(target.name, body.get('destination').replace(/\/+$/, ''), point);
                         }
@@ -5992,24 +6002,36 @@ if ($username == null) {
                     finally { form.fmEditorFileBusy = false; buttons.forEach(button => { button.disabled = false; }); }
                 }, true);
             });
+            const editorCommands = {
+                save: {run: target => target.saveFile()},
+                undo: {run: target => target.editor.undo()},
+                redo: {run: target => target.editor.redo()},
+                copyall: {run: target => target.copyAll()},
+                find: {run: target => target.editor.execCommand('replace')},
+                map: {run: target => target.toggleMinimap(), keepFocus: true},
+                gitdiff: {run: target => target.showGitDiff()},
+                wrap: {run: target => target.toggleWrap(), keepFocus: true},
+                fullscreen: {run: target => target.toggleFullscreen(), keepFocus: true},
+                format: {run: target => target.formatCode()}
+            };
             function updateEditorMenu() {
                 const ready = activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.frame.contentWindow.editor;
-                document.querySelectorAll('.editor-menu-action').forEach(button => { button.disabled = !ready; });
+                document.querySelectorAll('.editor-menu-action').forEach(button => {
+                    button.disabled = !ready || !Object.hasOwn(editorCommands, button.dataset.editorCommand);
+                });
                 updateButtonStates();
+            }
+            function runEditorCommand(name) {
+                if (!Object.hasOwn(editorCommands, name)) return;
+                const target = editorTabs.get(activeEditorPath)?.frame.contentWindow;
+                if (!target?.editor) return;
+                const command = editorCommands[name];
+                command.run(target);
+                if (!command.keepFocus) target.editor.focus();
             }
             document.getElementById('menu-show-files').addEventListener('click', () => activateTab(null));
             document.querySelectorAll('.editor-menu-action').forEach(button => {
-                button.addEventListener('click', () => {
-                    const target = editorTabs.get(activeEditorPath)?.frame.contentWindow;
-                    if (!target?.editor) return;
-                    const commands = {
-                        save: () => target.saveFile(), undo: () => target.editor.undo(), redo: () => target.editor.redo(),
-                        copyall: () => target.copyAll(), find: () => target.editor.execCommand('replace'), map: () => target.toggleMinimap(),
-                        gitdiff: () => target.showGitDiff(), wrap: () => target.toggleWrap(), fullscreen: () => target.toggleFullscreen(), format: () => target.formatCode()
-                    };
-                    commands[button.dataset.editorCommand]?.();
-                    if (!['map', 'wrap', 'fullscreen'].includes(button.dataset.editorCommand)) target.editor.focus();
-                });
+                button.addEventListener('click', () => runEditorCommand(button.dataset.editorCommand));
             });
             // Move between menu headings with the keyboard or pointer while a menu is open.
             document.querySelectorAll('.toolbar-actions .menu-heading[data-bs-toggle="dropdown"]').forEach(heading => {
@@ -6045,7 +6067,7 @@ if ($username == null) {
             };
             window.addEventListener('beforeunload', event => {
                 saveWorkspaceTabs();
-                if ([...editorTabs.values()].some(tab => tab.dirty)) {
+                if ([...editorTabs.values()].some(tabHasChanges)) {
                     event.preventDefault();
                     event.returnValue = '';
                 }
@@ -6088,15 +6110,8 @@ if ($username == null) {
                 editorTabs.set(path, tab);
                 button.addEventListener('click', () => activateTab(path));
                 close.addEventListener('click', async () => {
-                    if (tab.dirty && !await window.workspaceConfirm('Discard unsaved changes in ' + name + '?')) return;
-                    const keys = [...editorTabs.keys()];
-                    const index = keys.indexOf(path);
-                    editorTabs.delete(path);
-                    refreshMobileTabs();
-                    element.remove();
-                    frame.remove();
-                    scheduleSaveTabs();
-                    if (activeEditorPath === path) activateTab(keys[index - 1] || keys[index + 1] || null);
+                    if (tabHasChanges(tab) && !await window.workspaceConfirm('Discard unsaved changes in ' + name + '?')) return;
+                    removeEditorTab(path, tab, true);
                 });
                 element.append(button, close);
                 tabsBar.append(element);
@@ -6106,12 +6121,7 @@ if ($username == null) {
                     if (!source) {
                         if (frame.contentWindow.fmImagePreview) { tab.loaded = true; updateEditorMenu(); scheduleSaveTabs(); }
                         if (frame.contentDocument.body.textContent.trim() === 'Invalid file specified.') {
-                            editorTabs.delete(path);
-                            refreshMobileTabs();
-                            element.remove();
-                            frame.remove();
-                            if (activeEditorPath === path) activateTab(null);
-                            scheduleSaveTabs();
+                            removeEditorTab(path, tab);
                         }
                         return;
                     }
