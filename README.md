@@ -28,7 +28,7 @@ No database, Composer, or Node.js build is required.
 ## Installation
 
 1. Upload **`filemanager.php`** — no other application files are needed.
-2. Check `$config['root_path']`: by default, it is the web server document root.
+2. The initial workspace is the web server document root; change it with **File → Settings → Workspace root → Browse…**.
 3. Open the file over HTTPS. The initial password is **`admin123`**, with no username.
 4. Immediately change it in **File → Settings** before allowing public access to the manager.
 
@@ -47,6 +47,7 @@ Keep your personal password hash and settings when replacing the PHP file. Do no
 - **Ctrl/⌘ S:** save. **Ctrl/⌘ + click:** add cursors. **Escape:** return to one cursor.
 - **View → Color theme:** choose a theme. Language and editor font size are in the bottom status bar.
 - **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.
+- **Browse…** in Copy/Move selects an existing destination folder inside the workspace. The workspace picker can explore other folders permitted by PHP and hosting restrictions. Save open edits before switching roots.
 - **Save Settings** saves all changes together; **Cancel** discards them. Leave password fields empty to keep the current password.
 
 Settings are stored in `filemanager.php`; PHP needs permission to replace it. Legacy `.fm-config` values migrate on the next Settings save.

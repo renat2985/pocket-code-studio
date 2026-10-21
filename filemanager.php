@@ -118,8 +118,13 @@ function fmUpdatePasswordHash($oldHash, $newHash)
 function fmUpdateWorkspaceConfiguration($data, $oldHash, $newHash = null)
 {
     $data = fmValidateWorkspaceSettings($data);
-    $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
-    fmRewriteConfiguration(function ($source) use ($encoded, $oldHash, $newHash) {
+    fmRewriteConfiguration(function ($source) use ($data, $oldHash, $newHash) {
+        // Preserve a root selected by another settings request under the same lock.
+        if (!array_key_exists('root_path', $data) && preg_match('/^\$workspaceSettingsBase64 = \'([A-Za-z0-9+\/=]*)\';$/m', $source, $match)) {
+            $previous = json_decode(base64_decode($match[1]), true);
+            if (isset($previous['root_path'])) $data['root_path'] = $previous['root_path'];
+        }
+        $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
         $passwordPattern = '/^\$authPasswordHash = \'[^\']*\';$/m';
         $settingsPattern = '/^\$workspaceSettingsBase64 = \'[A-Za-z0-9+\/=]*\';$/m';
         if (preg_match_all($passwordPattern, $source, $matches) !== 1 || $matches[0][0] !== '$authPasswordHash = ' . var_export($oldHash, true) . ';') throw new RuntimeException('Password configuration changed. Reload and try again.');
@@ -139,7 +144,12 @@ function fmValidateWorkspaceSettings($data)
     try { new DateTimeZone($timezone); } catch (Throwable $error) { throw new RuntimeException('This timezone is not supported by the server.'); }
     if (!is_string($format) || $format === '' || strlen($format) > 128 || !preg_match('//u', $format) || preg_match('/[\x00-\x1f\x7f]/', $format)) throw new RuntimeException('Date format must be 1–128 bytes without control characters.');
     if (!is_string($font) || !preg_match('/^(1[0-9]|2[0-9]|3[0-2])px$/D', $font)) throw new RuntimeException('Font size must be between 10px and 32px.');
-    return ['timezone' => $timezone, 'date_format' => $format, 'font_size' => $font];
+    $result = ['timezone' => $timezone, 'date_format' => $format, 'font_size' => $font];
+    if (array_key_exists('root_path', $data)) {
+        if (!is_string($data['root_path']) || strlen($data['root_path']) > 4096 || preg_match('/[\x00-\x1f\x7f]/', $data['root_path']) || !preg_match('//u', $data['root_path'])) throw new RuntimeException('Invalid workspace folder.');
+        if ($data['root_path'] !== '') $result['root_path'] = $data['root_path'];
+    }
+    return $result;
 }
 
 // Read the current hash from disk so OPcache cannot keep an old password valid.
@@ -218,6 +228,13 @@ if ($authAction === 'save_settings' && $isPostRequest) {
             'date_format' => $_POST['dateformat'] ?? null,
             'font_size' => $_POST['fontSize'] ?? null,
         ]);
+        if (array_key_exists('workspace_root', $_POST)) {
+            $requestedRoot = $_POST['workspace_root'];
+            if (!is_string($requestedRoot) || strpos($requestedRoot, "\0") !== false) throw new RuntimeException('Invalid workspace folder.');
+            $resolvedRoot = @realpath($requestedRoot === '' ? $_SERVER['DOCUMENT_ROOT'] : $requestedRoot);
+            if (!$resolvedRoot || !is_dir($resolvedRoot) || !is_readable($resolvedRoot) || @scandir($resolvedRoot) === false) throw new RuntimeException('This folder is not accessible. Check folder permissions or hosting restrictions.');
+            $data['root_path'] = $resolvedRoot;
+        }
         $current = $_POST['current_password'] ?? '';
         $new = $_POST['new_password'] ?? '';
         $confirm = $_POST['confirm_password'] ?? '';
@@ -271,15 +288,6 @@ $config = [
     "font_size" => "16px",
 ];
 
-// Map the workspace to its public URL only when it is inside the document root.
-$publicDocumentRoot = realpath($_SERVER['DOCUMENT_ROOT']);
-$publicWorkspaceRoot = realpath($config['root_path']);
-$publicWorkspaceBase = null;
-if ($publicDocumentRoot && $publicWorkspaceRoot && ($publicWorkspaceRoot === $publicDocumentRoot || strpos($publicWorkspaceRoot, rtrim($publicDocumentRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) === 0)) {
-    $publicRelativeRoot = substr($publicWorkspaceRoot, strlen(rtrim($publicDocumentRoot, DIRECTORY_SEPARATOR)));
-    $publicWorkspaceBase = rtrim(implode('/', array_map('rawurlencode', explode('/', str_replace(DIRECTORY_SEPARATOR, '/', $publicRelativeRoot)))), '/');
-}
-
 // Read settings from disk as data, never eval, so OPcache cannot retain old values.
 if (preg_match('/^\$workspaceSettingsBase64 = \'([A-Za-z0-9+\/=]*)\';$/m', $authHeader, $settingsMatch) !== 1) fmAuthReply(503, 'Settings configuration unavailable.');
 try {
@@ -297,6 +305,47 @@ try {
         }
     }
 } catch (Throwable $error) { fmAuthReply(503, 'Settings configuration unavailable.'); }
+
+// Map the workspace to its public URL only when it is inside the document root.
+$publicDocumentRoot = realpath($_SERVER['DOCUMENT_ROOT']);
+$publicWorkspaceRoot = realpath($config['root_path']);
+$publicWorkspaceBase = null;
+$publicWebsitePrefix = null;
+if ($publicDocumentRoot && $publicWorkspaceRoot && strpos($publicDocumentRoot, rtrim($publicWorkspaceRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) === 0) {
+    $publicWebsitePrefix = str_replace(DIRECTORY_SEPARATOR, '/', substr($publicDocumentRoot, strlen(rtrim($publicWorkspaceRoot, DIRECTORY_SEPARATOR))));
+}
+if ($publicDocumentRoot && $publicWorkspaceRoot && ($publicWorkspaceRoot === $publicDocumentRoot || strpos($publicWorkspaceRoot, rtrim($publicDocumentRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) === 0)) {
+    $publicRelativeRoot = substr($publicWorkspaceRoot, strlen(rtrim($publicDocumentRoot, DIRECTORY_SEPARATOR)));
+    $publicWorkspaceBase = rtrim(implode('/', array_map('rawurlencode', explode('/', str_replace(DIRECTORY_SEPARATOR, '/', $publicRelativeRoot)))), '/');
+}
+
+// Only this read-only picker may explore outside the selected workspace.
+if ($isPostRequest && ($_POST['action'] ?? '') === 'browse_folders') {
+    $scope = $_POST['scope'] ?? 'workspace';
+    if (!in_array($scope, ['workspace', 'server'], true)) fmAuthReply(400, 'Invalid folder browser scope.');
+    $root = realpath($config['root_path']);
+    $requested = $_POST['folder'] ?? '';
+    if (!is_string($requested) || strpos($requested, "\0") !== false) fmAuthReply(400, 'Invalid folder path.');
+    $candidate = $scope === 'server' ? ($requested === '' ? $config['root_path'] : $requested) : $root . '/' . ltrim($requested, '/');
+    $folder = @realpath($candidate);
+    if (!$folder || !is_dir($folder) || !is_readable($folder)) fmAuthReply(403, 'Folder unavailable. Check permissions or hosting restrictions.');
+    if ($scope === 'workspace' && !securityCheck($folder)) fmAuthReply(403, 'Choose a folder inside the current workspace.');
+    $entries = @scandir($folder);
+    if ($entries === false) fmAuthReply(403, 'The server does not allow listing this folder.');
+    $displayPath = function ($path) use ($scope, $root) { return $scope === 'server' ? $path : (substr($path, strlen(rtrim($root, '/'))) ?: '/'); };
+    $folders = [];
+    foreach ($entries as $name) {
+        if ($name === '.' || $name === '..' || !preg_match('//u', $name)) continue;
+        $child = $folder . '/' . $name;
+        if (!@is_dir($child)) continue;
+        if ($scope === 'workspace' && !securityCheck($child)) continue;
+        $folders[] = ['name' => $name, 'path' => $displayPath($child), 'readable' => @is_readable($child)];
+    }
+    usort($folders, function ($a, $b) { return strnatcasecmp($a['name'], $b['name']); });
+    $parent = dirname($folder);
+    if ($parent === $folder || ($scope === 'workspace' && !securityCheck($parent))) $parent = null;
+    fmAuthReply(200, 'Folders loaded.', ['folder' => $displayPath($folder), 'parent' => $parent === null ? null : $displayPath($parent), 'folders' => $folders]);
+}
 
 // Set timezone
 date_default_timezone_set($config["timezone"]);
@@ -345,6 +394,81 @@ SETI_JSON
 $workspaceThemeScript = <<<'JS'
 <script>
 (function () {
+    function workspaceIconURL(hostname) {
+        let hash = 2166136261;
+        for (const char of hostname.toLowerCase()) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+        const hue = (hash >>> 0) % 360;
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="hsl(' + hue + ',65%,38%)"/><path d="m23 20-12 12 12 12m18-24 12 12-12 12m-6-28-6 32" fill="none" stroke="white" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        return 'data:image/svg+xml,' + encodeURIComponent(svg);
+    }
+    function badgeSiteIcon(url) {
+        return new Promise((resolve, reject) => {
+            const image = new Image();
+            image.crossOrigin = 'anonymous'; image.referrerPolicy = 'no-referrer';
+            const timeout = setTimeout(() => { image.onload = image.onerror = null; reject(new Error('Icon timeout')); }, 2500);
+            image.onerror = () => { clearTimeout(timeout); reject(new Error('Icon unavailable')); };
+            image.onload = () => {
+                clearTimeout(timeout);
+                try {
+                    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 64;
+                    const ctx = canvas.getContext('2d');
+                    const scale = Math.min(64 / image.naturalWidth, 64 / image.naturalHeight);
+                    const width = image.naturalWidth * scale, height = image.naturalHeight * scale;
+                    ctx.drawImage(image, (64 - width) / 2, (64 - height) / 2, width, height);
+                    let hash = 2166136261;
+                    for (const char of location.hostname.toLowerCase()) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
+                    ctx.beginPath(); ctx.arc(51, 51, 11, 0, Math.PI * 2);
+                    ctx.fillStyle = 'hsl(' + ((hash >>> 0) % 360) + ',75%,50%)'; ctx.fill();
+                    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 3; ctx.stroke();
+                    resolve(canvas.toDataURL('image/png'));
+                } catch (error) { reject(error); }
+            };
+            image.src = url;
+        });
+    }
+    async function loadSiteIcon() {
+        const cacheKey = 'fm_site_favicon_v1';
+        try { const cached = sessionStorage.getItem(cacheKey); if (cached?.startsWith('data:image/png;base64,')) return cached; } catch (_) {}
+        const urls = [];
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        try {
+            const response = await fetch(new URL('/', location.href), {signal: controller.signal});
+            if (response.ok) {
+                const html = new DOMParser().parseFromString(await response.text(), 'text/html');
+                const base = new URL(html.querySelector('base[href]')?.getAttribute('href') || response.url, response.url);
+                for (const link of html.querySelectorAll('link[rel~="icon"][href]')) {
+                    const url = new URL(link.getAttribute('href'), base);
+                    if (['http:', 'https:'].includes(url.protocol)) urls.push(url.href);
+                }
+            }
+        } catch (_) {} finally { clearTimeout(timeout); }
+        urls.push(new URL('/favicon.ico', location.href).href);
+        for (const url of [...new Set(urls)].slice(0, 4)) {
+            try {
+                const icon = await badgeSiteIcon(url);
+                try { sessionStorage.setItem(cacheKey, icon); } catch (_) {}
+                return icon;
+            } catch (_) {}
+        }
+        return workspaceIconURL(location.hostname);
+    }
+    window.setWorkspaceDocumentTitle = function(name = 'Files', dirty = false) {
+        document.title = location.hostname + ' — ' + (dirty ? '● ' : '') + name;
+    };
+    document.addEventListener('DOMContentLoaded', () => {
+        const filename = new URL(location.href).searchParams.get('filename');
+        window.setWorkspaceDocumentTitle(filename ? filename.split('/').pop() : 'Files');
+        document.querySelectorAll('link[rel="icon"]').forEach(icon => icon.remove());
+        const icon = document.createElement('link');
+        icon.rel = 'icon'; icon.type = 'image/svg+xml'; icon.href = workspaceIconURL(location.hostname);
+        document.head.append(icon);
+        const host = window.parent !== window ? window.parent : window;
+        if (!host.workspaceSiteIconPromise) host.workspaceSiteIconPromise = loadSiteIcon();
+        host.workspaceSiteIconPromise.then(url => {
+            icon.type = url.startsWith('data:image/png') ? 'image/png' : 'image/svg+xml'; icon.href = url;
+        }).catch(() => {});
+    });
     const fmCSRF = __FM_CSRF_TOKEN__;
     const nativeFetch = window.fetch.bind(window);
     window.fetch = function(input, options = {}) {
@@ -524,6 +648,16 @@ $workspaceThemeScript = <<<'JS'
     .workspace-toast[data-type="error"] > i { color: var(--accent-danger); }
     .workspace-toast[data-type="warning"] > i { color: var(--accent-warning); }
     .workspace-toast[data-type="info"] > i { color: var(--accent); }
+    #folder-picker { width:min(540px,calc(100vw - 24px)); max-height:85dvh; padding:0; border:1px solid var(--border-default); border-radius:6px; background:var(--bg-main); color:var(--text-primary); font:var(--workspace-ui-font-size)/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+    #folder-picker::backdrop { background:#0007; }
+    .folder-picker-head, .folder-picker-footer { padding:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    #folder-picker-path { flex-basis:100%; overflow-wrap:anywhere; }
+    #folder-picker-list { max-height:48dvh; overflow:auto; border-block:1px solid var(--border-subtle); }
+    #folder-picker button { padding:7px 10px; border:1px solid var(--border-default); border-radius:4px; background:var(--bg-elevated); color:var(--text-primary); font:inherit; cursor:pointer; }
+    #folder-picker button:disabled { opacity:.45; cursor:default; }
+    #folder-picker-list button { display:flex; gap:8px; width:100%; text-align:left; background:transparent; border:0; border-radius:0; overflow-wrap:anywhere; min-height:38px; }
+    #folder-picker-list button:hover { background:var(--bg-selected); }
+    #folder-picker-message { padding:0 12px; color:var(--text-secondary); }
     /* Shared floating surfaces follow the workspace theme, including light palettes. */
     .modal { --bs-body-color: var(--text-primary); --bs-body-bg: var(--bg-main); --bs-border-color: var(--border-default); }
     .modal .table {
@@ -1713,7 +1847,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
         editor.session.on('change', function() {
             if (!hasUnsavedChanges) {
                 hasUnsavedChanges = true;
-                document.title = '● ' + editorFilename + ' — Pocket Code Studio';
+                window.setWorkspaceDocumentTitle(editorFilename, true);
             }
             updateSaveStatus();
             notifyWorkspace();
@@ -1832,7 +1966,7 @@ dom.importCssString(exports.cssText, exports.cssClass, false);
                 lastSavedContent = content;
                 hasUnsavedChanges = editor.getValue() !== savedEditorValue;
                 notifyWorkspace();
-                document.title = (hasUnsavedChanges ? '● ' : '') + editorFilename + ' — Pocket Code Studio';
+                window.setWorkspaceDocumentTitle(editorFilename, hasUnsavedChanges);
                 window.workspaceToast('File saved and verified.', 'Saved');
                 lastSavedAt = new Date();
             } catch (error) {
@@ -2440,8 +2574,12 @@ function updateSettings($timezone, $dateFormat, $fontSize)
             'date_format' => $dateFormat === '' ? $config['date_format'] : $dateFormat,
             'font_size' => $fontSize === '' ? $config['font_size'] : $fontSize,
         ]);
-        $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
-        fmRewriteConfiguration(function ($source) use ($encoded) {
+        fmRewriteConfiguration(function ($source) use ($data) {
+            if (preg_match('/^\$workspaceSettingsBase64 = \'([A-Za-z0-9+\/=]*)\';$/m', $source, $match)) {
+                $previous = json_decode(base64_decode($match[1]), true);
+                if (isset($previous['root_path'])) $data['root_path'] = $previous['root_path'];
+            }
+            $encoded = base64_encode(json_encode($data, JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR));
             $pattern = '/^\$workspaceSettingsBase64 = \'[A-Za-z0-9+\/=]*\';$/m';
             if (preg_match_all($pattern, $source) !== 1) throw new RuntimeException('Settings configuration changed. Reload and try again.');
             return preg_replace_callback($pattern, function () use ($encoded) { return '$workspaceSettingsBase64 = ' . var_export($encoded, true) . ';'; }, $source, 1);
@@ -4549,6 +4687,10 @@ if ($username == null) {
                     </div>
                     <div class="modal-body">
                         <div class="mb-3">
+                            <label class="form-label" for="settings-root">Workspace root</label>
+                            <div class="input-group"><input class="form-control" id="settings-root" name="workspace_root" value="<?= htmlspecialchars($config['root_path'], ENT_QUOTES, 'UTF-8') ?>" readonly><button type="button" class="btn btn-secondary" id="browse-workspace">Browse…</button></div>
+                            <div class="form-text">Choose a folder accessible to PHP. Applied after Save Settings.</div>
+                        </div><div class="mb-3">
                             <label class="form-label" for="settings-timezone">Timezone</label>
                             <select class="form-select" id="settings-timezone" name="timezone" required aria-describedby="timezone-preview timezone-browser-hint">
                                 <?php foreach (array_unique(array_merge(timezone_identifiers_list(DateTimeZone::ALL), [$config['timezone']])) as $zone): ?>
@@ -4782,6 +4924,13 @@ if ($username == null) {
         </div></div>
     </div>
 
+    <dialog id="folder-picker" aria-labelledby="folder-picker-title">
+        <div class="folder-picker-head"><strong id="folder-picker-title">Choose folder</strong><span id="folder-picker-path"></span>
+        <button type="button" id="folder-picker-home">Home</button><button type="button" id="folder-picker-up">Up</button><button type="button" id="folder-picker-website">Website folder</button></div>
+        <div id="folder-picker-list"></div><p id="folder-picker-message" role="status"></p>
+        <div class="folder-picker-footer" style="justify-content:flex-end"><button type="button" id="folder-picker-cancel">Cancel</button><button type="button" id="folder-picker-use">Use this folder</button></div>
+    </dialog>
+
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-lg">
@@ -4831,8 +4980,8 @@ if ($username == null) {
                         <div class="mb-3" id="fileOpItems" style="font-size:0.8rem;color:var(--text-secondary)"></div>
                         <div class="mb-2">
                             <label class="form-label">Destination Path</label>
-                            <input type="text" name="destination" class="form-control" id="destinationPath"
-                                placeholder="/path/to/destination" required>
+                            <div class="input-group"><input type="text" name="destination" class="form-control" id="destinationPath"
+                                placeholder="/path/to/destination" required><button type="button" class="btn btn-secondary" id="browse-destination">Browse…</button></div>
                             <input type="hidden" name="path" id="copyPath">
                             <input type="hidden" name="items" id="copyItems">
                             <div class="form-text">Current: <span id="currentPathDisplay"
@@ -7216,6 +7365,8 @@ var qrcode = function() {
     <script>
         var SERVER_ROOT_PATH = <?= json_encode($config['root_path'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const PUBLIC_WORKSPACE_BASE = <?= json_encode($publicWorkspaceBase, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+        const PUBLIC_WEBSITE_PREFIX = <?= json_encode($publicWebsitePrefix, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+        const WEBSITE_FOLDER = <?= json_encode(realpath($_SERVER['DOCUMENT_ROOT']), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
     </script>
 
     <div class="modal fade" id="aboutPocketModal" tabindex="-1" aria-labelledby="aboutPocketTitle" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
@@ -7322,6 +7473,8 @@ var qrcode = function() {
             settingsForm.addEventListener('submit', async event => {
                 event.preventDefault();
                 if (settingsSaving) return;
+                const rootChanged = document.getElementById('settings-root').value !== SERVER_ROOT_PATH;
+                if (rootChanged && [...editorTabs.values()].some(tabHasChanges)) { window.workspaceAlert('Save your open files before switching the workspace folder.', 'Unsaved changes', 'warning'); return; }
                 settingsSaving = true;
                 const buttons = [...settingsForm.querySelectorAll('button')];
                 buttons.forEach(button => { button.disabled = true; });
@@ -7331,6 +7484,7 @@ var qrcode = function() {
                     const data = await response.json();
                     settingsResult.textContent = data.message || 'Could not save settings.';
                     if (response.ok && data.status === 'success') {
+                        if (rootChanged) { location.reload(); return; }
                         settingsForm.querySelectorAll('input:not([type="password"])').forEach(input => { input.defaultValue = input.value; });
                         settingsForm.querySelectorAll('select').forEach(select => {
                             const selected = select.value;
@@ -7418,6 +7572,57 @@ var qrcode = function() {
             let treeContextSelection = null;
             let clickedBtn = null;
             let hasResponseError = false;
+
+            const folderPicker = document.getElementById('folder-picker');
+            const pickerList = document.getElementById('folder-picker-list');
+            const pickerMessage = document.getElementById('folder-picker-message');
+            const pickerUse = document.getElementById('folder-picker-use');
+            const pickerUp = document.getElementById('folder-picker-up');
+            let pickerScope, pickerTarget, pickerFolder, pickerParent, pickerRequest = 0;
+            async function loadPickerFolder(folder) {
+                const request = ++pickerRequest;
+                pickerUse.disabled = true; pickerUp.disabled = true;
+                pickerMessage.textContent = 'Loading folders…'; pickerList.replaceChildren();
+                try {
+                    const data = await requestWorkspace('browse_folders', {scope: pickerScope, folder});
+                    if (request !== pickerRequest || !folderPicker.open) return;
+                    pickerFolder = data.folder; pickerParent = data.parent;
+                    document.getElementById('folder-picker-path').textContent = pickerFolder;
+                    pickerUp.disabled = pickerParent === null; pickerUse.disabled = false;
+                    pickerMessage.textContent = data.folders.length ? '' : 'No subfolders. You can select this folder.';
+                    data.folders.forEach(item => {
+                        const button = document.createElement('button'); button.type = 'button'; button.disabled = !item.readable;
+                        const icon = document.createElement('i'); icon.className = 'fas fa-folder'; icon.setAttribute('aria-hidden', 'true');
+                        button.append(icon, document.createTextNode(item.name + (item.readable ? '' : ' (no access)')));
+                        button.addEventListener('click', () => loadPickerFolder(item.path)); pickerList.append(button);
+                    });
+                } catch (error) {
+                    if (request !== pickerRequest || !folderPicker.open) return;
+                    pickerMessage.textContent = error.message;
+                    pickerUp.disabled = !pickerFolder || pickerParent === null;
+                }
+            }
+            function openFolderPicker(input, scope) {
+                pickerScope = scope; pickerTarget = input; pickerFolder = null; pickerParent = null;
+                (input.closest('.modal') || document.body).append(folderPicker);
+                document.getElementById('folder-picker-title').textContent = scope === 'server' ? 'Choose workspace folder' : 'Choose destination folder';
+                document.getElementById('folder-picker-website').hidden = scope !== 'server';
+                folderPicker.showModal();
+                loadPickerFolder(input.value || (scope === 'server' ? SERVER_ROOT_PATH : '/'));
+            }
+            document.getElementById('browse-workspace').addEventListener('click', () => openFolderPicker(document.getElementById('settings-root'), 'server'));
+            document.getElementById('browse-destination').addEventListener('click', () => openFolderPicker(document.getElementById('destinationPath'), 'workspace'));
+            document.getElementById('folder-picker-home').addEventListener('click', () => loadPickerFolder(pickerScope === 'server' ? SERVER_ROOT_PATH : '/'));
+            document.getElementById('folder-picker-website').addEventListener('click', () => loadPickerFolder(WEBSITE_FOLDER));
+            pickerUp.addEventListener('click', () => { if (pickerParent !== null) loadPickerFolder(pickerParent); });
+            document.getElementById('folder-picker-cancel').addEventListener('click', () => folderPicker.close());
+            pickerUse.addEventListener('click', () => {
+                if (pickerUse.disabled) return;
+                pickerTarget.value = pickerFolder;
+                pickerTarget.dispatchEvent(new Event('input', {bubbles:true}));
+                folderPicker.close();
+            });
+            folderPicker.addEventListener('close', () => { pickerRequest++; pickerTarget?.focus(); });
 
             // ── File list ─────────────────────────────────────────────
             async function requestWorkspace(action, fields = {}, options = {}) {
@@ -7616,9 +7821,9 @@ var qrcode = function() {
             function showContextMenu(x, y, type) {
                 const menu = document.getElementById('context-menu');
                 document.getElementById('ctx-download').style.display = type === 'file' ? 'flex' : 'none';
-                document.getElementById('ctx-open-divider').style.display = type === 'file' && PUBLIC_WORKSPACE_BASE !== null ? 'block' : 'none';
-                document.getElementById('ctx-browser').style.display = type === 'file' && PUBLIC_WORKSPACE_BASE !== null ? 'flex' : 'none';
-                document.getElementById('ctx-phone').style.display = type === 'file' && PUBLIC_WORKSPACE_BASE !== null ? 'flex' : 'none';
+                document.getElementById('ctx-open-divider').style.display = type === 'file' && canOpenBrowserFile(contextTarget) ? 'block' : 'none';
+                document.getElementById('ctx-browser').style.display = type === 'file' && canOpenBrowserFile(contextTarget) ? 'flex' : 'none';
+                document.getElementById('ctx-phone').style.display = type === 'file' && canOpenBrowserFile(contextTarget) ? 'flex' : 'none';
                 document.getElementById('ctx-extract').style.display = type === 'file' && /\.(zip|tar|gz|gzip|bz2|bzip2|rar|7z)$/i.test(contextTarget.name) ? 'flex' : 'none';
                 document.getElementById('ctx-edit').style.display = type === 'file' ? 'flex' : 'none';
                 document.getElementById('ctx-open').style.display = type === 'dir' ? 'flex' : 'none';
@@ -7682,6 +7887,8 @@ var qrcode = function() {
                 const isFile = selectedFile?.type === 'file';
                 const isArchive = isFile && ['zip', 'tar', 'gz', 'gzip', 'bz2', 'bzip2', 'rar', '7z'].includes((selectedFile.extension || '').toLowerCase());
 
+                const browserFile = selectedBrowserFile();
+                const publicFile = browserFile && canOpenBrowserFile(browserFile);
                 const states = {
                     'permissions-btn': n === 1 && !inTrash,
                     'edit-btn': n === 1 && !inTrash,
@@ -7691,8 +7898,8 @@ var qrcode = function() {
                     'delete-btn': n > 0 && !inTrash,
                     'compress-btn': n > 0 && !inTrash,
                     'download-btn': isFile && !inTrash,
-                    'open-browser-btn': PUBLIC_WORKSPACE_BASE !== null && !inTrash && (activeEditorPath !== null || isFile),
-                    'open-phone-btn': PUBLIC_WORKSPACE_BASE !== null && !inTrash && (activeEditorPath !== null || isFile),
+                    'open-browser-btn': publicFile && !inTrash && (activeEditorPath !== null || isFile),
+                    'open-phone-btn': publicFile && !inTrash && (activeEditorPath !== null || isFile),
                     'extract-btn': isArchive && !inTrash,
                     'restore-btn': n > 0 && inTrash,
                     'unselect-all-btn': n > 0,
@@ -8394,11 +8601,16 @@ var qrcode = function() {
             }
             window.addEventListener('resize', resizeMobileWorkspace);
             resizeMobileWorkspace();
+            function updateWorkspaceTitle() {
+                const name = activeEditorPath ? activeEditorPath.split('/').pop() : 'Files';
+                window.setWorkspaceDocumentTitle(name, activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.dirty);
+            }
             function activateTab(path) {
                 document.body.classList.toggle('mobile-editor', path !== null);
                 document.body.classList.remove('mobile-file-list');
                 closeMobileMenu();
                 activeEditorPath = path;
+                updateWorkspaceTitle();
                 scheduleSaveTabs();
                 updateEditorMenu();
                 refreshMobileTabs();
@@ -8540,6 +8752,7 @@ var qrcode = function() {
                         tab.dirty = dirty;
                         tab.dot.hidden = !dirty;
                         tab.close.title = dirty ? 'Close — unsaved changes' : 'Close';
+                        updateWorkspaceTitle();
                         refreshMobileTabs();
                     }
                 });
@@ -8641,10 +8854,20 @@ var qrcode = function() {
             });
 
             function browserFileURL(name, directory) {
-                if (PUBLIC_WORKSPACE_BASE === null) throw new Error('This workspace has no public URL under the web document root.');
-                const segments = (directory + '/' + name).split('/').filter(Boolean);
+                let segments = (directory + '/' + name).split('/').filter(Boolean);
                 if (segments.some(segment => segment === '.' || segment === '..' || segment.includes('\\'))) throw new Error('Invalid file path.');
-                return location.origin + PUBLIC_WORKSPACE_BASE + '/' + segments.map(encodeURIComponent).join('/');
+                let base = PUBLIC_WORKSPACE_BASE;
+                if (base === null) {
+                    const prefix = typeof PUBLIC_WEBSITE_PREFIX === 'string' ? PUBLIC_WEBSITE_PREFIX.split('/').filter(Boolean) : null;
+                    if (!prefix || !prefix.every((part, index) => segments[index] === part) || segments.length <= prefix.length) throw new Error('This file has no public URL under the web document root.');
+                    segments = segments.slice(prefix.length); base = '';
+                }
+                return location.origin + base + '/' + segments.map(encodeURIComponent).join('/');
+            }
+            function canOpenBrowserFile(file) {
+                if (!file) return false;
+                try { browserFileURL(file.name, file.directory); return true; }
+                catch (_) { return false; }
             }
             function openFileInBrowser(name, directory) {
                 try { window.open(browserFileURL(name, directory), '_blank', 'noopener,noreferrer'); }
