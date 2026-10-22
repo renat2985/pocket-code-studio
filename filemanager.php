@@ -29,6 +29,127 @@ function fmPrivateAuthDirectory()
     if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0700)) || !@chmod($directory, 0700)) fmAuthReply(503, 'Cannot prepare private authentication storage. Access denied.');
     return $directory;
 }
+function fmReadAuthData($path, $default = [])
+{
+    if (is_link($path)) throw new RuntimeException('Invalid authentication data file.');
+    if (!is_file($path)) return $default;
+    $json = @file_get_contents($path, false, null, 0, 1048577);
+    if (!is_string($json) || strlen($json) > 1048576) throw new RuntimeException('Authentication data unavailable.');
+    $data = json_decode($json, true);
+    if (!is_array($data)) throw new RuntimeException('Invalid authentication data.');
+    return $data;
+}
+function fmWriteAuthData($path, $data)
+{
+    if (is_link($path)) throw new RuntimeException('Invalid authentication data file.');
+    $json = json_encode($data, JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+    if (strlen($json) > 1048576) throw new RuntimeException('Authentication data exceeds its size limit.');
+    $temp = @tempnam(dirname($path), '.login-');
+    if (!$temp) throw new RuntimeException('Cannot prepare authentication data.');
+    try {
+        if (realpath(dirname($temp)) !== realpath(dirname($path))) throw new RuntimeException('Cannot prepare authentication data.');
+        if (!@chmod($temp, 0600) || @file_put_contents($temp, $json) !== strlen($json) || !@rename($temp, $path)) throw new RuntimeException('Cannot store authentication data.');
+    } finally { if (is_file($temp)) @unlink($temp); }
+}
+function fmLoginPolicy()
+{
+    $default = ['per_ip' => 8, 'global' => 64, 'window_minutes' => 15];
+    try { return fmValidateLoginPolicy(fmReadAuthData(fmPrivateAuthDirectory() . '/login-policy.json', $default)); }
+    catch (Throwable $error) { return $default; }
+}
+function fmValidateLoginPolicy($data)
+{
+    $result = [];
+    foreach (['per_ip' => [1,100], 'global' => [1,1000], 'window_minutes' => [1,1440]] as $key => $limits) {
+        $value = $data[$key] ?? null;
+        if ((!is_int($value) && !is_string($value)) || !preg_match('/^[0-9]+$/D', (string) $value) || $value < $limits[0] || $value > $limits[1]) throw new RuntimeException('Invalid login limit: ' . $key . '.');
+        $result[$key] = (int) $value;
+    }
+    if ($result['global'] < $result['per_ip']) throw new RuntimeException('The global limit must be at least the per-IP limit.');
+    return $result;
+}
+function fmWithActivityLock($callback)
+{
+    $directory = fmPrivateAuthDirectory(); $path = $directory . '/activity.lock';
+    if (is_link($path)) throw new RuntimeException('Invalid activity lock.');
+    $handle = @fopen($path, 'c');
+    if (!$handle) throw new RuntimeException('Cannot open activity lock.');
+    try {
+        if (!@chmod($path, 0600) || !flock($handle, LOCK_EX)) throw new RuntimeException('Cannot lock login activity.');
+        return $callback($directory);
+    } finally { flock($handle, LOCK_UN); fclose($handle); }
+}
+function fmRecordLoginEvent($ip, $result, $agent = '', $actor = null)
+{
+    fmWithActivityLock(function ($directory) use ($ip, $result, $agent, $actor) {
+        $now = time(); $path = $directory . '/login-activity.json';
+        $events = array_values(array_filter(fmReadAuthData($path), function ($event) use ($now) { return is_array($event) && ($event['last'] ?? 0) >= $now - 604800; }));
+        $merged = false;
+        if ($result === 'blocked') {
+            for ($i = count($events) - 1; $i >= max(0, count($events) - 50); $i--) {
+                if ($events[$i]['ip'] === $ip && $events[$i]['result'] === 'blocked' && $events[$i]['first'] >= $now - 60) {
+                    $events[$i]['last'] = $now; $events[$i]['count']++; $events[$i]['agent'] = substr($agent, 0, 180); $merged = true; break;
+                }
+            }
+        }
+        if (!$merged) $events[] = ['ip' => $ip, 'result' => $result, 'first' => $now, 'last' => $now, 'count' => 1, 'agent' => substr($agent, 0, 180), 'actor' => $actor];
+        usort($events, function ($a, $b) { return $a['last'] <=> $b['last']; });
+        $events = array_slice($events, -2000);
+        while (strlen(json_encode($events, JSON_INVALID_UTF8_SUBSTITUTE)) > 1000000) $events = array_slice($events, (int) ceil(count($events) / 5));
+        fmWriteAuthData($path, $events);
+    });
+}
+function fmLoginActivitySnapshot()
+{
+    $directory = fmPrivateAuthDirectory(); $policy = fmLoginPolicy(); $now = time();
+    $path = $directory . '/attempts.json'; $state = [];
+    if (is_link($path)) throw new RuntimeException('Invalid login counters.');
+    if (is_file($path)) {
+        $handle = @fopen($path, 'r');
+        if (!$handle) throw new RuntimeException('Cannot read login counters.');
+        try { if (!flock($handle, LOCK_SH)) throw new RuntimeException('Cannot lock login counters.'); $state = fmReadAuthData($path); }
+        finally { flock($handle, LOCK_UN); fclose($handle); }
+    }
+    $events = fmReadAuthData($directory . '/login-activity.json');
+    $rows = []; $failures = 0; $lastSuccess = null; $blockedIPs = 0;
+    foreach ($events as $event) {
+        if (!is_array($event) || ($event['last'] ?? 0) < $now - 604800) continue;
+        $key = hash('sha256', $event['ip']);
+        if (!isset($rows[$key])) $rows[$key] = ['key' => $key, 'ip' => $event['ip'], 'first' => $event['first'], 'last' => 0, 'failures' => 0, 'agent' => '', 'last_success' => null, 'events' => []];
+        $row = &$rows[$key]; $row['first'] = min($row['first'], $event['first']); $row['last'] = max($row['last'], $event['last']);
+        if ($event['agent'] !== '') $row['agent'] = $event['agent'];
+        if ($event['last'] >= $now - 86400 && in_array($event['result'], ['wrong_password','blocked'], true)) { $failures += $event['count']; $row['failures'] += $event['count']; }
+        if ($event['result'] === 'success') { $row['last_success'] = max($row['last_success'] ?? 0, $event['last']); $lastSuccess = max($lastSuccess ?? 0, $event['last']); }
+        $row['events'][] = $event; $row['events'] = array_slice($row['events'], -20); unset($row);
+    }
+    foreach ($state as $key => $counter) {
+        if ($key === 'global' || ($counter['since'] ?? 0) < $now - $policy['window_minutes'] * 60) continue;
+        if (!isset($rows[$key])) $rows[$key] = ['key' => $key, 'ip' => $counter['ip'] ?? 'Unknown (legacy counter)', 'first' => $counter['since'], 'last' => $counter['last'] ?? $counter['since'], 'failures' => $counter['count'], 'agent' => '', 'last_success' => null, 'events' => []];
+        $rows[$key]['attempts'] = $counter['count'];
+        $rows[$key]['blocked_until'] = $counter['count'] >= $policy['per_ip'] ? $counter['since'] + $policy['window_minutes'] * 60 : null;
+        if ($rows[$key]['blocked_until']) $blockedIPs++;
+    }
+    foreach ($rows as &$row) { $row += ['attempts' => 0, 'blocked_until' => null]; $row['events'] = array_reverse($row['events']); } unset($row);
+    $rows = array_values($rows); usort($rows, function ($a, $b) { return $b['last'] <=> $a['last']; });
+    $global = $state['global'] ?? [];
+    $globalUntil = ($global['count'] ?? 0) >= $policy['global'] && ($global['since'] ?? 0) + $policy['window_minutes'] * 60 > $now ? $global['since'] + $policy['window_minutes'] * 60 : null;
+    return ['rows' => $rows, 'policy' => $policy, 'failures_24h' => $failures, 'blocked_ips' => $blockedIPs, 'last_success' => $lastSuccess, 'global_blocked_until' => $globalUntil, 'now' => $now, 'current_ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown'];
+}
+function fmResetLoginLimit($key)
+{
+    if ($key !== 'global' && (!is_string($key) || !preg_match('/^[a-f0-9]{64}$/D', $key))) throw new RuntimeException('Invalid login counter.');
+    $path = fmPrivateAuthDirectory() . '/attempts.json';
+    if (is_link($path)) throw new RuntimeException('Invalid login counters.');
+    $handle = @fopen($path, 'c+');
+    if (!$handle) throw new RuntimeException('Cannot read login counters.');
+    try {
+        if (!@chmod($path, 0600) || !flock($handle, LOCK_EX)) throw new RuntimeException('Cannot lock login counters.');
+        $state = fmReadAuthData($path, []); $ip = $key === 'global' ? ($_SERVER['REMOTE_ADDR'] ?? 'unknown') : ($state[$key]['ip'] ?? 'unknown'); unset($state[$key]);
+        $json = json_encode($state); rewind($handle);
+        if (fwrite($handle, $json) !== strlen($json) || !ftruncate($handle, strlen($json)) || !fflush($handle)) throw new RuntimeException('Cannot reset login counter.');
+    } finally { flock($handle, LOCK_UN); fclose($handle); }
+    fmRecordLoginEvent($ip, $key === 'global' ? 'global_limit_reset' : 'limit_reset', '', $_SERVER['REMOTE_ADDR'] ?? 'unknown');
+}
 function fmLoginAttempt($password, $hash)
 {
     $directory = fmPrivateAuthDirectory();
@@ -37,16 +158,17 @@ function fmLoginAttempt($password, $hash)
     $handle = @fopen($path, 'c+');
     if (!$handle || !@chmod($path, 0600) || !flock($handle, LOCK_EX)) fmAuthReply(503, 'Cannot lock authentication storage.');
     $state = json_decode(stream_get_contents($handle), true) ?: [];
-    $now = time();
-    foreach ($state as $key => $value) if ($value['since'] < $now - 900) unset($state[$key]);
+    $now = time(); $policy = fmLoginPolicy();
+    foreach ($state as $key => $value) if ($value['since'] < $now - $policy['window_minutes'] * 60) unset($state[$key]);
     $key = hash('sha256', $_SERVER['REMOTE_ADDR'] ?? 'unknown');
-    $blocked = ($state[$key]['count'] ?? 0) >= 8 || ($state['global']['count'] ?? 0) >= 64;
+    $blocked = ($state[$key]['count'] ?? 0) >= $policy['per_ip'] || ($state['global']['count'] ?? 0) >= $policy['global'];
     $valid = !$blocked && is_string($password) && strlen($password) <= 72 && password_verify($password, $hash);
     if (!$valid && !$blocked) {
         foreach ([$key, 'global'] as $counter) {
             $state[$counter] = ['since' => $state[$counter]['since'] ?? $now, 'count' => ($state[$counter]['count'] ?? 0) + 1];
         }
     }
+    if (isset($state[$key])) { $state[$key]['ip'] = $_SERVER['REMOTE_ADDR'] ?? 'unknown'; $state[$key]['last'] = $now; }
     if ($valid) unset($state[$key]);
     $json = json_encode($state);
     rewind($handle);
@@ -54,6 +176,8 @@ function fmLoginAttempt($password, $hash)
     $stored = $written === strlen($json) && ftruncate($handle, strlen($json)) && fflush($handle);
     flock($handle, LOCK_UN); fclose($handle);
     if (!$stored) fmAuthReply(503, 'Cannot record login attempt. Access denied.');
+    try { fmRecordLoginEvent($_SERVER['REMOTE_ADDR'] ?? 'unknown', $valid ? 'success' : ($blocked ? 'blocked' : 'wrong_password'), $_SERVER['HTTP_USER_AGENT'] ?? ''); }
+    catch (Throwable $ignored) { error_log('Pocket Code Studio: login activity could not be recorded.'); }
     return [$valid, $blocked];
 }
 // Password and UI settings share one lock so simultaneous changes preserve each other.
@@ -191,12 +315,14 @@ if (!$authenticated && $authAction === 'login' && $isPostRequest) {
         session_regenerate_id(true);
         $_SESSION['auth'] = $authFingerprint;
         $_SESSION['auth_started'] = $_SESSION['auth_seen'] = $authNow;
+
+        $_SESSION['login_notice_pending'] = true;
         $_SESSION['csrf'] = bin2hex(random_bytes(32));
         session_write_close();
         header('Location: ' . $_SERVER['SCRIPT_NAME'], true, 303);
         exit;
     }
-    $loginError = $blocked ? 'Too many attempts. Try again in 15 minutes.' : 'Incorrect password.';
+    $loginError = $blocked ? 'Too many attempts. Try again later.' : 'Incorrect password.';
     http_response_code($blocked ? 429 : 401);
 }
 if (!$authenticated) {
@@ -215,6 +341,19 @@ if (!$authenticated) {
 <?php session_write_close(); exit;
 }
 $_SESSION['auth_seen'] = $authNow;
+if ($isPostRequest && ($_POST['action'] ?? '') === 'login_activity') {
+    try {
+        $operation = $_POST['operation'] ?? 'read';
+        if ($operation === 'reset') fmResetLoginLimit($_POST['key'] ?? null);
+        elseif ($operation === 'policy') {
+            $policy = fmValidateLoginPolicy($_POST);
+            fmWithActivityLock(function ($directory) use ($policy) { fmWriteAuthData($directory . '/login-policy.json', $policy); });
+            fmRecordLoginEvent($_SERVER['REMOTE_ADDR'] ?? 'unknown', 'policy_changed');
+        } elseif ($operation !== 'read') throw new RuntimeException('Unknown login activity action.');
+        fmAuthReply(200, 'Login activity loaded.', fmLoginActivitySnapshot());
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
+}
+
 if ($authAction === 'logout' && $isPostRequest) {
     $_SESSION = [];
     session_destroy();
@@ -273,6 +412,14 @@ if ($authAction === 'change_password' && $isPostRequest) {
     } catch (Throwable $error) { fmAuthReply(500, $error->getMessage()); }
 }
 if (!$isPostRequest && isset($_GET['action']) && (!is_string($_GET['action']) || !in_array($_GET['action'], ['list', 'tree', 'search', 'download'], true))) fmAuthReply(405, 'File changes require a protected POST request.');
+$loginBlockedNotice = null;
+if (!$isPostRequest && !isset($_GET['editor']) && !isset($_GET['action']) && !empty($_SESSION['login_notice_pending'])) {
+    unset($_SESSION['login_notice_pending']);
+    try {
+        $activity = fmLoginActivitySnapshot();
+        if ($activity['blocked_ips'] > 0) $loginBlockedNotice = $activity['blocked_ips'];
+    } catch (Throwable $ignored) {}
+}
 session_write_close();
 // No application code or file operation executes before this authentication gate.
 
@@ -351,7 +498,8 @@ if ($isPostRequest && ($_POST['action'] ?? '') === 'browse_folders') {
 date_default_timezone_set($config["timezone"]);
 
 /*
-Embedded Seti file icons from microsoft/vscode/extensions/theme-seti.
+Seti icon mappings from microsoft/vscode/extensions/theme-seti.
+Font loaded from jsDelivr, pinned to revision 8993bc4913b5ecd98a639457ac1dabf5e4c58787.
 
 THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 For Microsoft vscode-theme-seti
@@ -543,9 +691,12 @@ $workspaceThemeScript = <<<'JS'
             if (typeof frame.contentWindow.applySelectedTheme === 'function') frame.contentWindow.applySelectedTheme(theme);
         });
     };
+    function escapeAlertText(value) {
+        return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    }
     window.workspaceAlert = function(message, title = 'Editor', icon = /error|failed/i.test(title) ? 'error' : 'info') {
         if (window.parent !== window && typeof window.parent.workspaceAlert === 'function') return window.parent.workspaceAlert(message, title, icon);
-        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title, text: String(message), icon, showCancelButton: false, confirmButtonText: 'OK'});
+        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title: escapeAlertText(title), text: escapeAlertText(message), icon, showCancelButton: false, confirmButtonText: 'OK'});
         window.alert(message);
         return Promise.resolve({isConfirmed: true});
     };
@@ -573,7 +724,7 @@ $workspaceThemeScript = <<<'JS'
         const duration = type === 'success' ? 3000 : 5000;
         if (typeof CoolAlert !== 'undefined') {
             try {
-                const result = CoolAlert.show({toast: true, icon: type, title, text: String(message), duration});
+                const result = CoolAlert.show({toast: true, icon: type, title: escapeAlertText(title), text: escapeAlertText(message), duration});
                 startToastCountdown(document.querySelector('#cool-alert-toast-container .cool-alert-toast:last-child'), duration);
                 return result;
             } catch (_) {}
@@ -597,7 +748,7 @@ $workspaceThemeScript = <<<'JS'
     };
     window.workspaceConfirm = function(message) {
         if (window.parent !== window && typeof window.parent.workspaceConfirm === 'function') return window.parent.workspaceConfirm(message);
-        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title: 'Unsaved changes', text: String(message), icon: 'warning', showCancelButton: true, confirmButtonText: 'Discard changes', cancelButtonText: 'Keep editing'}).then(result => result.isConfirmed);
+        if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title: 'Unsaved changes', text: escapeAlertText(message), icon: 'warning', showCancelButton: true, confirmButtonText: 'Discard changes', cancelButtonText: 'Keep editing'}).then(result => result.isConfirmed);
         return Promise.resolve(window.confirm(message));
     };
     window.applyWorkspacePalette = applyPalette;
@@ -612,7 +763,7 @@ $workspaceThemeScript = <<<'JS'
             const message = 'The page did not finish initializing. Reload the page; if this continues, check the end of the HTML response and the server PHP error log.';
             const row = document.createElement('tr');
             const cell = document.createElement('td');
-            cell.colSpan = 7; cell.style.padding = '20px'; cell.textContent = message;
+            cell.colSpan = 8; cell.style.padding = '20px'; cell.textContent = message;
             row.append(cell); files.replaceChildren(row);
             const tree = document.querySelector('#directory-tree .file-tree');
             if (tree) { const item = document.createElement('li'); item.className = 'tree-message'; item.textContent = 'Page initialization incomplete. Please reload.'; tree.replaceChildren(item); }
@@ -643,7 +794,7 @@ $workspaceThemeScript = <<<'JS'
         /* Avoid browser zoom while typing in mobile dialogs. */
         .modal :is(input.form-control, textarea.form-control, select.form-select) { font-size: 16px !important; }
     }
-    .workspace-toast { position: fixed; top: 48px; right: 16px; max-width: min(380px, calc(100vw - 32px)); padding: 12px 16px; gap: 10px; align-items: center; z-index: 9999; background: var(--bg-main); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 6px; box-shadow: 0 8px 32px #00000040; font: 400 var(--workspace-ui-font-size)/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .workspace-toast { position: fixed; top: 48px; right: 16px; max-width: min(380px, calc(100vw - 32px)); padding: 12px 16px 22px; gap: 10px; align-items: center; z-index: 9999; background: var(--bg-main); color: var(--text-primary); border: 1px solid var(--border-default); border-radius: 6px; box-shadow: 0 8px 32px #00000040; font: 400 var(--workspace-ui-font-size)/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
     .workspace-toast > i { color: var(--accent-success); }
     .workspace-toast[data-type="error"] > i { color: var(--accent-danger); }
     .workspace-toast[data-type="warning"] > i { color: var(--accent-warning); }
@@ -667,10 +818,9 @@ $workspaceThemeScript = <<<'JS'
         --bs-table-hover-bg: var(--bg-selected); --bs-table-active-color: var(--text-primary);
         --bs-table-active-bg: var(--bg-selected); color: var(--text-primary);
     }
-    .modal .table thead th { background: var(--bg-elevated); color: var(--text-secondary); border-color: var(--border-subtle); font-size: 0.75rem; font-weight: 500; }
+    .modal .table thead th { background: var(--bg-elevated); color: var(--text-secondary); border-color: var(--border-subtle); font-size: 0.75rem; font-weight: 500; position: sticky; top: 0; z-index: 1; }
     .modal .table td { font-size: 0.8rem; border-color: var(--border-subtle); vertical-align: middle; }
     .modal .table-responsive { max-height: 65vh; overflow: auto; }
-    .modal .table thead th { position: sticky; top: 0; z-index: 1; }
     .modal .text-muted, .modal .form-text, .modal small { color: var(--text-muted) !important; }
     .modal .form-select option { background: var(--bg-deep); color: var(--text-primary); }
     .modal .form-control:focus, .modal .form-select:focus { box-shadow: 0 0 0 2px var(--bg-selected); }
@@ -690,9 +840,13 @@ $workspaceThemeScript = <<<'JS'
     :root[data-workspace-theme="tomorrow"] .modal .btn-close,
     :root[data-workspace-theme="kuroir"] .modal .btn-close { filter: none; }
     .cool-alert-modal, .cool-alert-toast { background: var(--bg-main) !important; color: var(--text-primary) !important; border: 1px solid var(--border-default) !important; box-shadow: 0 8px 32px #00000040 !important; }
-    .cool-alert-modal-header { background: var(--bg-surface) !important; border-color: var(--border-subtle) !important; }
+    /* The empty drag handle must not paint over the alert icon. */
+    .cool-alert-modal-header, .cool-alert-modal-header:hover {
+        height: 16px !important; background: transparent !important;
+        border: 0 !important; box-shadow: none !important;
+    }
     .cool-alert-modal-title, .cool-alert-toast-title, .cool-alert-title { color: var(--text-primary) !important; }
-    .cool-alert-modal-message, .cool-alert-toast-message, .cool-alert-text { color: var(--text-secondary) !important; }
+    .cool-alert-modal-message, .cool-alert-toast-message, .cool-alert-text { color: var(--text-secondary) !important; white-space: pre-line; overflow-wrap: anywhere; }
     .cool-alert-modal-btn { border-radius: 4px !important; font-size: 0.8rem !important; }
     .cool-alert-modal-btn.cool-alert-primary { background: var(--accent) !important; color: var(--accent-contrast) !important; border-color: var(--accent) !important; }
     .cool-alert-modal-btn.cool-alert-secondary { background: var(--bg-elevated) !important; color: var(--text-secondary) !important; border: 1px solid var(--border-default) !important; }
@@ -709,7 +863,6 @@ $workspaceThemeScript = <<<'JS'
         font-variant-numeric: tabular-nums; text-align: right;
     }
     .cool-alert-toast-progress::after, .workspace-toast-timer::after { content: none !important; }
-    .workspace-toast { padding-bottom: 22px; }
     .cool-alert-spinner { border-color: var(--border-default) !important; border-top-color: var(--text-secondary) !important; }
     .modal .alert-info { background: var(--bg-selected); color: var(--text-primary); border-color: var(--border-default); }
     .modal .alert-warning, .modal .alert-danger { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-default); }
@@ -932,6 +1085,21 @@ function editorReply($statusCode, $status, $message, $extra = [])
     exit();
 }
 
+function editorOpenError($message, $statusCode = 400)
+{
+    global $workspaceThemeScript;
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET' && isset($_GET['check'])) editorReply($statusCode, 'error', $message);
+    http_response_code($statusCode);
+    header('Content-Type: text/html; charset=UTF-8');
+    header('Cache-Control: no-store');
+    $json = json_encode($message, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+    echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cannot open file</title>' . $workspaceThemeScript;
+    echo '<style>body{margin:0;background:var(--bg-deep);color:var(--text-primary);font:14px system-ui}</style></head><body>';
+    echo '<script src="https://cdn.jsdelivr.net/npm/coolalertjs@latest/dist/coolalert.min.js"></script>';
+    echo '<script>window.fmEditorOpenError=' . $json . ';if(window.parent===window){window.workspaceAlert(window.fmEditorOpenError,"Cannot open file","warning");}</script></body></html>';
+    exit;
+}
+
 function editorTextFormat($text)
 {
     if (strpos($text, "\0") !== false || preg_match('//u', $text) !== 1) {
@@ -974,14 +1142,15 @@ $editorRoot = realpath($config['root_path']);
 $filename = is_string($requestedFilename) && strpos($requestedFilename, "\0") === false ? realpath($requestedFilename) : false;
 if (!$editorRoot || !$filename || !is_file($filename) || ($filename !== $editorRoot && strpos($filename, rtrim($editorRoot, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0)) {
     if ($isEditorSave) editorReply(400, 'error', 'Invalid file specified.');
-    die('Invalid file specified.');
+    editorOpenError('Invalid file specified.', 404);
 }
 header('Cache-Control: no-store');
 $imageTypes = ['png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg', 'gif' => 'image/gif', 'webp' => 'image/webp', 'bmp' => 'image/bmp', 'ico' => 'image/x-icon', 'avif' => 'image/avif', 'svg' => 'image/svg+xml'];
 $imageExtension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 if (isset($imageTypes[$imageExtension])) {
     if ($isEditorSave) editorReply(405, 'error', 'Images are available for preview only.');
-    if (!is_readable($filename)) { http_response_code(403); die('Cannot read image.'); }
+    if (!is_readable($filename)) editorOpenError('Cannot read image.', 403);
+    if (isset($_GET['check'])) editorReply(200, 'success', 'Image preview available.', ['kind' => 'image']);
     if (isset($_GET['image'])) {
         header('Content-Type: ' . $imageTypes[$imageExtension]);
         header('X-Content-Type-Options: nosniff');
@@ -1083,11 +1252,12 @@ if ($isEditorSave) {
     if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
     editorReply(200, 'success', 'File saved and verified.', $result);
 }
-if (filesize($filename) > $maxEditorBytes) die('File is too large for safe editing (maximum 8 MB).');
+if (filesize($filename) > $maxEditorBytes) editorOpenError('File is too large for safe editing (maximum 8 MB).', 413);
 $fileContents = @file_get_contents($filename);
-if ($fileContents === false) die('Cannot read file. Saving is disabled.');
+if ($fileContents === false) editorOpenError('Cannot read file. Saving is disabled.', 403);
 try { $originalNewline = editorTextFormat($fileContents); }
-catch (Throwable $error) { die(htmlspecialchars($error->getMessage(), ENT_QUOTES, 'UTF-8')); }
+catch (Throwable $error) { editorOpenError($error->getMessage()); }
+if (isset($_GET['check'])) editorReply(200, 'success', 'Text editor available.', ['kind' => 'text']);
 $fileHash = hash('sha256', $fileContents);
 $fileExtension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 $basename = basename($filename);
@@ -1581,10 +1751,9 @@ $lineCount = substr_count($fileContents, "\n") + 1;
 
         #subbar { position: static; flex-shrink: 0; overflow: hidden; white-space: nowrap; }
         #subbar > span:first-child { overflow: hidden; text-overflow: ellipsis; }
-        #editor-wrap { position: relative; inset: auto; flex: 1; min-height: 0; display: flex; }
+        #editor-wrap { position: relative; inset: auto; flex: 1; min-height: 0; display: flex; overflow: hidden; }
         #editor { flex: 1; min-width: 0; width: auto; }
         /* The minimap handles vertical navigation; keep Ace's own bar as a fallback. */
-        #editor-wrap { overflow: hidden; }
         #editor .ace_scrollbar-v { visibility: hidden; pointer-events: none; }
         body.minimap-hidden #editor .ace_scrollbar-v { visibility: visible; pointer-events: auto; }
         #editor .ace_scrollbar { scrollbar-width: thin; scrollbar-color: var(--scrollbar-gold) var(--bg-main); }
@@ -2382,7 +2551,7 @@ function formatSize($bytes)
 }
 
 // Use identical Seti icons in the listing, sidebar and tabs.
-/* Embedded Material Icon Theme SVGs. Source: https://github.com/material-extensions/vscode-material-icon-theme
+/* Material Icon Theme SVGs loaded from jsDelivr. Source: https://github.com/material-extensions/vscode-material-icon-theme
 Revision: 13025adc5ad10a5cc649528a2c1edec93069f1b9
 The MIT License (MIT)
 Copyright (c) 2025 Material Extensions
@@ -2394,7 +2563,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 $materialIconData = json_decode(<<<'MATERIAL_ICONS_JSON'
-{"icons":{"php":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzFlODhlNSIgZD0iTTEyIDE4LjA4Yy02LjYzIDAtMTItMi43Mi0xMi02LjA4czUuMzctNi4wOCAxMi02LjA4UzI0IDguNjQgMjQgMTJzLTUuMzcgNi4wOC0xMiA2LjA4bS01LjE5LTcuOTVjLjU0IDAgLjkxLjEgMS4wOS4zMS4xOC4yLjIyLjU2LjEzIDEuMDMtLjEuNTMtLjI5Ljg3LS41OCAxLjA5cS0uNDIuMzMtMS4yOS4zM2gtLjg3bC41My0yLjc2em0tMy41IDUuNTVoMS40NGwuMzQtMS43NWgxLjIzYy41NCAwIC45OC0uMDYgMS4zMy0uMTcuMzUtLjEyLjY3LS4zMS45Ni0uNTguMjQtLjIyLjQzLS40Ni41OC0uNzMuMTUtLjI2LjI2LS41Ni4zMS0uODguMTYtLjc4LjA1LTEuMzktLjMzLTEuODItLjM5LS40NC0uOTktLjY1LTEuODItLjY1SDQuNTl6bTcuMjUtOC4zMy0xLjI4IDYuNThoMS40MmwuNzQtMy43N2gxLjE0Yy4zNiAwIC42LjA2LjcxLjE4cy4xMy4zNC4wNy42NmwtLjU3IDIuOTNoMS40NWwuNTktMy4wN2MuMTMtLjYyLjAzLTEuMDctLjI3LTEuMzYtLjMtLjI3LS44NS0uNC0xLjY1LS40aC0xLjI3TDEyIDcuMzV6TTE4IDEwLjEzYy41NSAwIC45MS4xIDEuMDkuMzEuMTguMi4yMi41Ni4xMyAxLjAzLS4xLjUzLS4yOS44Ny0uNTcgMS4wOS0uMjkuMjItLjcyLjMzLTEuMy4zM2gtLjg1bC41LTIuNzZ6bS0zLjUgNS41NWgxLjQ0bC4zNC0xLjc1aDEuMjJjLjU1IDAgMS0uMDYgMS4zNS0uMTcuMzUtLjEyLjY1LS4zMS45NS0uNTguMjQtLjIyLjQ0LS40Ni41OC0uNzMuMTUtLjI2LjI2LS41Ni4zMi0uODguMTUtLjc4LjA0LTEuMzktLjM0LTEuODItLjM2LS40NC0uOTktLjY1LTEuODItLjY1aC0yLjc1eiIvPjwvc3ZnPg==","android":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjQiIGhlaWdodD0iMTAiIHg9IjIiIHk9IjEyIiBmaWxsPSIjOGJjMzRhIiByeD0iMiIvPjxyZWN0IHdpZHRoPSI0IiBoZWlnaHQ9IjEwIiB4PSIyNiIgeT0iMTIiIGZpbGw9IiM4YmMzNGEiIHJ4PSIyIi8+PHBhdGggZmlsbD0iIzhiYzM0YSIgZD0iTTggMTJoMTZ2MTJIOHptMiAxMmg0djRhMiAyIDAgMCAxLTIgMiAyIDIgMCAwIDEtMi0yem04IDBoNHY0YTIgMiAwIDAgMS0yIDIgMiAyIDAgMCAxLTItMnptMy41NDUtMTkuNzU5IDIuMTItMi4xMkExIDEgMCAwIDAgMjIuMjUxLjcwN2wtMi4zMjYgMi4zMjZhNy45NyA3Ljk3IDAgMCAwLTcuODUgMEw5Ljc1LjcwN2ExIDEgMCAxIDAtMS40MTQgMS40MTRsMi4xMiAyLjEyQTcuOTcgNy45NyAwIDAgMCA4IDEwaDE2YTcuOTcgNy45NyAwIDAgMC0yLjQ1NS01Ljc1OU0xNCA4aC0yVjZoMlptNiAwaC0yVjZoMloiLz48L3N2Zz4=","git":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iI2U2NGExOSIgZD0iTTEzLjE3MiAyLjgyOCAxMS43OCA0LjIybDEuOTEgMS45MSAyIDJBMi45ODYgMi45ODYgMCAwIDEgMjAgMTAuODFhMy4yNSAzLjI1IDAgMCAxLS4zMSAxLjMxbDIuMDYgMmEyLjY4IDIuNjggMCAwIDEgMy4zNy41NyAyLjg2IDIuODYgMCAwIDEgLjg4IDIuMTE3IDMuMDIgMy4wMiAwIDAgMS0uODU2IDIuMTA5QTIuOSAyLjkgMCAwIDEgMjMgMTkuODFhMi45MyAyLjkzIDAgMCAxLTIuMTMtLjg3IDIuNjk0IDIuNjk0IDAgMCAxLS41Ni0zLjM4bC0yLTIuMDZhMyAzIDAgMCAxLS4zMS4xMlYyMGEzIDMgMCAwIDEgMS40NCAxLjA5IDIuOTIgMi45MiAwIDAgMSAuNTYgMS43MiAyLjg4IDIuODggMCAwIDEtLjg3OCAyLjEyOCAyLjk4IDIuOTggMCAwIDEtMi4wNDguODcxIDIuOTgxIDIuOTgxIDAgMCAxLTIuNTE0LTQuNzE5QTMgMyAwIDAgMSAxNiAyMHYtNi4zOGEyLjk2IDIuOTYgMCAwIDEtMS40NC0xLjA5IDIuOSAyLjkgMCAwIDEtLjU2LTEuNzIgMi45IDIuOSAwIDAgMSAuMzEtMS4zMWwtMy45LTMuOS03LjU3OSA3LjU3MmE0IDQgMCAwIDAtLjAwMSA1LjY1OGwxMC4zNDIgMTAuMzQyYTQgNCAwIDAgMCA1LjY1NiAwbDEwLjM0NC0xMC4zNDRhNCA0IDAgMCAwIDAtNS42NTZMMTguODI4IDIuODI4YTQgNCAwIDAgMC01LjY1NiAwIi8+PC9zdmc+","xml":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzhiYzM0YSIgZD0iTTEzIDloNS41TDEzIDMuNXpNNiAyaDhsNiA2djEyYTIgMiAwIDAgMS0yIDJINmEyIDIgMCAwIDEtMi0yVjRjMC0xLjExLjg5LTIgMi0ybS4xMiAxMy41IDMuNzQgMy43NCAxLjQyLTEuNDEtMi4zMy0yLjMzIDIuMzMtMi4zMy0xLjQyLTEuNDF6bTExLjE2IDAtMy43NC0zLjc0LTEuNDIgMS40MSAyLjMzIDIuMzMtMi4zMyAyLjMzIDEuNDIgMS40MXoiLz48L3N2Zz4=","json":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgLTk2MCA5NjAgOTYwIj48cGF0aCBmaWxsPSIjZjlhODI1IiBkPSJNNTYwLTE2MHYtODBoMTIwcTE3IDAgMjguNS0xMS41VDcyMC0yODB2LTgwcTAtMzggMjItNjl0NTgtNDR2LTE0cS0zNi0xMy01OC00NHQtMjItNjl2LTgwcTAtMTctMTEuNS0yOC41VDY4MC03MjBINTYwdi04MGgxMjBxNTAgMCA4NSAzNXQzNSA4NXY4MHEwIDE3IDExLjUgMjguNVQ4NDAtNTYwaDQwdjE2MGgtNDBxLTE3IDAtMjguNSAxMS41VDgwMC0zNjB2ODBxMCA1MC0zNSA4NXQtODUgMzV6bS0yODAgMHEtNTAgMC04NS0zNXQtMzUtODV2LTgwcTAtMTctMTEuNS0yOC41VDEyMC00MDBIODB2LTE2MGg0MHExNyAwIDI4LjUtMTEuNVQxNjAtNjAwdi04MHEwLTUwIDM1LTg1dDg1LTM1aDEyMHY4MEgyODBxLTE3IDAtMjguNSAxMS41VDI0MC02ODB2ODBxMCAzOC0yMiA2OXQtNTggNDR2MTRxMzYgMTMgNTggNDR0MjIgNjl2ODBxMCAxNyAxMS41IDI4LjVUMjgwLTI0MGgxMjB2ODB6Ii8+PC9zdmc+","zip":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2FmYjQyYiIgZD0iTTE0IDE3aC0ydi0yaC0ydi0yaDJ2MmgybTAtNmgtMnYyaDJ2MmgtMnYtMmgtMlY5aDJWN2gtMlY1aDJ2MmgybTUtNEg1Yy0xLjExIDAtMiAuODktMiAydjE0YTIgMiAwIDAgMCAyIDJoMTRhMiAyIDAgMCAwIDItMlY1YTIgMiAwIDAgMC0yLTIiLz48L3N2Zz4=","favicon":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iI2ZmZDU0ZiIgZD0ibTE2IDI0IDEwIDYtNC0xMCA4LTgtMTAtLjAzMkwxNiAybC00IDEwSDJsOCA4LTQgMTBaIi8+PC9zdmc+","image":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZmlsbD0iIzI2YTY5YSIgZD0iTTguNSA2aDRsLTQtNHpNMy44NzUgMUg5LjVsNCA0djguNmMwIC43NzMtLjYxNiAxLjQtMS4zNzUgMS40aC04LjI1Yy0uNzYgMC0xLjM3NS0uNjI3LTEuMzc1LTEuNFYyLjRjMC0uNzc3LjYxMi0xLjQgMS4zNzUtMS40TTQgMTMuNmg4VjhsLTIuNjI1IDIuOEw4IDkuNHptMS4yNS03LjdjLS43NiAwLTEuMzc1LjYyNy0xLjM3NSAxLjRzLjYxNiAxLjQgMS4zNzUgMS40Yy43NiAwIDEuMzc1LS42MjcgMS4zNzUtMS40UzYuMDA5IDUuOSA1LjI1IDUuOSIvPjwvc3ZnPg==","document":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTAgMGgyNHYyNEgweiIvPjxwYXRoIGZpbGw9IiM0MmE1ZjUiIGQ9Ik04IDE2aDh2Mkg4em0wLTRoOHYySDh6bTYtMTBINmMtMS4xIDAtMiAuOS0yIDJ2MTZjMCAxLjEuODkgMiAxLjk5IDJIMThjMS4xIDAgMi0uOSAyLTJWOHptNCAxOEg2VjRoN3Y1aDV6Ii8+PC9zdmc+","robots":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iI2ZmNTI1MiIgZD0iTTI4LjU4NiAxOEgyOGE4IDggMCAwIDAtOC04aC0yVjguNDQ1YTQgNCAwIDEgMC00IDBWMTBoLTJhOCA4IDAgMCAwLTggOGgtLjU4NkExLjQxNCAxLjQxNCAwIDAgMCAyIDE5LjQxNHYzLjE3MkExLjQxNCAxLjQxNCAwIDAgMCAzLjQxNCAyNEg0djFhMyAzIDAgMCAwIDMgM2gxOGEzIDMgMCAwIDAgMy0zdi0xaC41ODZBMS40MTQgMS40MTQgMCAwIDAgMzAgMjIuNTg2di0zLjE3MkExLjQxNCAxLjQxNCAwIDAgMCAyOC41ODYgMThNMTEgMjJhMyAzIDAgMSAxIDMtMyAzIDMgMCAwIDEtMyAzbTEwIDBhMyAzIDAgMSAxIDMtMyAzIDMgMCAwIDEtMyAzIi8+PC9zdmc+","html":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iI2U2NTEwMCIgZD0ibTQgNCAyIDIyIDEwIDIgMTAtMiAyLTIyWm0xOS43MiA3SDExLjI4bC4yOSAzaDExLjg2bC0uODAyIDkuMzM1TDE1Ljk5IDI1bC02LjYzNS0xLjY0Nkw4LjkzIDE5aDMuMDJsLjE5IDIgMy44Ni43NyAzLjg0LS43Ny4yOS00SDguODRMOCA4aDE2WiIvPjwvc3ZnPg==","css":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iIzdlNTdjMiIgZD0iTTIwIDE4aC0ydi0yaC0ydjJjMCAuMTkzIDAgLjcwMyAxLjI1NCAxLjAzM0EzLjM0NSAzLjM0NSAwIDAgMSAyMCAyMmgydjJoMnYtMmMwLS4zODgtLjU2Mi0uODUxLTEuMjU0LTEuMDM0QzIwLjM1NiAyMC4zNCAyMCAxOC44NCAyMCAxOG0tMy4yNTQgMi45NjZDMTQuMzU2IDIwLjM0IDE0IDE4Ljg0IDE0IDE4aC0ydi0yaC0ydjhoMnYtMmg0djJoMnYtMmMwLS4zODgtLjU2Mi0uODUxLTEuMjU0LTEuMDM0Ii8+PHBhdGggZmlsbD0iIzdlNTdjMiIgZD0iTTI0IDRINHYyMGE0IDQgMCAwIDAgNCA0aDE2LjE2QTMuODQgMy44NCAwIDAgMCAyOCAyNC4xNlY4YTQgNCAwIDAgMC00LTRtMiAxNGgtMnYtMmgtMnYyYzAgLjE5MyAwIC43MDMgMS4yNTQgMS4wMzNBMy4zNDUgMy4zNDUgMCAwIDEgMjYgMjJ2MmEyIDIgMCAwIDEtMiAyaC0yYTIgMiAwIDAgMS0yLTIgMiAyIDAgMCAxLTIgMmgtMmEyIDIgMCAwIDEtMi0yIDIgMiAwIDAgMS0yIDJoLTJhMiAyIDAgMCAxLTItMnYtOGEyIDIgMCAwIDEgMi0yaDJhMiAyIDAgMCAxIDIgMiAyIDIgMCAwIDEgMi0yaDJhMiAyIDAgMCAxIDIgMiAyIDIgMCAwIDEgMi0yaDJhMiAyIDAgMCAxIDIgMloiLz48L3N2Zz4=","javascript":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZmlsbD0iI2ZmY2EyOCIgZD0iTTIgMnYxMmgxMlYyem02IDZoMXY0YTEuMDAzIDEuMDAzIDAgMCAxLTEgMUg3YTEuMDAzIDEuMDAzIDAgMCAxLTEtMXYtMWgxdjFoMXptMyAwaDJ2MWgtMnYxaDFhMS4wMDMgMS4wMDMgMCAwIDEgMSAxdjFhMS4wMDMgMS4wMDMgMCAwIDEtMSAxaC0ydi0xaDJ2LTFoLTFhMS4wMDMgMS4wMDMgMCAwIDEtMS0xVjlhMS4wMDMgMS4wMDMgMCAwIDEgMS0xIi8+PC9zdmc+","typescript":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbDpzcGFjZT0icHJlc2VydmUiIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZmlsbD0iIzAyODhkMSIgZD0iTTIgMnYxMmgxMlYyem00IDZoM3YxSDh2NEg3VjlINnptNSAwaDJ2MWgtMnYxaDFhMS4wMDMgMS4wMDMgMCAwIDEgMSAxdjFhMS4wMDMgMS4wMDMgMCAwIDEtMSAxaC0ydi0xaDJ2LTFoLTFhMS4wMDMgMS4wMDMgMCAwIDEtMS0xVjlhMS4wMDMgMS4wMDMgMCAwIDEgMS0xIi8+PC9zdmc+","python":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzAyODhkMSIgZD0iTTkuODYgMkEyLjg2IDIuODYgMCAwIDAgNyA0Ljg2djEuNjhoNC4yOWMuMzkgMCAuNzEuNTcuNzEuOTZINC44NkEyLjg2IDIuODYgMCAwIDAgMiAxMC4zNnYzLjc4MWEyLjg2IDIuODYgMCAwIDAgMi44NiAyLjg2aDEuMTh2LTIuNjhhMi44NSAyLjg1IDAgMCAxIDIuODUtMi44Nmg1LjI1YzEuNTggMCAyLjg2LTEuMjcxIDIuODYtMi44NTFWNC44NkEyLjg2IDIuODYgMCAwIDAgMTQuMTQgMnptLS43MiAxLjYxYy40IDAgLjcyLjEyLjcyLjcxcy0uMzIuODkxLS43Mi44OTFjLS4zOSAwLS43MS0uMy0uNzEtLjg5cy4zMi0uNzExLjcxLS43MTEiLz48cGF0aCBmaWxsPSIjZmRkODM1IiBkPSJNMTcuOTU5IDd2Mi42OGEyLjg1IDIuODUgMCAwIDEtMi44NSAyLjg1OUg5Ljg2QTIuODUgMi44NSAwIDAgMCA3IDE1LjM4OXYzLjc1YTIuODYgMi44NiAwIDAgMCAyLjg2IDIuODZoNC4yOEEyLjg2IDIuODYgMCAwIDAgMTcgMTkuMTR2LTEuNjhoLTQuMjkxYy0uMzkgMC0uNzA5LS41Ny0uNzA5LS45Nmg3LjE0QTIuODYgMi44NiAwIDAgMCAyMiAxMy42NFY5Ljg2QTIuODYgMi44NiAwIDAgMCAxOS4xNCA3ek04LjMyIDExLjUxM2wtLjAwNC4wMDQuMDM4LS4wMDR6bTYuNTQgNy4yNzZjLjM5IDAgLjcxLjMuNzEuODlhLjcxLjcxIDAgMCAxLS43MS43MWMtLjQgMC0uNzItLjEyLS43Mi0uNzFzLjMyLS44OS43Mi0uODkiLz48L3N2Zz4=","database":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iI2ZmY2EyOCIgZD0iTTE2IDI0Yy01LjUyNSAwLTEwLS45LTEwLTJ2NGMwIDEuMSA0LjQ3NSAyIDEwIDJzMTAtLjkgMTAtMnYtNGMwIDEuMS00LjQ3NSAyLTEwIDJtMC04Yy01LjUyNSAwLTEwLS45LTEwLTJ2NGMwIDEuMSA0LjQ3NSAyIDEwIDJzMTAtLjkgMTAtMnYtNGMwIDEuMS00LjQ3NSAyLTEwIDJtMC0xMkMxMC40NzcgNCA2IDQuODk1IDYgNnY0YzAgMS4xIDQuNDc1IDIgMTAgMnMxMC0uOSAxMC0yVjZjMC0xLjEwNS00LjQ3Ny0yLTEwLTIiLz48L3N2Zz4=","console":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggZmlsbD0iI2ZmNzA0MyIgZD0iTTIgMmExIDEgMCAwIDAtMSAxdjEwYzAgLjU1NC40NDYgMSAxIDFoMTJjLjU1NCAwIDEtLjQ0NiAxLTFWM2ExIDEgMCAwIDAtMS0xem0wIDNoMTJ2OEgyem0xIDIgMiAyLTIgMiAxIDEgMy0zLTMtM3ptNSAzLjVWMTJoNXYtMS41eiIvPjwvc3ZnPg==","markdown":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHBhdGggZmlsbD0iIzQyYTVmNSIgZD0ibTE0IDEwLTQgMy41TDYgMTBINHYxMmg0di02bDIgMiAyLTJ2Nmg0VjEwem0xMiA2di02aC00djZoLTRsNiA4IDYtOHoiLz48L3N2Zz4=","pdf":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iI2VmNTM1MCIgZD0iTTEzIDloNS41TDEzIDMuNXpNNiAyaDhsNiA2djEyYTIgMiAwIDAgMS0yIDJINmEyIDIgMCAwIDEtMi0yVjRhMiAyIDAgMCAxIDItMm00LjkzIDEwLjQ0Yy40MS45LjkzIDEuNjQgMS41MyAyLjE1bC40MS4zMmMtLjg3LjE2LTIuMDcuNDQtMy4zNC45M2wtLjExLjA0LjUtMS4wNGMuNDUtLjg3Ljc4LTEuNjYgMS4wMS0yLjRtNi40OCAzLjgxYy4xOC0uMTguMjctLjQxLjI4LS42Ni4wMy0uMi0uMDItLjM5LS4xMi0uNTUtLjI5LS40Ny0xLjA0LS42OS0yLjI4LS42OWwtMS4yOS4wNy0uODctLjU4Yy0uNjMtLjUyLTEuMi0xLjQzLTEuNi0yLjU2bC4wNC0uMTRjLjMzLTEuMzMuNjQtMi45NC0uMDItMy42YS44NS44NSAwIDAgMC0uNjEtLjI0aC0uMjRjLS4zNyAwLS43LjM5LS43OS43Ny0uMzcgMS4zMy0uMTUgMi4wNi4yMiAzLjI3di4wMWMtLjI1Ljg4LS41NyAxLjktMS4wOCAyLjkzbC0uOTYgMS44LS44OS40OWMtMS4yLjc1LTEuNzcgMS41OS0xLjg4IDIuMTItLjA0LjE5LS4wMi4zNi4wNS41NGwuMDMuMDUuNDguMzEuNDQuMTFjLjgxIDAgMS43My0uOTUgMi45Ny0zLjA3bC4xOC0uMDdjMS4wMy0uMzMgMi4zMS0uNTYgNC4wMy0uNzUgMS4wMy41MSAyLjI0Ljc0IDMgLjc0LjQ0IDAgLjc0LS4xMS45MS0uM20tLjQxLS43MS4wOS4xMWMtLjAxLjEtLjA0LjExLS4wOS4xM2gtLjA0bC0uMTkuMDJjLS40NiAwLTEuMTctLjE5LTEuOS0uNTEuMDktLjEuMTMtLjEuMjMtLjEgMS40IDAgMS44LjI1IDEuOS4zNU03LjgzIDE3Yy0uNjUgMS4xOS0xLjI0IDEuODUtMS42OSAyIC4wNS0uMzguNS0xLjA0IDEuMjEtMS42OXptMy4wMi02LjkxYy0uMjMtLjktLjI0LTEuNjMtLjA3LTIuMDVsLjA3LS4xMi4xNS4wNWMuMTcuMjQuMTkuNTYuMDkgMS4xbC0uMDMuMTYtLjE2LjgyeiIvPjwvc3ZnPg==","folder-base":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzhkNmU2MyIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNkN2NjYzgiIGQ9Ik03LjUgMTFjLS4yNzcgMC0uNS4yMjMtLjUuNXYyYzAgLjI3Ny4yMjMuNS41LjVoOGMuMjc3IDAgLjUtLjIyMy41LS41di0yYzAtLjI3Ny0uMjIzLS41LS41LS41WiIvPjwvc3ZnPg==","folder-template":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzhkNmU2MyIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNkN2NjYzgiIGQ9Ik02IDEzaDR2MUg2Wm0wLTJoNHYxSDZabTAtMmg0djFINlptMC0yaDR2MUg2Wm01IDBoNHY3aC00eiIvPjwvc3ZnPg==","folder-upload":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iI2ZmNzA0MyIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNmZmNjYmMiIGQ9Ik0xMCAxMlY5SDhsMy41LTRMMTUgOWgtMnYzem0tMiAydi0xaDd2MXoiLz48L3N2Zz4=","folder-packages":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzFlODhlNSIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNiYmRlZmIiIGQ9Ik0xNS42IDYuNDY3IDE0LjggNS40QTEgMSAwIDAgMCAxNCA1aC00YTEgMSAwIDAgMC0uOC40bC0uOCAxLjA2NmEyIDIgMCAwIDAtLjQgMS4yVjEzYTEgMSAwIDAgMCAxIDFoNmExIDEgMCAwIDAgMS0xVjcuNjY3YTIgMiAwIDAgMC0uNC0xLjJNMTAgNmg0bC43NSAxaC01LjV6bTMgNXYyaC0ydi0ySDlsMy0zIDMgM3oiLz48L3N2Zz4=","folder-config":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzAwYWNjMSIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiM4MGRlZWEiIGQ9Ik0xMS41IDEyLjA3NUExLjYgMS42IDAgMCAxIDkuODgyIDEwLjVhMS42MiAxLjYyIDAgMSAxIDEuNjIgMS41NzVtMy40MzctMS4xMzhhNCA0IDAgMCAwIC4wMzItLjQzOCA0IDQgMCAwIDAtLjAzMi0uNDVsLjk3Ni0uNzMzYS4yMjMuMjIzIDAgMCAwIC4wNTYtLjI4OGwtLjkyNi0xLjU1NmEuMjMuMjMgMCAwIDAtLjI4My0uMWwtMS4xNS40NWEzLjQgMy40IDAgMCAwLS43ODMtLjQ0bC0uMTcxLTEuMTkzQS4yMy4yMyAwIDAgMCAxMi40MjUgNmgtMS44NWEuMjMuMjMgMCAwIDAtLjIzMS4xODlsLS4xNzEgMS4xOTNhMy40IDMuNCAwIDAgMC0uNzgxLjQ0bC0xLjE1Mi0uNDVhLjIzLjIzIDAgMCAwLS4yODIuMWwtLjkyNiAxLjU1NmEuMjIuMjIgMCAwIDAgLjA1Ni4yODhsLjk3NS43MzRhNCA0IDAgMCAwLS4wMzIuNDUgNCA0IDAgMCAwIC4wMzIuNDM3bC0uOTc1Ljc0NmEuMjIuMjIgMCAwIDAtLjA1Ni4yODhsLjkyNSAxLjU1OGEuMjM1LjIzNSAwIDAgMCAuMjgzLjA5OWwxLjE1Mi0uNDU1YTMuMiAzLjIgMCAwIDAgLjc4MS40NDZsLjE3MSAxLjE5MmEuMjMuMjMgMCAwIDAgLjIzMi4xODloMS44NWEuMjMuMjMgMCAwIDAgLjIzMi0uMTg5bC4xNy0xLjE5MmEzLjQgMy40IDAgMCAwIC43ODMtLjQ0NmwxLjE1LjQ1NWEuMjQuMjQgMCAwIDAgLjI4NC0uMWwuOTI0LTEuNTU3YS4yMjMuMjIzIDAgMCAwLS4wNTUtLjI4OFoiLz48L3N2Zz4=","folder-images":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzAwOTY4OCIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNiMmRmZGIiIGQ9Ik0xMiA1SDguNWEuNS41IDAgMCAwLS41LjV2OGEuNS41IDAgMCAwIC41LjVoNmEuNS41IDAgMCAwIC41LS41VjhabS0yIDNhMSAxIDAgMSAxLTEgMSAxLjAwNSAxLjAwNSAwIDAgMSAxLTFtNCA1SDlsMi0yIDEgMSAyLTJ6bS0yLjQxNC00LjU4NlY2TDE0IDguNDE0WiIvPjwvc3ZnPg==","folder-backup":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzhkNmU2MyIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxnIGlkPSJtb3RpdmUiIGZpbGw9IiNkN2NjYzgiPjxwYXRoIGQ9Ik0xMi42ODggMTIuMzkgMTAgMTAuMjRWN2gxdjIuNzZsMi4zMTMgMS44NXoiLz48cGF0aCBkPSJNMTEgMTVhNSA1IDAgMSAxIDUtNSA1LjAwNSA1LjAwNSAwIDAgMS01IDVtMC05YTQgNCAwIDEgMCA0IDQgNC4wMDUgNC4wMDUgMCAwIDAtNC00Ii8+PC9nPjwvc3ZnPg==","folder-public":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzAzOWJlNSIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNiM2U1ZmMiIGQ9Ik0xMSA1YTUgNSAwIDEgMCA1IDUgNSA1IDAgMCAwLTUtNW0zLjQ1OSAzSDEyLjk4YTggOCAwIDAgMC0uNjcxLTEuNzdBNC4wMiA0LjAyIDAgMCAxIDE0LjQ1OSA4TTExIDZhNyA3IDAgMCAxIC45NDUgMmgtMS44OUE3IDcgMCAwIDEgMTEgNm0tMS4zMDkuMjNBOCA4IDAgMCAwIDkuMDIgOEg3LjU0MWE0LjAyIDQuMDIgMCAwIDEgMi4xNS0xLjc3TTcuMTMxIDExYTMuODUgMy44NSAwIDAgMSAwLTJoMS43MDRhNy44IDcuOCAwIDAgMCAwIDJ6bS40MSAxSDkuMDJhOCA4IDAgMCAwIC42NzEgMS43N0E0LjAyIDQuMDIgMCAwIDEgNy41NDEgMTJNMTEgMTRhNyA3IDAgMCAxLS45NDUtMmgxLjg5QTcgNyAwIDAgMSAxMSAxNG0xLjE1NS0zaC0yLjMxYTYuNyA2LjcgMCAwIDEgMC0yaDIuMzFhNi43IDYuNyAwIDAgMSAwIDJtLjE1NCAyLjc3QTggOCAwIDAgMCAxMi45OCAxMmgxLjQ3OWE0LjAyIDQuMDIgMCAwIDEtMi4xNSAxLjc3bTIuNTYtMi43N2gtMS43MDRhNy44IDcuOCAwIDAgMCAwLTJoMS43MDRhMy44NSAzLjg1IDAgMCAxIDAgMiIvPjwvc3ZnPg==","folder-database":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iI2ZmY2EyOCIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNmZmVjYjMiIGQ9Ik0xMiA1YTQgMiAwIDAgMC00IDIgNCAyIDAgMCAwIDQgMiA0IDIgMCAwIDAgNC0yIDQgMiAwIDAgMC00LTJNOCA4djJjMCAxLjEwNSAxLjc5MSAyIDQgMnM0LS44OTUgNC0yVjhjMCAxLjEwNS0xLjc5MSAyLTQgMnMtNC0uODk1LTQtMm0wIDN2MmMwIDEuMTA1IDEuNzkxIDIgNCAyczQtLjg5NSA0LTJ2LTJjMCAxLjEwNS0xLjc5MSAyLTQgMnMtNC0uODk1LTQtMiIvPjwvc3ZnPg==","folder-src":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzRjYWY1MCIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNjOGU2YzkiIGQ9Ik05LjIyNSAxNWEuNS41IDAgMCAxLS4xMi0uMDE0LjU3LjU2OCAwIDAgMS0uNDE0LS42NjFsMS41NDktNy44NzJhLjU2Ni41NjUgMCAwIDEgLjI1NC0uMzcyLjUzLjUzIDAgMCAxIC40LS4wNjcuNTcuNTcgMCAwIDEgLjQxNS42NjJsLTEuNTUyIDcuODcyYS41Ni41NiAwIDAgMS0uMjUzLjM3MS41My41MyAwIDAgMS0uMjguMDgxbTMuMTA1LTFoLS4wMzhhLjU0LjU0IDAgMCAxLS4zODItLjIwNi41ODMuNTgyIDAgMCAxIC4wNTctLjc3NGwyLjY2NC0yLjQ4My0yLjY1My0yLjMxMmEuNTgzLjU4MiAwIDAgMS0uMDgtLjc3Mi41NC41NCAwIDAgMSAuMzc3LS4yMTguNTMuNTMgMCAwIDEgLjQwNi4xMjlsMy4xMjYgMi43MjdhLjU3OS41NzggMCAwIDEgLjAwMi44NjJsLTMuMTE0IDIuOTA0YS41MzYuNTM1IDAgMCAxLS4zNjUuMTQ0em0tNC42NjEgMGEuNTM2LjUzNSAwIDAgMS0uMzY1LS4xNDZMNC4xODYgMTAuOTVhLjU4LjU4IDAgMCAxLS4wMDUtLjg0NmwuMDEtLjAxIDMuMTI4LTIuNzI2YS41MTYuNTE1IDAgMCAxIC40LS4xMy41NC41NCAwIDAgMSAuMzguMjE4LjU4My41ODIgMCAwIDEtLjA4Ljc3M2wtMi42NSAyLjMxIDIuNjYzIDIuNDgyYS41NzkuNTc4IDAgMCAxIC4wNTYuNzc0LjUzNi41MzUgMCAwIDEtLjM4MS4yMDZ6Ii8+PC9zdmc+","folder-test":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNiAxNiI+PHBhdGggaWQ9ImZvbGRlciIgZmlsbD0iIzAwYmZhNSIgZD0ibTYuOTIyIDMuNzY4LS42NDQtLjUzNkExIDEgMCAwIDAgNS42MzggM0gyYTEgMSAwIDAgMC0xIDF2OGExIDEgMCAwIDAgMSAxaDEyYTEgMSAwIDAgMCAxLTFWNWExIDEgMCAwIDAtMS0xSDcuNTYyYTEgMSAwIDAgMS0uNjQtLjIzMiIvPjxwYXRoIGlkPSJtb3RpdmUiIGZpbGw9IiNhN2ZmZWIiIGQ9Ik04IDZ2MWgxdjZhMiAyIDAgMCAwIDQgMFY3aDFWNlptMi41IDdhLjUuNSAwIDEgMSAuNS0uNS41LjUgMCAwIDEtLjUuNW0xLTJhLjUuNSAwIDEgMSAuNS0uNS41LjUgMCAwIDEtLjUuNW0uNS0yaC0yVjdoMnoiLz48L3N2Zz4="},"names":{".gitignore":"git",".gitattributes":"git",".gitmodules":"git",".htaccess":"xml",".whitesource":"json","composer.json":"json","composer.lock":"json","favicon.ico":"favicon","robots.txt":"robots"},"extensions":{"php":"php","php3":"php","php4":"php","php5":"php","php7":"php","php8":"php","phtml":"php","apk":"android","aab":"android","json":"json","jsonc":"json","json5":"json","zip":"zip","7z":"zip","rar":"zip","gz":"zip","tar":"zip","bz2":"zip","xz":"zip","png":"image","jpg":"image","jpeg":"image","gif":"image","webp":"image","svg":"image","bmp":"image","ico":"image","avif":"image","txt":"document","log":"document","html":"html","htm":"html","css":"css","scss":"css","sass":"css","less":"css","js":"javascript","mjs":"javascript","cjs":"javascript","ts":"typescript","tsx":"typescript","py":"python","pyw":"python","db":"database","sqlite":"database","sqlite3":"database","sql":"database","sh":"console","bash":"console","zsh":"console","bat":"console","cmd":"console","md":"markdown","markdown":"markdown","pdf":"pdf","xml":"xml"},"folders":{"template":"folder-template","templates":"folder-template","views":"folder-template","upload":"folder-upload","uploads":"folder-upload","vendor":"folder-packages","packages":"folder-packages","node_modules":"folder-packages","config":"folder-config","configs":"folder-config",".vscode":"folder-config",".github":"folder-config","images":"folder-images","img":"folder-images","pictures":"folder-images","icons":"folder-images","backup":"folder-backup","backups":"folder-backup","public":"folder-public","www":"folder-public","htdocs":"folder-public","database":"folder-database","databases":"folder-database","src":"folder-src","source":"folder-src","test":"folder-test","tests":"folder-test"}}
+{"icons":{"php":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/php.svg","android":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/android.svg","git":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/git.svg","xml":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/xml.svg","json":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/json.svg","zip":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/zip.svg","favicon":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/favicon.svg","image":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/image.svg","document":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/document.svg","robots":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/robots.svg","html":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/html.svg","css":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/css.svg","javascript":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/javascript.svg","typescript":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/typescript.svg","python":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/python.svg","database":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/database.svg","console":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/console.svg","markdown":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/markdown.svg","pdf":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/pdf.svg","folder-base":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-base.svg","folder-template":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-template.svg","folder-upload":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-upload.svg","folder-packages":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-packages.svg","folder-config":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-config.svg","folder-images":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-images.svg","folder-backup":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-backup.svg","folder-public":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-public.svg","folder-database":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-database.svg","folder-src":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-src.svg","folder-test":"https://cdn.jsdelivr.net/gh/material-extensions/vscode-material-icon-theme@13025adc5ad10a5cc649528a2c1edec93069f1b9/icons/folder-test.svg"},"names":{".gitignore":"git",".gitattributes":"git",".gitmodules":"git",".htaccess":"xml",".whitesource":"json","composer.json":"json","composer.lock":"json","favicon.ico":"favicon","robots.txt":"robots"},"extensions":{"php":"php","php3":"php","php4":"php","php5":"php","php7":"php","php8":"php","phtml":"php","apk":"android","aab":"android","json":"json","jsonc":"json","json5":"json","zip":"zip","7z":"zip","rar":"zip","gz":"zip","tar":"zip","bz2":"zip","xz":"zip","png":"image","jpg":"image","jpeg":"image","gif":"image","webp":"image","svg":"image","bmp":"image","ico":"image","avif":"image","txt":"document","log":"document","html":"html","htm":"html","css":"css","scss":"css","sass":"css","less":"css","js":"javascript","mjs":"javascript","cjs":"javascript","ts":"typescript","tsx":"typescript","py":"python","pyw":"python","db":"database","sqlite":"database","sqlite3":"database","sql":"database","sh":"console","bash":"console","zsh":"console","bat":"console","cmd":"console","md":"markdown","markdown":"markdown","pdf":"pdf","xml":"xml"},"folders":{"template":"folder-template","templates":"folder-template","views":"folder-template","upload":"folder-upload","uploads":"folder-upload","vendor":"folder-packages","packages":"folder-packages","node_modules":"folder-packages","config":"folder-config","configs":"folder-config",".vscode":"folder-config",".github":"folder-config","images":"folder-images","img":"folder-images","pictures":"folder-images","icons":"folder-images","backup":"folder-backup","backups":"folder-backup","public":"folder-public","www":"folder-public","htdocs":"folder-public","database":"folder-database","databases":"folder-database","src":"folder-src","source":"folder-src","test":"folder-test","tests":"folder-test"}}
 MATERIAL_ICONS_JSON
 , true);
 
@@ -2489,6 +2658,23 @@ function buildDirectoryTree($dir, $relativePath = "")
     return $result;
 }
 
+// Resolve repeated UID/GID values once per request; POSIX names are optional.
+function getFileOwnership($file)
+{
+    static $users = [], $groups = [];
+    $uid = @fileowner($file); $gid = @filegroup($file);
+    if ($uid !== false && !array_key_exists($uid, $users)) {
+        $record = function_exists('posix_getpwuid') ? @posix_getpwuid($uid) : false;
+        $users[$uid] = $record && isset($record['name']) ? $record['name'] : (string) $uid;
+    }
+    if ($gid !== false && !array_key_exists($gid, $groups)) {
+        $record = function_exists('posix_getgrgid') ? @posix_getgrgid($gid) : false;
+        $groups[$gid] = $record && isset($record['name']) ? $record['name'] : (string) $gid;
+    }
+    return ['owner' => $uid === false ? '—' : $users[$uid], 'group' => $gid === false ? '—' : $groups[$gid],
+        'uid' => $uid === false ? null : $uid, 'gid' => $gid === false ? null : $gid];
+}
+
 // Function to get directory contents
 function getDirectoryContents($dir, $sort = "name", $order = "asc")
 {
@@ -2512,6 +2698,7 @@ function getDirectoryContents($dir, $sort = "name", $order = "asc")
                 "icon" => getFileIcon($fullPath),
             ];
 
+            $fileInfo = array_merge($fileInfo, getFileOwnership($fullPath));
             $result[] = $fileInfo;
         }
     }
@@ -3002,6 +3189,28 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
                     "current_path" => str_replace($config["root_path"], "", $currentPath),
                 ];
                 break;
+            case "upload_check":
+                try {
+                    $entries = json_decode($_POST['files'] ?? '', true);
+                    if (!is_array($entries) || !$entries || count($entries) > (int) ini_get('max_file_uploads')) throw new RuntimeException('Select fewer files. Server limit: ' . ini_get('max_file_uploads') . ' files per upload.');
+                    $resolved = realpath($currentPath);
+                    if (!$resolved || !is_dir($resolved) || !is_writable($resolved)) throw new RuntimeException('Destination folder is not writable.');
+                    $checks = []; $total = 0;
+                    foreach ($entries as $entry) {
+                        if (!is_array($entry) || !isset($entry['name'], $entry['size']) || !is_int($entry['size']) || $entry['size'] < 0) throw new RuntimeException('Invalid upload request.');
+                        $target = fmUploadTarget($resolved, $entry['name']);
+                        if (array_key_exists($entry['name'], $checks)) throw new RuntimeException('Duplicate file names in this upload.');
+                        $limit = parseSize(ini_get('upload_max_filesize'));
+                        if ($limit > 0 && $entry['size'] > $limit) throw new RuntimeException($entry['name'] . ': exceeds the server upload size limit.');
+                        $hash = file_exists($target) ? @hash_file('sha256', $target) : null;
+                        if ($hash === false) throw new RuntimeException($entry['name'] . ': cannot read the existing file.');
+                        $checks[$entry['name']] = $hash; $total += $entry['size'] + 1024;
+                    }
+                    $postLimit = parseSize(ini_get('post_max_size'));
+                    if ($postLimit > 0 && $total > $postLimit) throw new RuntimeException('Upload exceeds the server request size limit. Select fewer or smaller files.');
+                    $response = ['status' => 'success', 'files' => (object) $checks];
+                } catch (Throwable $error) { http_response_code(400); $response = ['status' => 'error', 'message' => $error->getMessage()]; }
+                break;
             case "tree":
                 $resolvedTreePath = realpath($currentPath);
                 $resolvedRoot = realpath($config["root_path"]);
@@ -3279,6 +3488,68 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
 }
 
 
+function fmUploadTarget($directory, $name)
+{
+    if (!is_string($name) || $name === '' || $name === '.' || $name === '..' || strpbrk($name, "/\\\0") !== false || !preg_match('//u', $name)) throw new RuntimeException('Invalid file name.');
+    $target = $directory . DIRECTORY_SEPARATOR . $name;
+    if (!securityCheck($target) || is_link($target)) throw new RuntimeException('Symbolic links or files outside the workspace cannot be replaced.');
+    if (file_exists($target) && (!is_file($target) || !is_readable($target) || !is_writable($target))) throw new RuntimeException('Existing file is not a readable, writable regular file.');
+    return $target;
+}
+function fmInstallUpload($uploadedFile, $target, $expectedHash)
+{
+    global $config;
+    $root = realpath($config['root_path']);
+    $directory = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/fm-editor-' . substr(hash('sha256', __FILE__ . '|' . $root), 0, 24);
+    if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0700)) || !@chmod($directory, 0700)) throw new RuntimeException('Cannot prepare private upload backups.');
+    $real = realpath($directory);
+    if ($real === $root || strpos($real, rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) === 0) throw new RuntimeException('Upload backups must be outside the workspace.');
+    $key = hash('sha256', $target);
+    $lockPath = $directory . '/' . $key . '.lock';
+    if (is_link($lockPath)) throw new RuntimeException('Invalid upload lock.');
+    $lock = @fopen($lockPath, 'c');
+    if (!$lock) throw new RuntimeException('Cannot acquire upload lock.');
+    $temporary = null;
+    try {
+        if (!@chmod($lockPath, 0600) || !flock($lock, LOCK_EX)) throw new RuntimeException('Cannot acquire upload lock.');
+        clearstatcache(true, $target);
+        fmUploadTarget(dirname($target), basename($target));
+        $exists = file_exists($target);
+        if ($exists && (!is_string($expectedHash) || !preg_match('/^[a-f0-9]{64}$/D', $expectedHash) || !hash_equals($expectedHash, (string) @hash_file('sha256', $target)))) throw new RuntimeException('File already exists or changed since confirmation. Choose the file again to confirm replacement.');
+        if (!$exists && $expectedHash !== null) throw new RuntimeException('File disappeared since confirmation. Choose the file again.');
+        $stat = $exists ? @stat($target) : null;
+        if ($exists && (!$stat || $stat['nlink'] !== 1)) throw new RuntimeException('Files with hard links cannot be replaced safely.');
+        $hash = @hash_file('sha256', $uploadedFile); $size = @filesize($uploadedFile);
+        if ($hash === false || $size === false || !is_uploaded_file($uploadedFile)) throw new RuntimeException('Invalid or unreadable uploaded file.');
+        $temporary = @tempnam(dirname($target), '.fm-upload-');
+        if (!$temporary || dirname($temporary) !== dirname($target)) throw new RuntimeException('Cannot create a temporary file in the destination folder.');
+        if (!@move_uploaded_file($uploadedFile, $temporary)) throw new RuntimeException('Cannot write uploaded file to the destination folder.');
+        $tempStat = @stat($temporary);
+        if ($stat && $tempStat['uid'] !== $stat['uid'] && !@chown($temporary, $stat['uid'])) throw new RuntimeException('Cannot preserve file owner. Original file was not changed.');
+        if ($stat && $tempStat['gid'] !== $stat['gid'] && !@chgrp($temporary, $stat['gid'])) throw new RuntimeException('Cannot preserve file group. Original file was not changed.');
+        $mode = $stat ? ($stat['mode'] & 07777) : (0666 & ~umask());
+        if (!@chmod($temporary, $mode) || !is_readable($temporary) || @filesize($temporary) !== $size || @hash_file('sha256', $temporary) !== $hash) throw new RuntimeException('Upload failed content or permission verification. Original file was not changed.');
+        if ($exists) {
+            $backup = $directory . '/' . $key . '-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(6)) . '.bak';
+            if (is_link($backup) || !@copy($target, $backup) || !@chmod($backup, 0600) || @hash_file('sha256', $backup) !== $expectedHash) throw new RuntimeException('Cannot verify a backup. Original file was not changed.');
+            clearstatcache(true, $target); $latest = @stat($target);
+            if (is_link($target) || !$latest || $latest['ino'] !== $stat['ino'] || @hash_file('sha256', $target) !== $expectedHash) throw new RuntimeException('File changed during upload. Original file was not replaced.');
+            if (!@rename($temporary, $target)) throw new RuntimeException('Cannot replace the file. Original file was not changed.');
+        } else {
+            // Hard-link installation refuses a file that appeared after the check.
+            if (!@link($temporary, $target)) throw new RuntimeException('Cannot create file, or a file with this name already exists.');
+            @unlink($temporary);
+        }
+        $temporary = null;
+        clearstatcache(true, $target);
+        if (!is_readable($target) || @filesize($target) !== $size || @hash_file('sha256', $target) !== $hash || (fileperms($target) & 07777) !== $mode) throw new RuntimeException('Upload completed but final verification failed. Check the file before continuing.');
+        if (function_exists('opcache_invalidate')) @opcache_invalidate($target, true);
+    } finally {
+        if ($temporary && is_file($temporary)) @unlink($temporary);
+        flock($lock, LOCK_UN); fclose($lock);
+    }
+}
+
 function parseSize($size)
 {
     $unit = preg_replace('/[^bkmgtpezy]/i', '', $size);
@@ -3290,6 +3561,8 @@ function parseSize($size)
 }
 
 
+if (isset($_POST['upload_manifest']) && !isset($_FILES['files'])) fmAuthReply(400, 'No files received. Check server upload limits and choose the files again.');
+
 if (isset($_FILES["files"])) {
     header("Content-Type: application/json");
     $currentPath = isset($_POST["path"]) ? $config["root_path"] . $_POST["path"] : $config["root_path"];
@@ -3297,14 +3570,24 @@ if (isset($_FILES["files"])) {
         echo json_encode(["status" => "error", "message" => "Security violation"]);
         exit();
     }
+    $currentPath = realpath($currentPath);
+    if (!$currentPath || !is_dir($currentPath) || !is_writable($currentPath)) fmAuthReply(403, 'Destination folder is not writable.');
+    $manifest = json_decode($_POST['upload_manifest'] ?? '', true);
+    if (!is_array($manifest)) fmAuthReply(400, 'Upload confirmation is missing. Choose the files again.');
     $files = $_FILES["files"];
+    if (!isset($files['name'], $files['tmp_name'], $files['error'], $files['size']) || !is_array($files['name']) || !count($files['name'])) fmAuthReply(400, 'No valid upload files received.');
     $uploaded = 0;
     $failed = 0;
     $failedFiles = [];
+    $uploadedNames = [];
+    $received = [];
     for ($i = 0; $i < count($files["name"]); $i++) {
         $fileName = $files["name"][$i];
-        if (!is_string($fileName) || $fileName === "." || $fileName === ".." || strpbrk($fileName, "/\\\0") !== false) { $failed++; continue; }
-        $filePath = $currentPath . DIRECTORY_SEPARATOR . $fileName;
+        try {
+            $filePath = fmUploadTarget($currentPath, $fileName);
+            if (!array_key_exists($fileName, $manifest) || isset($received[$fileName])) throw new RuntimeException('Missing confirmation or duplicate file name.');
+            $received[$fileName] = true;
+        } catch (Throwable $error) { $failed++; $failedFiles[] = (is_string($fileName) ? $fileName : 'File') . ': ' . $error->getMessage(); continue; }
         if ($files["error"][$i] !== UPLOAD_ERR_OK) {
             $failed++;
             $errorMsg = "";
@@ -3337,7 +3620,7 @@ if (isset($_FILES["files"])) {
             continue;
         }
         $maxFileSize = parseSize(ini_get('upload_max_filesize'));
-        if ($files["size"][$i] > $maxFileSize) {
+        if ($maxFileSize > 0 && $files["size"][$i] > $maxFileSize) {
             $failed++;
             $failedFiles[] = $fileName . " (Exceeds maximum file size limit)";
             continue;
@@ -3350,14 +3633,19 @@ if (isset($_FILES["files"])) {
                 continue;
             }
         }
-        if (move_uploaded_file($files["tmp_name"][$i], $filePath)) {
-            $uploaded++;
-        } else {
-            $failed++;
-            $failedFiles[] = $fileName . " (Server error during move)";
+        try {
+            fmInstallUpload($files['tmp_name'][$i], $filePath, $manifest[$fileName]);
+            $uploaded++; $uploadedNames[] = $fileName;
+        } catch (Throwable $error) {
+            $failed++; $failedFiles[] = $fileName . ': ' . $error->getMessage();
         }
     }
-    $response = ["status" => $failed == 0 ? "success" : "partial", "message" => "Uploaded $uploaded file(s)" . ($failed > 0 ? ", Failed $failed file(s)" : "")];
+    foreach ($manifest as $name => $_) {
+        if (!isset($received[$name])) { $failed++; $failedFiles[] = $name . ': not received by the server. Check upload limits.'; }
+    }
+    $response = ['status' => $failed === 0 ? 'success' : ($uploaded > 0 ? 'partial' : 'error'),
+        'message' => "Uploaded and verified $uploaded file(s)" . ($failed ? "; failed $failed file(s)." : '.'), 'uploaded' => $uploadedNames];
+    if ($failed && !$uploaded) http_response_code(400);
     if (!empty($failedFiles)) {
         $response["failedFiles"] = $failedFiles;
     }
@@ -3377,7 +3665,7 @@ if ($username == null) {
 
 <head>
     <style>
-        @font-face { font-family: 'Embedded Seti'; src: url('data:font/woff;base64,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') format('woff'); font-weight: normal; font-style: normal; font-display: block; }
+        @font-face { font-family: 'Embedded Seti'; src: url('https://cdn.jsdelivr.net/gh/microsoft/vscode@8993bc4913b5ecd98a639457ac1dabf5e4c58787/extensions/theme-seti/icons/seti.woff') format('woff'); font-weight: normal; font-style: normal; font-display: block; }
         .file-type-icon { font-family: 'Embedded Seti' !important; font-size: 24px; font-style: normal; font-weight: normal; line-height: 1; width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; color: var(--file-icon-color, #9da5b4); }
         :root[data-workspace-theme="github"] .file-type-icon, :root[data-workspace-theme="tomorrow"] .file-type-icon, :root[data-workspace-theme="kuroir"] .file-type-icon { color: var(--file-icon-light-color, #57606a); }
         .file-type-icon img { width: 20px; height: 20px; object-fit: contain; display: block; }
@@ -3547,10 +3835,12 @@ if ($username == null) {
             background: var(--bg-surface);
             border-bottom: 1px solid var(--border-subtle);
             padding: 2px 10px;
-            display: flex;
+            display: grid;
+            grid-template-columns: minmax(max-content, 1fr) minmax(220px, min(46vw, 640px)) minmax(max-content, 1fr);
             align-items: center;
-            flex-wrap: wrap;
-            gap: 2px;
+            flex-shrink: 0;
+            flex-wrap: nowrap;
+            gap: 2px 12px;
             min-height: 30px;
         }
 
@@ -3616,8 +3906,9 @@ if ($username == null) {
         /* ── Layout Shell ────────────────────────────────────────── */
         .fm-layout {
             display: flex;
-            height: calc(100vh - 84px);
-            /* header + toolbar */
+            flex: 1;
+            min-height: 0;
+            height: auto;
             overflow: hidden;
         }
 
@@ -3738,13 +4029,9 @@ if ($username == null) {
         }
 
         body { display: flex; flex-direction: column; }
-        .main-toolbar { flex-shrink: 0; }
-        .main-toolbar { flex-wrap: nowrap; }
-        .toolbar-actions { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow: visible; }
+        .toolbar-actions { display: flex; align-items: center; gap: 2px; flex: none; min-width: 0; overflow: visible; grid-column: 1; grid-row: 1; }
         .toolbar-actions > * { flex-shrink: 0; }
         .toolbar-actions .header-btns { padding: 4px 5px; font-size: 0.74rem; }
-        .toolbar-utilities { margin-left: auto; padding-left: 8px; flex-shrink: 0; }
-        .toolbar-utilities .search-container { width: 160px; }
         .toolbar-utilities #workspace-theme { height: 25px; padding: 1px 6px; font-size: 0.75rem; }
         .toolbar-utilities .input-group .form-control { height: 25px; min-height: 25px; padding: 1px 7px; font-size: 0.75rem; }
         .toolbar-utilities .btn-search { height: 25px; padding: 1px 8px; font-size: 0.75rem; }
@@ -3768,9 +4055,7 @@ if ($username == null) {
         .toolbar-more .dropdown-menu .header-btns:disabled,
         .toolbar-more .dropdown-menu .header-btns.disabled { background: transparent; opacity: 0.45; color: var(--text-muted); }
         @media (max-width: 900px) { .toolbar-actions .action-label { display: none; } .toolbar-actions .header-btns { padding: 6px 8px; } }
-        @media (max-width: 550px) { .main-toolbar { flex-wrap: wrap; } .toolbar-utilities { padding-left: 0; } .toolbar-utilities .search-container { width: 120px; } }
         #workspace-theme option { background: var(--bg-elevated); color: var(--text-primary); }
-        .fm-layout { flex: 1; min-height: 0; height: auto; }
         /* Internal editor tabs */
         .workspace { flex: 1; min-width: 0; display: flex; flex-direction: column; }
         .workspace-tabs { display: flex; flex-shrink: 0; overflow-x: auto; background: var(--bg-main); border-bottom: 1px solid var(--border-subtle); }
@@ -3835,9 +4120,7 @@ if ($username == null) {
         .git-status-badge { margin-left: 8px; font-size: 0.7rem; font-weight: 600; color: var(--text-link); }
 
         /* Keep search central and sign-out independent from the application menus. */
-        .main-toolbar { display: grid; grid-template-columns: minmax(max-content, 1fr) minmax(220px, min(46vw, 640px)) minmax(max-content, 1fr); column-gap: 12px; }
-        .toolbar-actions { grid-column: 1; grid-row: 1; flex: none; }
-        .toolbar-utilities { grid-column: 2; grid-row: 1; width: 100%; min-width: 0; margin: 0; padding: 0; }
+        .toolbar-utilities { grid-column: 2; grid-row: 1; width: 100%; min-width: 0; margin: 0; padding: 0; flex-shrink: 0; }
         .toolbar-utilities .search-container { width: 100%; min-width: 0; }
         #logout-form { grid-column: 3; grid-row: 1; justify-self: end; margin: 0; }
         #logout-form .menu-heading { white-space: nowrap; }
@@ -3990,6 +4273,7 @@ if ($username == null) {
             font-size: 0.7rem;
         }
 
+        .file-ownership { max-width: 170px; width: 1%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-muted) !important; }
         .permissions {
             font-family: var(--font-mono);
             font-size: 0.68rem;
@@ -4078,10 +4362,7 @@ if ($username == null) {
             color: var(--text-link);
         }
 
-        .context-menu-item.danger {
-            color: #f87171;
-        }
-
+        .context-menu-item.danger,
         .context-menu-item.danger i {
             color: #f87171;
         }
@@ -4209,24 +4490,14 @@ if ($username == null) {
             color: #fff;
         }
 
-        .btn-outline-secondary {
-            border-color: var(--border-default);
-            color: var(--text-secondary);
-            background: transparent;
-        }
-
-        .btn-outline-secondary:hover {
-            background: var(--bg-elevated);
-            color: var(--text-primary);
-            border-color: var(--border-default);
-        }
-
+        .btn-outline-secondary,
         .btn-outline-light {
             border-color: var(--border-default);
             color: var(--text-secondary);
             background: transparent;
         }
 
+        .btn-outline-secondary:hover,
         .btn-outline-light:hover {
             background: var(--bg-elevated);
             color: var(--text-primary);
@@ -4348,10 +4619,7 @@ if ($username == null) {
             display: none;
         }
 
-        .htmx-request .my-indicator {
-            display: inline;
-        }
-
+        .htmx-request .my-indicator,
         .htmx-request.my-indicator {
             display: inline;
         }
@@ -4401,7 +4669,7 @@ if ($username == null) {
                 <option value="github">GitHub Light</option>
                 <option value="tomorrow">Tomorrow</option>
                 <option value="kuroir">Kuroir</option>
-            </select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
+            </select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
@@ -4478,11 +4746,12 @@ if ($username == null) {
                             <th>Modified</th>
                             <th>Type</th>
                             <th>Permissions</th>
+                            <th>Owner / Group</th>
                         </tr>
                     </thead>
                     <tbody id="files-list">
                         <tr>
-                            <td colspan="7" class="text-center" style="padding: 32px; color: var(--text-muted);">
+                            <td colspan="8" class="text-center" style="padding: 32px; color: var(--text-muted);">
                                 <i class="fas fa-spinner fa-spin me-2"></i> Loading files…
                             </td>
                         </tr>
@@ -4915,12 +5184,14 @@ if ($username == null) {
             <div class="modal-header"><h5 class="modal-title" id="phoneModalTitle"><i class="fas fa-qrcode me-2"></i>Open on phone</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
             <div class="modal-body text-center">
                 <p id="phone-file-name" style="overflow-wrap:anywhere"></p>
-                <canvas id="phone-qr" role="img" aria-label="QR code with the file URL" style="display:block;width:min(280px,100%);height:auto;margin:0 auto 16px;background:white"></canvas>
+                <p id="phone-qr-status" role="status" aria-live="polite"></p>
+                <button type="button" id="phone-qr-retry" class="btn btn-secondary mb-3" hidden>Retry</button>
+                <canvas hidden id="phone-qr" role="img" aria-label="QR code with the file URL" style="width:min(280px,100%);height:auto;margin:0 auto 16px;background:white"></canvas>
                 <p>Scan with your phone camera to open this file.</p>
                 <a id="phone-file-link" target="_blank" rel="noopener noreferrer" style="overflow-wrap:anywhere"></a>
                 <p class="form-text mt-2">Opens the saved file on the website, just like Open in browser.</p>
             </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+            <div class="modal-footer"><button type="button" id="phone-copy-link" class="btn btn-primary">Copy link</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
         </div></div>
     </div>
 
@@ -4930,6 +5201,37 @@ if ($username == null) {
         <div id="folder-picker-list"></div><p id="folder-picker-message" role="status"></p>
         <div class="folder-picker-footer" style="justify-content:flex-end"><button type="button" id="folder-picker-cancel">Cancel</button><button type="button" id="folder-picker-use">Use this folder</button></div>
     </dialog>
+
+    <div class="modal fade" id="uploadReplaceModal" tabindex="-1" aria-labelledby="uploadReplaceTitle" aria-hidden="true">
+        <div class="modal-dialog"><div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle">Replace existing files?</h5></div>
+            <div class="modal-body"><p>These files already exist in the destination folder. Replace them with the uploaded versions?</p><ul id="upload-replace-names" style="max-height:40vh;overflow:auto;overflow-wrap:anywhere"></ul></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="upload-replace-confirm">Replace</button></div>
+        </div></div>
+    </div>
+
+    <div class="modal fade" id="loginActivityModal" tabindex="-1" aria-labelledby="loginActivityTitle" aria-hidden="true">
+        <div class="modal-dialog modal-lg"><div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title" id="loginActivityTitle"><i class="fas fa-shield-halved me-2"></i>Login activity</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-body">
+                <p id="login-activity-summary"></p><div id="login-global-limit" class="alert alert-warning" hidden></div>
+                <div class="table-responsive"><table class="table table-hover"><thead><tr><th>IP</th><th>Last attempt</th><th>Failed · 24h</th><th>Status</th><th></th></tr></thead><tbody id="login-activity-rows"></tbody></table></div>
+                <div id="login-activity-details" class="border rounded p-2 my-2" style="overflow-wrap:anywhere;max-height:35vh;overflow:auto" hidden></div>
+                <p class="form-text">Select an IP for details. Times use your browser timezone. The journal keeps up to 7 days, 2,000 entries and 1 MB; repeated blocked requests are grouped. Statistics use retained entries.</p>
+                <form id="login-policy-form" class="border rounded p-2 mt-3">
+                    <strong>Login limits</strong>
+                    <div class="row g-2 mt-1">
+                        <label class="col-sm-4 form-label">Failed attempts per IP<input class="form-control" type="number" name="per_ip" min="1" max="100" required></label>
+                        <label class="col-sm-4 form-label">Global failed attempts<input class="form-control" type="number" name="global" min="1" max="1000" required></label>
+                        <label class="col-sm-4 form-label">Window (minutes)<input class="form-control" type="number" name="window_minutes" min="1" max="1440" required></label>
+                    </div><button type="submit" class="btn btn-primary mt-2">Save limits</button>
+                    <p class="form-text mt-2 mb-0">The global limit can block all new logins. Resetting an IP does not reset the global limit. IPs are recorded as reported by PHP; proxies may share one address. Limits and activity use private server temporary storage and may be cleared by hosting cleanup.</p>
+                </form>
+                <p id="login-activity-feedback" class="form-text mt-2 mb-0" role="status"></p>
+            </div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" id="login-activity-refresh">Refresh</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+        </div></div>
+    </div>
 
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
@@ -5039,2329 +5341,6 @@ if ($username == null) {
 
     <!-- ── Scripts ───────────────────────────────────────────────── -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
-    <script>
-/* qrcode-generator 1.4.4
-MIT License
-
-Copyright (c) 2009 Kazuhiko Arase
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
-*/
-//---------------------------------------------------------------------
-//
-// QR Code Generator for JavaScript
-//
-// Copyright (c) 2009 Kazuhiko Arase
-//
-// URL: http://www.d-project.com/
-//
-// Licensed under the MIT license:
-//  http://www.opensource.org/licenses/mit-license.php
-//
-// The word 'QR Code' is registered trademark of
-// DENSO WAVE INCORPORATED
-//  http://www.denso-wave.com/qrcode/faqpatent-e.html
-//
-//---------------------------------------------------------------------
-
-var qrcode = function() {
-
-  //---------------------------------------------------------------------
-  // qrcode
-  //---------------------------------------------------------------------
-
-  /**
-   * qrcode
-   * @param typeNumber 1 to 40
-   * @param errorCorrectionLevel 'L','M','Q','H'
-   */
-  var qrcode = function(typeNumber, errorCorrectionLevel) {
-
-    var PAD0 = 0xEC;
-    var PAD1 = 0x11;
-
-    var _typeNumber = typeNumber;
-    var _errorCorrectionLevel = QRErrorCorrectionLevel[errorCorrectionLevel];
-    var _modules = null;
-    var _moduleCount = 0;
-    var _dataCache = null;
-    var _dataList = [];
-
-    var _this = {};
-
-    var makeImpl = function(test, maskPattern) {
-
-      _moduleCount = _typeNumber * 4 + 17;
-      _modules = function(moduleCount) {
-        var modules = new Array(moduleCount);
-        for (var row = 0; row < moduleCount; row += 1) {
-          modules[row] = new Array(moduleCount);
-          for (var col = 0; col < moduleCount; col += 1) {
-            modules[row][col] = null;
-          }
-        }
-        return modules;
-      }(_moduleCount);
-
-      setupPositionProbePattern(0, 0);
-      setupPositionProbePattern(_moduleCount - 7, 0);
-      setupPositionProbePattern(0, _moduleCount - 7);
-      setupPositionAdjustPattern();
-      setupTimingPattern();
-      setupTypeInfo(test, maskPattern);
-
-      if (_typeNumber >= 7) {
-        setupTypeNumber(test);
-      }
-
-      if (_dataCache == null) {
-        _dataCache = createData(_typeNumber, _errorCorrectionLevel, _dataList);
-      }
-
-      mapData(_dataCache, maskPattern);
-    };
-
-    var setupPositionProbePattern = function(row, col) {
-
-      for (var r = -1; r <= 7; r += 1) {
-
-        if (row + r <= -1 || _moduleCount <= row + r) continue;
-
-        for (var c = -1; c <= 7; c += 1) {
-
-          if (col + c <= -1 || _moduleCount <= col + c) continue;
-
-          if ( (0 <= r && r <= 6 && (c == 0 || c == 6) )
-              || (0 <= c && c <= 6 && (r == 0 || r == 6) )
-              || (2 <= r && r <= 4 && 2 <= c && c <= 4) ) {
-            _modules[row + r][col + c] = true;
-          } else {
-            _modules[row + r][col + c] = false;
-          }
-        }
-      }
-    };
-
-    var getBestMaskPattern = function() {
-
-      var minLostPoint = 0;
-      var pattern = 0;
-
-      for (var i = 0; i < 8; i += 1) {
-
-        makeImpl(true, i);
-
-        var lostPoint = QRUtil.getLostPoint(_this);
-
-        if (i == 0 || minLostPoint > lostPoint) {
-          minLostPoint = lostPoint;
-          pattern = i;
-        }
-      }
-
-      return pattern;
-    };
-
-    var setupTimingPattern = function() {
-
-      for (var r = 8; r < _moduleCount - 8; r += 1) {
-        if (_modules[r][6] != null) {
-          continue;
-        }
-        _modules[r][6] = (r % 2 == 0);
-      }
-
-      for (var c = 8; c < _moduleCount - 8; c += 1) {
-        if (_modules[6][c] != null) {
-          continue;
-        }
-        _modules[6][c] = (c % 2 == 0);
-      }
-    };
-
-    var setupPositionAdjustPattern = function() {
-
-      var pos = QRUtil.getPatternPosition(_typeNumber);
-
-      for (var i = 0; i < pos.length; i += 1) {
-
-        for (var j = 0; j < pos.length; j += 1) {
-
-          var row = pos[i];
-          var col = pos[j];
-
-          if (_modules[row][col] != null) {
-            continue;
-          }
-
-          for (var r = -2; r <= 2; r += 1) {
-
-            for (var c = -2; c <= 2; c += 1) {
-
-              if (r == -2 || r == 2 || c == -2 || c == 2
-                  || (r == 0 && c == 0) ) {
-                _modules[row + r][col + c] = true;
-              } else {
-                _modules[row + r][col + c] = false;
-              }
-            }
-          }
-        }
-      }
-    };
-
-    var setupTypeNumber = function(test) {
-
-      var bits = QRUtil.getBCHTypeNumber(_typeNumber);
-
-      for (var i = 0; i < 18; i += 1) {
-        var mod = (!test && ( (bits >> i) & 1) == 1);
-        _modules[Math.floor(i / 3)][i % 3 + _moduleCount - 8 - 3] = mod;
-      }
-
-      for (var i = 0; i < 18; i += 1) {
-        var mod = (!test && ( (bits >> i) & 1) == 1);
-        _modules[i % 3 + _moduleCount - 8 - 3][Math.floor(i / 3)] = mod;
-      }
-    };
-
-    var setupTypeInfo = function(test, maskPattern) {
-
-      var data = (_errorCorrectionLevel << 3) | maskPattern;
-      var bits = QRUtil.getBCHTypeInfo(data);
-
-      // vertical
-      for (var i = 0; i < 15; i += 1) {
-
-        var mod = (!test && ( (bits >> i) & 1) == 1);
-
-        if (i < 6) {
-          _modules[i][8] = mod;
-        } else if (i < 8) {
-          _modules[i + 1][8] = mod;
-        } else {
-          _modules[_moduleCount - 15 + i][8] = mod;
-        }
-      }
-
-      // horizontal
-      for (var i = 0; i < 15; i += 1) {
-
-        var mod = (!test && ( (bits >> i) & 1) == 1);
-
-        if (i < 8) {
-          _modules[8][_moduleCount - i - 1] = mod;
-        } else if (i < 9) {
-          _modules[8][15 - i - 1 + 1] = mod;
-        } else {
-          _modules[8][15 - i - 1] = mod;
-        }
-      }
-
-      // fixed module
-      _modules[_moduleCount - 8][8] = (!test);
-    };
-
-    var mapData = function(data, maskPattern) {
-
-      var inc = -1;
-      var row = _moduleCount - 1;
-      var bitIndex = 7;
-      var byteIndex = 0;
-      var maskFunc = QRUtil.getMaskFunction(maskPattern);
-
-      for (var col = _moduleCount - 1; col > 0; col -= 2) {
-
-        if (col == 6) col -= 1;
-
-        while (true) {
-
-          for (var c = 0; c < 2; c += 1) {
-
-            if (_modules[row][col - c] == null) {
-
-              var dark = false;
-
-              if (byteIndex < data.length) {
-                dark = ( ( (data[byteIndex] >>> bitIndex) & 1) == 1);
-              }
-
-              var mask = maskFunc(row, col - c);
-
-              if (mask) {
-                dark = !dark;
-              }
-
-              _modules[row][col - c] = dark;
-              bitIndex -= 1;
-
-              if (bitIndex == -1) {
-                byteIndex += 1;
-                bitIndex = 7;
-              }
-            }
-          }
-
-          row += inc;
-
-          if (row < 0 || _moduleCount <= row) {
-            row -= inc;
-            inc = -inc;
-            break;
-          }
-        }
-      }
-    };
-
-    var createBytes = function(buffer, rsBlocks) {
-
-      var offset = 0;
-
-      var maxDcCount = 0;
-      var maxEcCount = 0;
-
-      var dcdata = new Array(rsBlocks.length);
-      var ecdata = new Array(rsBlocks.length);
-
-      for (var r = 0; r < rsBlocks.length; r += 1) {
-
-        var dcCount = rsBlocks[r].dataCount;
-        var ecCount = rsBlocks[r].totalCount - dcCount;
-
-        maxDcCount = Math.max(maxDcCount, dcCount);
-        maxEcCount = Math.max(maxEcCount, ecCount);
-
-        dcdata[r] = new Array(dcCount);
-
-        for (var i = 0; i < dcdata[r].length; i += 1) {
-          dcdata[r][i] = 0xff & buffer.getBuffer()[i + offset];
-        }
-        offset += dcCount;
-
-        var rsPoly = QRUtil.getErrorCorrectPolynomial(ecCount);
-        var rawPoly = qrPolynomial(dcdata[r], rsPoly.getLength() - 1);
-
-        var modPoly = rawPoly.mod(rsPoly);
-        ecdata[r] = new Array(rsPoly.getLength() - 1);
-        for (var i = 0; i < ecdata[r].length; i += 1) {
-          var modIndex = i + modPoly.getLength() - ecdata[r].length;
-          ecdata[r][i] = (modIndex >= 0)? modPoly.getAt(modIndex) : 0;
-        }
-      }
-
-      var totalCodeCount = 0;
-      for (var i = 0; i < rsBlocks.length; i += 1) {
-        totalCodeCount += rsBlocks[i].totalCount;
-      }
-
-      var data = new Array(totalCodeCount);
-      var index = 0;
-
-      for (var i = 0; i < maxDcCount; i += 1) {
-        for (var r = 0; r < rsBlocks.length; r += 1) {
-          if (i < dcdata[r].length) {
-            data[index] = dcdata[r][i];
-            index += 1;
-          }
-        }
-      }
-
-      for (var i = 0; i < maxEcCount; i += 1) {
-        for (var r = 0; r < rsBlocks.length; r += 1) {
-          if (i < ecdata[r].length) {
-            data[index] = ecdata[r][i];
-            index += 1;
-          }
-        }
-      }
-
-      return data;
-    };
-
-    var createData = function(typeNumber, errorCorrectionLevel, dataList) {
-
-      var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, errorCorrectionLevel);
-
-      var buffer = qrBitBuffer();
-
-      for (var i = 0; i < dataList.length; i += 1) {
-        var data = dataList[i];
-        buffer.put(data.getMode(), 4);
-        buffer.put(data.getLength(), QRUtil.getLengthInBits(data.getMode(), typeNumber) );
-        data.write(buffer);
-      }
-
-      // calc num max data.
-      var totalDataCount = 0;
-      for (var i = 0; i < rsBlocks.length; i += 1) {
-        totalDataCount += rsBlocks[i].dataCount;
-      }
-
-      if (buffer.getLengthInBits() > totalDataCount * 8) {
-        throw 'code length overflow. ('
-          + buffer.getLengthInBits()
-          + '>'
-          + totalDataCount * 8
-          + ')';
-      }
-
-      // end code
-      if (buffer.getLengthInBits() + 4 <= totalDataCount * 8) {
-        buffer.put(0, 4);
-      }
-
-      // padding
-      while (buffer.getLengthInBits() % 8 != 0) {
-        buffer.putBit(false);
-      }
-
-      // padding
-      while (true) {
-
-        if (buffer.getLengthInBits() >= totalDataCount * 8) {
-          break;
-        }
-        buffer.put(PAD0, 8);
-
-        if (buffer.getLengthInBits() >= totalDataCount * 8) {
-          break;
-        }
-        buffer.put(PAD1, 8);
-      }
-
-      return createBytes(buffer, rsBlocks);
-    };
-
-    _this.addData = function(data, mode) {
-
-      mode = mode || 'Byte';
-
-      var newData = null;
-
-      switch(mode) {
-      case 'Numeric' :
-        newData = qrNumber(data);
-        break;
-      case 'Alphanumeric' :
-        newData = qrAlphaNum(data);
-        break;
-      case 'Byte' :
-        newData = qr8BitByte(data);
-        break;
-      case 'Kanji' :
-        newData = qrKanji(data);
-        break;
-      default :
-        throw 'mode:' + mode;
-      }
-
-      _dataList.push(newData);
-      _dataCache = null;
-    };
-
-    _this.isDark = function(row, col) {
-      if (row < 0 || _moduleCount <= row || col < 0 || _moduleCount <= col) {
-        throw row + ',' + col;
-      }
-      return _modules[row][col];
-    };
-
-    _this.getModuleCount = function() {
-      return _moduleCount;
-    };
-
-    _this.make = function() {
-      if (_typeNumber < 1) {
-        var typeNumber = 1;
-
-        for (; typeNumber < 40; typeNumber++) {
-          var rsBlocks = QRRSBlock.getRSBlocks(typeNumber, _errorCorrectionLevel);
-          var buffer = qrBitBuffer();
-
-          for (var i = 0; i < _dataList.length; i++) {
-            var data = _dataList[i];
-            buffer.put(data.getMode(), 4);
-            buffer.put(data.getLength(), QRUtil.getLengthInBits(data.getMode(), typeNumber) );
-            data.write(buffer);
-          }
-
-          var totalDataCount = 0;
-          for (var i = 0; i < rsBlocks.length; i++) {
-            totalDataCount += rsBlocks[i].dataCount;
-          }
-
-          if (buffer.getLengthInBits() <= totalDataCount * 8) {
-            break;
-          }
-        }
-
-        _typeNumber = typeNumber;
-      }
-
-      makeImpl(false, getBestMaskPattern() );
-    };
-
-    _this.createTableTag = function(cellSize, margin) {
-
-      cellSize = cellSize || 2;
-      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
-
-      var qrHtml = '';
-
-      qrHtml += '<table style="';
-      qrHtml += ' border-width: 0px; border-style: none;';
-      qrHtml += ' border-collapse: collapse;';
-      qrHtml += ' padding: 0px; margin: ' + margin + 'px;';
-      qrHtml += '">';
-      qrHtml += '<tbody>';
-
-      for (var r = 0; r < _this.getModuleCount(); r += 1) {
-
-        qrHtml += '<tr>';
-
-        for (var c = 0; c < _this.getModuleCount(); c += 1) {
-          qrHtml += '<td style="';
-          qrHtml += ' border-width: 0px; border-style: none;';
-          qrHtml += ' border-collapse: collapse;';
-          qrHtml += ' padding: 0px; margin: 0px;';
-          qrHtml += ' width: ' + cellSize + 'px;';
-          qrHtml += ' height: ' + cellSize + 'px;';
-          qrHtml += ' background-color: ';
-          qrHtml += _this.isDark(r, c)? '#000000' : '#ffffff';
-          qrHtml += ';';
-          qrHtml += '"/>';
-        }
-
-        qrHtml += '</tr>';
-      }
-
-      qrHtml += '</tbody>';
-      qrHtml += '</table>';
-
-      return qrHtml;
-    };
-
-    _this.createSvgTag = function(cellSize, margin, alt, title) {
-
-      var opts = {};
-      if (typeof arguments[0] == 'object') {
-        // Called by options.
-        opts = arguments[0];
-        // overwrite cellSize and margin.
-        cellSize = opts.cellSize;
-        margin = opts.margin;
-        alt = opts.alt;
-        title = opts.title;
-      }
-
-      cellSize = cellSize || 2;
-      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
-
-      // Compose alt property surrogate
-      alt = (typeof alt === 'string') ? {text: alt} : alt || {};
-      alt.text = alt.text || null;
-      alt.id = (alt.text) ? alt.id || 'qrcode-description' : null;
-
-      // Compose title property surrogate
-      title = (typeof title === 'string') ? {text: title} : title || {};
-      title.text = title.text || null;
-      title.id = (title.text) ? title.id || 'qrcode-title' : null;
-
-      var size = _this.getModuleCount() * cellSize + margin * 2;
-      var c, mc, r, mr, qrSvg='', rect;
-
-      rect = 'l' + cellSize + ',0 0,' + cellSize +
-        ' -' + cellSize + ',0 0,-' + cellSize + 'z ';
-
-      qrSvg += '<svg version="1.1" xmlns="http://www.w3.org/2000/svg"';
-      qrSvg += !opts.scalable ? ' width="' + size + 'px" height="' + size + 'px"' : '';
-      qrSvg += ' viewBox="0 0 ' + size + ' ' + size + '" ';
-      qrSvg += ' preserveAspectRatio="xMinYMin meet"';
-      qrSvg += (title.text || alt.text) ? ' role="img" aria-labelledby="' +
-          escapeXml([title.id, alt.id].join(' ').trim() ) + '"' : '';
-      qrSvg += '>';
-      qrSvg += (title.text) ? '<title id="' + escapeXml(title.id) + '">' +
-          escapeXml(title.text) + '</title>' : '';
-      qrSvg += (alt.text) ? '<description id="' + escapeXml(alt.id) + '">' +
-          escapeXml(alt.text) + '</description>' : '';
-      qrSvg += '<rect width="100%" height="100%" fill="white" cx="0" cy="0"/>';
-      qrSvg += '<path d="';
-
-      for (r = 0; r < _this.getModuleCount(); r += 1) {
-        mr = r * cellSize + margin;
-        for (c = 0; c < _this.getModuleCount(); c += 1) {
-          if (_this.isDark(r, c) ) {
-            mc = c*cellSize+margin;
-            qrSvg += 'M' + mc + ',' + mr + rect;
-          }
-        }
-      }
-
-      qrSvg += '" stroke="transparent" fill="black"/>';
-      qrSvg += '</svg>';
-
-      return qrSvg;
-    };
-
-    _this.createDataURL = function(cellSize, margin) {
-
-      cellSize = cellSize || 2;
-      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
-
-      var size = _this.getModuleCount() * cellSize + margin * 2;
-      var min = margin;
-      var max = size - margin;
-
-      return createDataURL(size, size, function(x, y) {
-        if (min <= x && x < max && min <= y && y < max) {
-          var c = Math.floor( (x - min) / cellSize);
-          var r = Math.floor( (y - min) / cellSize);
-          return _this.isDark(r, c)? 0 : 1;
-        } else {
-          return 1;
-        }
-      } );
-    };
-
-    _this.createImgTag = function(cellSize, margin, alt) {
-
-      cellSize = cellSize || 2;
-      margin = (typeof margin == 'undefined')? cellSize * 4 : margin;
-
-      var size = _this.getModuleCount() * cellSize + margin * 2;
-
-      var img = '';
-      img += '<img';
-      img += '\u0020src="';
-      img += _this.createDataURL(cellSize, margin);
-      img += '"';
-      img += '\u0020width="';
-      img += size;
-      img += '"';
-      img += '\u0020height="';
-      img += size;
-      img += '"';
-      if (alt) {
-        img += '\u0020alt="';
-        img += escapeXml(alt);
-        img += '"';
-      }
-      img += '/>';
-
-      return img;
-    };
-
-    var escapeXml = function(s) {
-      var escaped = '';
-      for (var i = 0; i < s.length; i += 1) {
-        var c = s.charAt(i);
-        switch(c) {
-        case '<': escaped += '&lt;'; break;
-        case '>': escaped += '&gt;'; break;
-        case '&': escaped += '&amp;'; break;
-        case '"': escaped += '&quot;'; break;
-        default : escaped += c; break;
-        }
-      }
-      return escaped;
-    };
-
-    var _createHalfASCII = function(margin) {
-      var cellSize = 1;
-      margin = (typeof margin == 'undefined')? cellSize * 2 : margin;
-
-      var size = _this.getModuleCount() * cellSize + margin * 2;
-      var min = margin;
-      var max = size - margin;
-
-      var y, x, r1, r2, p;
-
-      var blocks = {
-        '██': '█',
-        '█ ': '▀',
-        ' █': '▄',
-        '  ': ' '
-      };
-
-      var blocksLastLineNoMargin = {
-        '██': '▀',
-        '█ ': '▀',
-        ' █': ' ',
-        '  ': ' '
-      };
-
-      var ascii = '';
-      for (y = 0; y < size; y += 2) {
-        r1 = Math.floor((y - min) / cellSize);
-        r2 = Math.floor((y + 1 - min) / cellSize);
-        for (x = 0; x < size; x += 1) {
-          p = '█';
-
-          if (min <= x && x < max && min <= y && y < max && _this.isDark(r1, Math.floor((x - min) / cellSize))) {
-            p = ' ';
-          }
-
-          if (min <= x && x < max && min <= y+1 && y+1 < max && _this.isDark(r2, Math.floor((x - min) / cellSize))) {
-            p += ' ';
-          }
-          else {
-            p += '█';
-          }
-
-          // Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
-          ascii += (margin < 1 && y+1 >= max) ? blocksLastLineNoMargin[p] : blocks[p];
-        }
-
-        ascii += '\n';
-      }
-
-      if (size % 2 && margin > 0) {
-        return ascii.substring(0, ascii.length - size - 1) + Array(size+1).join('▀');
-      }
-
-      return ascii.substring(0, ascii.length-1);
-    };
-
-    _this.createASCII = function(cellSize, margin) {
-      cellSize = cellSize || 1;
-
-      if (cellSize < 2) {
-        return _createHalfASCII(margin);
-      }
-
-      cellSize -= 1;
-      margin = (typeof margin == 'undefined')? cellSize * 2 : margin;
-
-      var size = _this.getModuleCount() * cellSize + margin * 2;
-      var min = margin;
-      var max = size - margin;
-
-      var y, x, r, p;
-
-      var white = Array(cellSize+1).join('██');
-      var black = Array(cellSize+1).join('  ');
-
-      var ascii = '';
-      var line = '';
-      for (y = 0; y < size; y += 1) {
-        r = Math.floor( (y - min) / cellSize);
-        line = '';
-        for (x = 0; x < size; x += 1) {
-          p = 1;
-
-          if (min <= x && x < max && min <= y && y < max && _this.isDark(r, Math.floor((x - min) / cellSize))) {
-            p = 0;
-          }
-
-          // Output 2 characters per pixel, to create full square. 1 character per pixels gives only half width of square.
-          line += p ? white : black;
-        }
-
-        for (r = 0; r < cellSize; r += 1) {
-          ascii += line + '\n';
-        }
-      }
-
-      return ascii.substring(0, ascii.length-1);
-    };
-
-    _this.renderTo2dContext = function(context, cellSize) {
-      cellSize = cellSize || 2;
-      var length = _this.getModuleCount();
-      for (var row = 0; row < length; row++) {
-        for (var col = 0; col < length; col++) {
-          context.fillStyle = _this.isDark(row, col) ? 'black' : 'white';
-          context.fillRect(row * cellSize, col * cellSize, cellSize, cellSize);
-        }
-      }
-    }
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // qrcode.stringToBytes
-  //---------------------------------------------------------------------
-
-  qrcode.stringToBytesFuncs = {
-    'default' : function(s) {
-      var bytes = [];
-      for (var i = 0; i < s.length; i += 1) {
-        var c = s.charCodeAt(i);
-        bytes.push(c & 0xff);
-      }
-      return bytes;
-    }
-  };
-
-  qrcode.stringToBytes = qrcode.stringToBytesFuncs['default'];
-
-  //---------------------------------------------------------------------
-  // qrcode.createStringToBytes
-  //---------------------------------------------------------------------
-
-  /**
-   * @param unicodeData base64 string of byte array.
-   * [16bit Unicode],[16bit Bytes], ...
-   * @param numChars
-   */
-  qrcode.createStringToBytes = function(unicodeData, numChars) {
-
-    // create conversion map.
-
-    var unicodeMap = function() {
-
-      var bin = base64DecodeInputStream(unicodeData);
-      var read = function() {
-        var b = bin.read();
-        if (b == -1) throw 'eof';
-        return b;
-      };
-
-      var count = 0;
-      var unicodeMap = {};
-      while (true) {
-        var b0 = bin.read();
-        if (b0 == -1) break;
-        var b1 = read();
-        var b2 = read();
-        var b3 = read();
-        var k = String.fromCharCode( (b0 << 8) | b1);
-        var v = (b2 << 8) | b3;
-        unicodeMap[k] = v;
-        count += 1;
-      }
-      if (count != numChars) {
-        throw count + ' != ' + numChars;
-      }
-
-      return unicodeMap;
-    }();
-
-    var unknownChar = '?'.charCodeAt(0);
-
-    return function(s) {
-      var bytes = [];
-      for (var i = 0; i < s.length; i += 1) {
-        var c = s.charCodeAt(i);
-        if (c < 128) {
-          bytes.push(c);
-        } else {
-          var b = unicodeMap[s.charAt(i)];
-          if (typeof b == 'number') {
-            if ( (b & 0xff) == b) {
-              // 1byte
-              bytes.push(b);
-            } else {
-              // 2bytes
-              bytes.push(b >>> 8);
-              bytes.push(b & 0xff);
-            }
-          } else {
-            bytes.push(unknownChar);
-          }
-        }
-      }
-      return bytes;
-    };
-  };
-
-  //---------------------------------------------------------------------
-  // QRMode
-  //---------------------------------------------------------------------
-
-  var QRMode = {
-    MODE_NUMBER :    1 << 0,
-    MODE_ALPHA_NUM : 1 << 1,
-    MODE_8BIT_BYTE : 1 << 2,
-    MODE_KANJI :     1 << 3
-  };
-
-  //---------------------------------------------------------------------
-  // QRErrorCorrectionLevel
-  //---------------------------------------------------------------------
-
-  var QRErrorCorrectionLevel = {
-    L : 1,
-    M : 0,
-    Q : 3,
-    H : 2
-  };
-
-  //---------------------------------------------------------------------
-  // QRMaskPattern
-  //---------------------------------------------------------------------
-
-  var QRMaskPattern = {
-    PATTERN000 : 0,
-    PATTERN001 : 1,
-    PATTERN010 : 2,
-    PATTERN011 : 3,
-    PATTERN100 : 4,
-    PATTERN101 : 5,
-    PATTERN110 : 6,
-    PATTERN111 : 7
-  };
-
-  //---------------------------------------------------------------------
-  // QRUtil
-  //---------------------------------------------------------------------
-
-  var QRUtil = function() {
-
-    var PATTERN_POSITION_TABLE = [
-      [],
-      [6, 18],
-      [6, 22],
-      [6, 26],
-      [6, 30],
-      [6, 34],
-      [6, 22, 38],
-      [6, 24, 42],
-      [6, 26, 46],
-      [6, 28, 50],
-      [6, 30, 54],
-      [6, 32, 58],
-      [6, 34, 62],
-      [6, 26, 46, 66],
-      [6, 26, 48, 70],
-      [6, 26, 50, 74],
-      [6, 30, 54, 78],
-      [6, 30, 56, 82],
-      [6, 30, 58, 86],
-      [6, 34, 62, 90],
-      [6, 28, 50, 72, 94],
-      [6, 26, 50, 74, 98],
-      [6, 30, 54, 78, 102],
-      [6, 28, 54, 80, 106],
-      [6, 32, 58, 84, 110],
-      [6, 30, 58, 86, 114],
-      [6, 34, 62, 90, 118],
-      [6, 26, 50, 74, 98, 122],
-      [6, 30, 54, 78, 102, 126],
-      [6, 26, 52, 78, 104, 130],
-      [6, 30, 56, 82, 108, 134],
-      [6, 34, 60, 86, 112, 138],
-      [6, 30, 58, 86, 114, 142],
-      [6, 34, 62, 90, 118, 146],
-      [6, 30, 54, 78, 102, 126, 150],
-      [6, 24, 50, 76, 102, 128, 154],
-      [6, 28, 54, 80, 106, 132, 158],
-      [6, 32, 58, 84, 110, 136, 162],
-      [6, 26, 54, 82, 110, 138, 166],
-      [6, 30, 58, 86, 114, 142, 170]
-    ];
-    var G15 = (1 << 10) | (1 << 8) | (1 << 5) | (1 << 4) | (1 << 2) | (1 << 1) | (1 << 0);
-    var G18 = (1 << 12) | (1 << 11) | (1 << 10) | (1 << 9) | (1 << 8) | (1 << 5) | (1 << 2) | (1 << 0);
-    var G15_MASK = (1 << 14) | (1 << 12) | (1 << 10) | (1 << 4) | (1 << 1);
-
-    var _this = {};
-
-    var getBCHDigit = function(data) {
-      var digit = 0;
-      while (data != 0) {
-        digit += 1;
-        data >>>= 1;
-      }
-      return digit;
-    };
-
-    _this.getBCHTypeInfo = function(data) {
-      var d = data << 10;
-      while (getBCHDigit(d) - getBCHDigit(G15) >= 0) {
-        d ^= (G15 << (getBCHDigit(d) - getBCHDigit(G15) ) );
-      }
-      return ( (data << 10) | d) ^ G15_MASK;
-    };
-
-    _this.getBCHTypeNumber = function(data) {
-      var d = data << 12;
-      while (getBCHDigit(d) - getBCHDigit(G18) >= 0) {
-        d ^= (G18 << (getBCHDigit(d) - getBCHDigit(G18) ) );
-      }
-      return (data << 12) | d;
-    };
-
-    _this.getPatternPosition = function(typeNumber) {
-      return PATTERN_POSITION_TABLE[typeNumber - 1];
-    };
-
-    _this.getMaskFunction = function(maskPattern) {
-
-      switch (maskPattern) {
-
-      case QRMaskPattern.PATTERN000 :
-        return function(i, j) { return (i + j) % 2 == 0; };
-      case QRMaskPattern.PATTERN001 :
-        return function(i, j) { return i % 2 == 0; };
-      case QRMaskPattern.PATTERN010 :
-        return function(i, j) { return j % 3 == 0; };
-      case QRMaskPattern.PATTERN011 :
-        return function(i, j) { return (i + j) % 3 == 0; };
-      case QRMaskPattern.PATTERN100 :
-        return function(i, j) { return (Math.floor(i / 2) + Math.floor(j / 3) ) % 2 == 0; };
-      case QRMaskPattern.PATTERN101 :
-        return function(i, j) { return (i * j) % 2 + (i * j) % 3 == 0; };
-      case QRMaskPattern.PATTERN110 :
-        return function(i, j) { return ( (i * j) % 2 + (i * j) % 3) % 2 == 0; };
-      case QRMaskPattern.PATTERN111 :
-        return function(i, j) { return ( (i * j) % 3 + (i + j) % 2) % 2 == 0; };
-
-      default :
-        throw 'bad maskPattern:' + maskPattern;
-      }
-    };
-
-    _this.getErrorCorrectPolynomial = function(errorCorrectLength) {
-      var a = qrPolynomial([1], 0);
-      for (var i = 0; i < errorCorrectLength; i += 1) {
-        a = a.multiply(qrPolynomial([1, QRMath.gexp(i)], 0) );
-      }
-      return a;
-    };
-
-    _this.getLengthInBits = function(mode, type) {
-
-      if (1 <= type && type < 10) {
-
-        // 1 - 9
-
-        switch(mode) {
-        case QRMode.MODE_NUMBER    : return 10;
-        case QRMode.MODE_ALPHA_NUM : return 9;
-        case QRMode.MODE_8BIT_BYTE : return 8;
-        case QRMode.MODE_KANJI     : return 8;
-        default :
-          throw 'mode:' + mode;
-        }
-
-      } else if (type < 27) {
-
-        // 10 - 26
-
-        switch(mode) {
-        case QRMode.MODE_NUMBER    : return 12;
-        case QRMode.MODE_ALPHA_NUM : return 11;
-        case QRMode.MODE_8BIT_BYTE : return 16;
-        case QRMode.MODE_KANJI     : return 10;
-        default :
-          throw 'mode:' + mode;
-        }
-
-      } else if (type < 41) {
-
-        // 27 - 40
-
-        switch(mode) {
-        case QRMode.MODE_NUMBER    : return 14;
-        case QRMode.MODE_ALPHA_NUM : return 13;
-        case QRMode.MODE_8BIT_BYTE : return 16;
-        case QRMode.MODE_KANJI     : return 12;
-        default :
-          throw 'mode:' + mode;
-        }
-
-      } else {
-        throw 'type:' + type;
-      }
-    };
-
-    _this.getLostPoint = function(qrcode) {
-
-      var moduleCount = qrcode.getModuleCount();
-
-      var lostPoint = 0;
-
-      // LEVEL1
-
-      for (var row = 0; row < moduleCount; row += 1) {
-        for (var col = 0; col < moduleCount; col += 1) {
-
-          var sameCount = 0;
-          var dark = qrcode.isDark(row, col);
-
-          for (var r = -1; r <= 1; r += 1) {
-
-            if (row + r < 0 || moduleCount <= row + r) {
-              continue;
-            }
-
-            for (var c = -1; c <= 1; c += 1) {
-
-              if (col + c < 0 || moduleCount <= col + c) {
-                continue;
-              }
-
-              if (r == 0 && c == 0) {
-                continue;
-              }
-
-              if (dark == qrcode.isDark(row + r, col + c) ) {
-                sameCount += 1;
-              }
-            }
-          }
-
-          if (sameCount > 5) {
-            lostPoint += (3 + sameCount - 5);
-          }
-        }
-      };
-
-      // LEVEL2
-
-      for (var row = 0; row < moduleCount - 1; row += 1) {
-        for (var col = 0; col < moduleCount - 1; col += 1) {
-          var count = 0;
-          if (qrcode.isDark(row, col) ) count += 1;
-          if (qrcode.isDark(row + 1, col) ) count += 1;
-          if (qrcode.isDark(row, col + 1) ) count += 1;
-          if (qrcode.isDark(row + 1, col + 1) ) count += 1;
-          if (count == 0 || count == 4) {
-            lostPoint += 3;
-          }
-        }
-      }
-
-      // LEVEL3
-
-      for (var row = 0; row < moduleCount; row += 1) {
-        for (var col = 0; col < moduleCount - 6; col += 1) {
-          if (qrcode.isDark(row, col)
-              && !qrcode.isDark(row, col + 1)
-              &&  qrcode.isDark(row, col + 2)
-              &&  qrcode.isDark(row, col + 3)
-              &&  qrcode.isDark(row, col + 4)
-              && !qrcode.isDark(row, col + 5)
-              &&  qrcode.isDark(row, col + 6) ) {
-            lostPoint += 40;
-          }
-        }
-      }
-
-      for (var col = 0; col < moduleCount; col += 1) {
-        for (var row = 0; row < moduleCount - 6; row += 1) {
-          if (qrcode.isDark(row, col)
-              && !qrcode.isDark(row + 1, col)
-              &&  qrcode.isDark(row + 2, col)
-              &&  qrcode.isDark(row + 3, col)
-              &&  qrcode.isDark(row + 4, col)
-              && !qrcode.isDark(row + 5, col)
-              &&  qrcode.isDark(row + 6, col) ) {
-            lostPoint += 40;
-          }
-        }
-      }
-
-      // LEVEL4
-
-      var darkCount = 0;
-
-      for (var col = 0; col < moduleCount; col += 1) {
-        for (var row = 0; row < moduleCount; row += 1) {
-          if (qrcode.isDark(row, col) ) {
-            darkCount += 1;
-          }
-        }
-      }
-
-      var ratio = Math.abs(100 * darkCount / moduleCount / moduleCount - 50) / 5;
-      lostPoint += ratio * 10;
-
-      return lostPoint;
-    };
-
-    return _this;
-  }();
-
-  //---------------------------------------------------------------------
-  // QRMath
-  //---------------------------------------------------------------------
-
-  var QRMath = function() {
-
-    var EXP_TABLE = new Array(256);
-    var LOG_TABLE = new Array(256);
-
-    // initialize tables
-    for (var i = 0; i < 8; i += 1) {
-      EXP_TABLE[i] = 1 << i;
-    }
-    for (var i = 8; i < 256; i += 1) {
-      EXP_TABLE[i] = EXP_TABLE[i - 4]
-        ^ EXP_TABLE[i - 5]
-        ^ EXP_TABLE[i - 6]
-        ^ EXP_TABLE[i - 8];
-    }
-    for (var i = 0; i < 255; i += 1) {
-      LOG_TABLE[EXP_TABLE[i] ] = i;
-    }
-
-    var _this = {};
-
-    _this.glog = function(n) {
-
-      if (n < 1) {
-        throw 'glog(' + n + ')';
-      }
-
-      return LOG_TABLE[n];
-    };
-
-    _this.gexp = function(n) {
-
-      while (n < 0) {
-        n += 255;
-      }
-
-      while (n >= 256) {
-        n -= 255;
-      }
-
-      return EXP_TABLE[n];
-    };
-
-    return _this;
-  }();
-
-  //---------------------------------------------------------------------
-  // qrPolynomial
-  //---------------------------------------------------------------------
-
-  function qrPolynomial(num, shift) {
-
-    if (typeof num.length == 'undefined') {
-      throw num.length + '/' + shift;
-    }
-
-    var _num = function() {
-      var offset = 0;
-      while (offset < num.length && num[offset] == 0) {
-        offset += 1;
-      }
-      var _num = new Array(num.length - offset + shift);
-      for (var i = 0; i < num.length - offset; i += 1) {
-        _num[i] = num[i + offset];
-      }
-      return _num;
-    }();
-
-    var _this = {};
-
-    _this.getAt = function(index) {
-      return _num[index];
-    };
-
-    _this.getLength = function() {
-      return _num.length;
-    };
-
-    _this.multiply = function(e) {
-
-      var num = new Array(_this.getLength() + e.getLength() - 1);
-
-      for (var i = 0; i < _this.getLength(); i += 1) {
-        for (var j = 0; j < e.getLength(); j += 1) {
-          num[i + j] ^= QRMath.gexp(QRMath.glog(_this.getAt(i) ) + QRMath.glog(e.getAt(j) ) );
-        }
-      }
-
-      return qrPolynomial(num, 0);
-    };
-
-    _this.mod = function(e) {
-
-      if (_this.getLength() - e.getLength() < 0) {
-        return _this;
-      }
-
-      var ratio = QRMath.glog(_this.getAt(0) ) - QRMath.glog(e.getAt(0) );
-
-      var num = new Array(_this.getLength() );
-      for (var i = 0; i < _this.getLength(); i += 1) {
-        num[i] = _this.getAt(i);
-      }
-
-      for (var i = 0; i < e.getLength(); i += 1) {
-        num[i] ^= QRMath.gexp(QRMath.glog(e.getAt(i) ) + ratio);
-      }
-
-      // recursive call
-      return qrPolynomial(num, 0).mod(e);
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // QRRSBlock
-  //---------------------------------------------------------------------
-
-  var QRRSBlock = function() {
-
-    var RS_BLOCK_TABLE = [
-
-      // L
-      // M
-      // Q
-      // H
-
-      // 1
-      [1, 26, 19],
-      [1, 26, 16],
-      [1, 26, 13],
-      [1, 26, 9],
-
-      // 2
-      [1, 44, 34],
-      [1, 44, 28],
-      [1, 44, 22],
-      [1, 44, 16],
-
-      // 3
-      [1, 70, 55],
-      [1, 70, 44],
-      [2, 35, 17],
-      [2, 35, 13],
-
-      // 4
-      [1, 100, 80],
-      [2, 50, 32],
-      [2, 50, 24],
-      [4, 25, 9],
-
-      // 5
-      [1, 134, 108],
-      [2, 67, 43],
-      [2, 33, 15, 2, 34, 16],
-      [2, 33, 11, 2, 34, 12],
-
-      // 6
-      [2, 86, 68],
-      [4, 43, 27],
-      [4, 43, 19],
-      [4, 43, 15],
-
-      // 7
-      [2, 98, 78],
-      [4, 49, 31],
-      [2, 32, 14, 4, 33, 15],
-      [4, 39, 13, 1, 40, 14],
-
-      // 8
-      [2, 121, 97],
-      [2, 60, 38, 2, 61, 39],
-      [4, 40, 18, 2, 41, 19],
-      [4, 40, 14, 2, 41, 15],
-
-      // 9
-      [2, 146, 116],
-      [3, 58, 36, 2, 59, 37],
-      [4, 36, 16, 4, 37, 17],
-      [4, 36, 12, 4, 37, 13],
-
-      // 10
-      [2, 86, 68, 2, 87, 69],
-      [4, 69, 43, 1, 70, 44],
-      [6, 43, 19, 2, 44, 20],
-      [6, 43, 15, 2, 44, 16],
-
-      // 11
-      [4, 101, 81],
-      [1, 80, 50, 4, 81, 51],
-      [4, 50, 22, 4, 51, 23],
-      [3, 36, 12, 8, 37, 13],
-
-      // 12
-      [2, 116, 92, 2, 117, 93],
-      [6, 58, 36, 2, 59, 37],
-      [4, 46, 20, 6, 47, 21],
-      [7, 42, 14, 4, 43, 15],
-
-      // 13
-      [4, 133, 107],
-      [8, 59, 37, 1, 60, 38],
-      [8, 44, 20, 4, 45, 21],
-      [12, 33, 11, 4, 34, 12],
-
-      // 14
-      [3, 145, 115, 1, 146, 116],
-      [4, 64, 40, 5, 65, 41],
-      [11, 36, 16, 5, 37, 17],
-      [11, 36, 12, 5, 37, 13],
-
-      // 15
-      [5, 109, 87, 1, 110, 88],
-      [5, 65, 41, 5, 66, 42],
-      [5, 54, 24, 7, 55, 25],
-      [11, 36, 12, 7, 37, 13],
-
-      // 16
-      [5, 122, 98, 1, 123, 99],
-      [7, 73, 45, 3, 74, 46],
-      [15, 43, 19, 2, 44, 20],
-      [3, 45, 15, 13, 46, 16],
-
-      // 17
-      [1, 135, 107, 5, 136, 108],
-      [10, 74, 46, 1, 75, 47],
-      [1, 50, 22, 15, 51, 23],
-      [2, 42, 14, 17, 43, 15],
-
-      // 18
-      [5, 150, 120, 1, 151, 121],
-      [9, 69, 43, 4, 70, 44],
-      [17, 50, 22, 1, 51, 23],
-      [2, 42, 14, 19, 43, 15],
-
-      // 19
-      [3, 141, 113, 4, 142, 114],
-      [3, 70, 44, 11, 71, 45],
-      [17, 47, 21, 4, 48, 22],
-      [9, 39, 13, 16, 40, 14],
-
-      // 20
-      [3, 135, 107, 5, 136, 108],
-      [3, 67, 41, 13, 68, 42],
-      [15, 54, 24, 5, 55, 25],
-      [15, 43, 15, 10, 44, 16],
-
-      // 21
-      [4, 144, 116, 4, 145, 117],
-      [17, 68, 42],
-      [17, 50, 22, 6, 51, 23],
-      [19, 46, 16, 6, 47, 17],
-
-      // 22
-      [2, 139, 111, 7, 140, 112],
-      [17, 74, 46],
-      [7, 54, 24, 16, 55, 25],
-      [34, 37, 13],
-
-      // 23
-      [4, 151, 121, 5, 152, 122],
-      [4, 75, 47, 14, 76, 48],
-      [11, 54, 24, 14, 55, 25],
-      [16, 45, 15, 14, 46, 16],
-
-      // 24
-      [6, 147, 117, 4, 148, 118],
-      [6, 73, 45, 14, 74, 46],
-      [11, 54, 24, 16, 55, 25],
-      [30, 46, 16, 2, 47, 17],
-
-      // 25
-      [8, 132, 106, 4, 133, 107],
-      [8, 75, 47, 13, 76, 48],
-      [7, 54, 24, 22, 55, 25],
-      [22, 45, 15, 13, 46, 16],
-
-      // 26
-      [10, 142, 114, 2, 143, 115],
-      [19, 74, 46, 4, 75, 47],
-      [28, 50, 22, 6, 51, 23],
-      [33, 46, 16, 4, 47, 17],
-
-      // 27
-      [8, 152, 122, 4, 153, 123],
-      [22, 73, 45, 3, 74, 46],
-      [8, 53, 23, 26, 54, 24],
-      [12, 45, 15, 28, 46, 16],
-
-      // 28
-      [3, 147, 117, 10, 148, 118],
-      [3, 73, 45, 23, 74, 46],
-      [4, 54, 24, 31, 55, 25],
-      [11, 45, 15, 31, 46, 16],
-
-      // 29
-      [7, 146, 116, 7, 147, 117],
-      [21, 73, 45, 7, 74, 46],
-      [1, 53, 23, 37, 54, 24],
-      [19, 45, 15, 26, 46, 16],
-
-      // 30
-      [5, 145, 115, 10, 146, 116],
-      [19, 75, 47, 10, 76, 48],
-      [15, 54, 24, 25, 55, 25],
-      [23, 45, 15, 25, 46, 16],
-
-      // 31
-      [13, 145, 115, 3, 146, 116],
-      [2, 74, 46, 29, 75, 47],
-      [42, 54, 24, 1, 55, 25],
-      [23, 45, 15, 28, 46, 16],
-
-      // 32
-      [17, 145, 115],
-      [10, 74, 46, 23, 75, 47],
-      [10, 54, 24, 35, 55, 25],
-      [19, 45, 15, 35, 46, 16],
-
-      // 33
-      [17, 145, 115, 1, 146, 116],
-      [14, 74, 46, 21, 75, 47],
-      [29, 54, 24, 19, 55, 25],
-      [11, 45, 15, 46, 46, 16],
-
-      // 34
-      [13, 145, 115, 6, 146, 116],
-      [14, 74, 46, 23, 75, 47],
-      [44, 54, 24, 7, 55, 25],
-      [59, 46, 16, 1, 47, 17],
-
-      // 35
-      [12, 151, 121, 7, 152, 122],
-      [12, 75, 47, 26, 76, 48],
-      [39, 54, 24, 14, 55, 25],
-      [22, 45, 15, 41, 46, 16],
-
-      // 36
-      [6, 151, 121, 14, 152, 122],
-      [6, 75, 47, 34, 76, 48],
-      [46, 54, 24, 10, 55, 25],
-      [2, 45, 15, 64, 46, 16],
-
-      // 37
-      [17, 152, 122, 4, 153, 123],
-      [29, 74, 46, 14, 75, 47],
-      [49, 54, 24, 10, 55, 25],
-      [24, 45, 15, 46, 46, 16],
-
-      // 38
-      [4, 152, 122, 18, 153, 123],
-      [13, 74, 46, 32, 75, 47],
-      [48, 54, 24, 14, 55, 25],
-      [42, 45, 15, 32, 46, 16],
-
-      // 39
-      [20, 147, 117, 4, 148, 118],
-      [40, 75, 47, 7, 76, 48],
-      [43, 54, 24, 22, 55, 25],
-      [10, 45, 15, 67, 46, 16],
-
-      // 40
-      [19, 148, 118, 6, 149, 119],
-      [18, 75, 47, 31, 76, 48],
-      [34, 54, 24, 34, 55, 25],
-      [20, 45, 15, 61, 46, 16]
-    ];
-
-    var qrRSBlock = function(totalCount, dataCount) {
-      var _this = {};
-      _this.totalCount = totalCount;
-      _this.dataCount = dataCount;
-      return _this;
-    };
-
-    var _this = {};
-
-    var getRsBlockTable = function(typeNumber, errorCorrectionLevel) {
-
-      switch(errorCorrectionLevel) {
-      case QRErrorCorrectionLevel.L :
-        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 0];
-      case QRErrorCorrectionLevel.M :
-        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 1];
-      case QRErrorCorrectionLevel.Q :
-        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 2];
-      case QRErrorCorrectionLevel.H :
-        return RS_BLOCK_TABLE[(typeNumber - 1) * 4 + 3];
-      default :
-        return undefined;
-      }
-    };
-
-    _this.getRSBlocks = function(typeNumber, errorCorrectionLevel) {
-
-      var rsBlock = getRsBlockTable(typeNumber, errorCorrectionLevel);
-
-      if (typeof rsBlock == 'undefined') {
-        throw 'bad rs block @ typeNumber:' + typeNumber +
-            '/errorCorrectionLevel:' + errorCorrectionLevel;
-      }
-
-      var length = rsBlock.length / 3;
-
-      var list = [];
-
-      for (var i = 0; i < length; i += 1) {
-
-        var count = rsBlock[i * 3 + 0];
-        var totalCount = rsBlock[i * 3 + 1];
-        var dataCount = rsBlock[i * 3 + 2];
-
-        for (var j = 0; j < count; j += 1) {
-          list.push(qrRSBlock(totalCount, dataCount) );
-        }
-      }
-
-      return list;
-    };
-
-    return _this;
-  }();
-
-  //---------------------------------------------------------------------
-  // qrBitBuffer
-  //---------------------------------------------------------------------
-
-  var qrBitBuffer = function() {
-
-    var _buffer = [];
-    var _length = 0;
-
-    var _this = {};
-
-    _this.getBuffer = function() {
-      return _buffer;
-    };
-
-    _this.getAt = function(index) {
-      var bufIndex = Math.floor(index / 8);
-      return ( (_buffer[bufIndex] >>> (7 - index % 8) ) & 1) == 1;
-    };
-
-    _this.put = function(num, length) {
-      for (var i = 0; i < length; i += 1) {
-        _this.putBit( ( (num >>> (length - i - 1) ) & 1) == 1);
-      }
-    };
-
-    _this.getLengthInBits = function() {
-      return _length;
-    };
-
-    _this.putBit = function(bit) {
-
-      var bufIndex = Math.floor(_length / 8);
-      if (_buffer.length <= bufIndex) {
-        _buffer.push(0);
-      }
-
-      if (bit) {
-        _buffer[bufIndex] |= (0x80 >>> (_length % 8) );
-      }
-
-      _length += 1;
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // qrNumber
-  //---------------------------------------------------------------------
-
-  var qrNumber = function(data) {
-
-    var _mode = QRMode.MODE_NUMBER;
-    var _data = data;
-
-    var _this = {};
-
-    _this.getMode = function() {
-      return _mode;
-    };
-
-    _this.getLength = function(buffer) {
-      return _data.length;
-    };
-
-    _this.write = function(buffer) {
-
-      var data = _data;
-
-      var i = 0;
-
-      while (i + 2 < data.length) {
-        buffer.put(strToNum(data.substring(i, i + 3) ), 10);
-        i += 3;
-      }
-
-      if (i < data.length) {
-        if (data.length - i == 1) {
-          buffer.put(strToNum(data.substring(i, i + 1) ), 4);
-        } else if (data.length - i == 2) {
-          buffer.put(strToNum(data.substring(i, i + 2) ), 7);
-        }
-      }
-    };
-
-    var strToNum = function(s) {
-      var num = 0;
-      for (var i = 0; i < s.length; i += 1) {
-        num = num * 10 + chatToNum(s.charAt(i) );
-      }
-      return num;
-    };
-
-    var chatToNum = function(c) {
-      if ('0' <= c && c <= '9') {
-        return c.charCodeAt(0) - '0'.charCodeAt(0);
-      }
-      throw 'illegal char :' + c;
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // qrAlphaNum
-  //---------------------------------------------------------------------
-
-  var qrAlphaNum = function(data) {
-
-    var _mode = QRMode.MODE_ALPHA_NUM;
-    var _data = data;
-
-    var _this = {};
-
-    _this.getMode = function() {
-      return _mode;
-    };
-
-    _this.getLength = function(buffer) {
-      return _data.length;
-    };
-
-    _this.write = function(buffer) {
-
-      var s = _data;
-
-      var i = 0;
-
-      while (i + 1 < s.length) {
-        buffer.put(
-          getCode(s.charAt(i) ) * 45 +
-          getCode(s.charAt(i + 1) ), 11);
-        i += 2;
-      }
-
-      if (i < s.length) {
-        buffer.put(getCode(s.charAt(i) ), 6);
-      }
-    };
-
-    var getCode = function(c) {
-
-      if ('0' <= c && c <= '9') {
-        return c.charCodeAt(0) - '0'.charCodeAt(0);
-      } else if ('A' <= c && c <= 'Z') {
-        return c.charCodeAt(0) - 'A'.charCodeAt(0) + 10;
-      } else {
-        switch (c) {
-        case ' ' : return 36;
-        case '$' : return 37;
-        case '%' : return 38;
-        case '*' : return 39;
-        case '+' : return 40;
-        case '-' : return 41;
-        case '.' : return 42;
-        case '/' : return 43;
-        case ':' : return 44;
-        default :
-          throw 'illegal char :' + c;
-        }
-      }
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // qr8BitByte
-  //---------------------------------------------------------------------
-
-  var qr8BitByte = function(data) {
-
-    var _mode = QRMode.MODE_8BIT_BYTE;
-    var _data = data;
-    var _bytes = qrcode.stringToBytes(data);
-
-    var _this = {};
-
-    _this.getMode = function() {
-      return _mode;
-    };
-
-    _this.getLength = function(buffer) {
-      return _bytes.length;
-    };
-
-    _this.write = function(buffer) {
-      for (var i = 0; i < _bytes.length; i += 1) {
-        buffer.put(_bytes[i], 8);
-      }
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // qrKanji
-  //---------------------------------------------------------------------
-
-  var qrKanji = function(data) {
-
-    var _mode = QRMode.MODE_KANJI;
-    var _data = data;
-
-    var stringToBytes = qrcode.stringToBytesFuncs['SJIS'];
-    if (!stringToBytes) {
-      throw 'sjis not supported.';
-    }
-    !function(c, code) {
-      // self test for sjis support.
-      var test = stringToBytes(c);
-      if (test.length != 2 || ( (test[0] << 8) | test[1]) != code) {
-        throw 'sjis not supported.';
-      }
-    }('\u53cb', 0x9746);
-
-    var _bytes = stringToBytes(data);
-
-    var _this = {};
-
-    _this.getMode = function() {
-      return _mode;
-    };
-
-    _this.getLength = function(buffer) {
-      return ~~(_bytes.length / 2);
-    };
-
-    _this.write = function(buffer) {
-
-      var data = _bytes;
-
-      var i = 0;
-
-      while (i + 1 < data.length) {
-
-        var c = ( (0xff & data[i]) << 8) | (0xff & data[i + 1]);
-
-        if (0x8140 <= c && c <= 0x9FFC) {
-          c -= 0x8140;
-        } else if (0xE040 <= c && c <= 0xEBBF) {
-          c -= 0xC140;
-        } else {
-          throw 'illegal char at ' + (i + 1) + '/' + c;
-        }
-
-        c = ( (c >>> 8) & 0xff) * 0xC0 + (c & 0xff);
-
-        buffer.put(c, 13);
-
-        i += 2;
-      }
-
-      if (i < data.length) {
-        throw 'illegal char at ' + (i + 1);
-      }
-    };
-
-    return _this;
-  };
-
-  //=====================================================================
-  // GIF Support etc.
-  //
-
-  //---------------------------------------------------------------------
-  // byteArrayOutputStream
-  //---------------------------------------------------------------------
-
-  var byteArrayOutputStream = function() {
-
-    var _bytes = [];
-
-    var _this = {};
-
-    _this.writeByte = function(b) {
-      _bytes.push(b & 0xff);
-    };
-
-    _this.writeShort = function(i) {
-      _this.writeByte(i);
-      _this.writeByte(i >>> 8);
-    };
-
-    _this.writeBytes = function(b, off, len) {
-      off = off || 0;
-      len = len || b.length;
-      for (var i = 0; i < len; i += 1) {
-        _this.writeByte(b[i + off]);
-      }
-    };
-
-    _this.writeString = function(s) {
-      for (var i = 0; i < s.length; i += 1) {
-        _this.writeByte(s.charCodeAt(i) );
-      }
-    };
-
-    _this.toByteArray = function() {
-      return _bytes;
-    };
-
-    _this.toString = function() {
-      var s = '';
-      s += '[';
-      for (var i = 0; i < _bytes.length; i += 1) {
-        if (i > 0) {
-          s += ',';
-        }
-        s += _bytes[i];
-      }
-      s += ']';
-      return s;
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // base64EncodeOutputStream
-  //---------------------------------------------------------------------
-
-  var base64EncodeOutputStream = function() {
-
-    var _buffer = 0;
-    var _buflen = 0;
-    var _length = 0;
-    var _base64 = '';
-
-    var _this = {};
-
-    var writeEncoded = function(b) {
-      _base64 += String.fromCharCode(encode(b & 0x3f) );
-    };
-
-    var encode = function(n) {
-      if (n < 0) {
-        // error.
-      } else if (n < 26) {
-        return 0x41 + n;
-      } else if (n < 52) {
-        return 0x61 + (n - 26);
-      } else if (n < 62) {
-        return 0x30 + (n - 52);
-      } else if (n == 62) {
-        return 0x2b;
-      } else if (n == 63) {
-        return 0x2f;
-      }
-      throw 'n:' + n;
-    };
-
-    _this.writeByte = function(n) {
-
-      _buffer = (_buffer << 8) | (n & 0xff);
-      _buflen += 8;
-      _length += 1;
-
-      while (_buflen >= 6) {
-        writeEncoded(_buffer >>> (_buflen - 6) );
-        _buflen -= 6;
-      }
-    };
-
-    _this.flush = function() {
-
-      if (_buflen > 0) {
-        writeEncoded(_buffer << (6 - _buflen) );
-        _buffer = 0;
-        _buflen = 0;
-      }
-
-      if (_length % 3 != 0) {
-        // padding
-        var padlen = 3 - _length % 3;
-        for (var i = 0; i < padlen; i += 1) {
-          _base64 += '=';
-        }
-      }
-    };
-
-    _this.toString = function() {
-      return _base64;
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // base64DecodeInputStream
-  //---------------------------------------------------------------------
-
-  var base64DecodeInputStream = function(str) {
-
-    var _str = str;
-    var _pos = 0;
-    var _buffer = 0;
-    var _buflen = 0;
-
-    var _this = {};
-
-    _this.read = function() {
-
-      while (_buflen < 8) {
-
-        if (_pos >= _str.length) {
-          if (_buflen == 0) {
-            return -1;
-          }
-          throw 'unexpected end of file./' + _buflen;
-        }
-
-        var c = _str.charAt(_pos);
-        _pos += 1;
-
-        if (c == '=') {
-          _buflen = 0;
-          return -1;
-        } else if (c.match(/^\s$/) ) {
-          // ignore if whitespace.
-          continue;
-        }
-
-        _buffer = (_buffer << 6) | decode(c.charCodeAt(0) );
-        _buflen += 6;
-      }
-
-      var n = (_buffer >>> (_buflen - 8) ) & 0xff;
-      _buflen -= 8;
-      return n;
-    };
-
-    var decode = function(c) {
-      if (0x41 <= c && c <= 0x5a) {
-        return c - 0x41;
-      } else if (0x61 <= c && c <= 0x7a) {
-        return c - 0x61 + 26;
-      } else if (0x30 <= c && c <= 0x39) {
-        return c - 0x30 + 52;
-      } else if (c == 0x2b) {
-        return 62;
-      } else if (c == 0x2f) {
-        return 63;
-      } else {
-        throw 'c:' + c;
-      }
-    };
-
-    return _this;
-  };
-
-  //---------------------------------------------------------------------
-  // gifImage (B/W)
-  //---------------------------------------------------------------------
-
-  var gifImage = function(width, height) {
-
-    var _width = width;
-    var _height = height;
-    var _data = new Array(width * height);
-
-    var _this = {};
-
-    _this.setPixel = function(x, y, pixel) {
-      _data[y * _width + x] = pixel;
-    };
-
-    _this.write = function(out) {
-
-      //---------------------------------
-      // GIF Signature
-
-      out.writeString('GIF87a');
-
-      //---------------------------------
-      // Screen Descriptor
-
-      out.writeShort(_width);
-      out.writeShort(_height);
-
-      out.writeByte(0x80); // 2bit
-      out.writeByte(0);
-      out.writeByte(0);
-
-      //---------------------------------
-      // Global Color Map
-
-      // black
-      out.writeByte(0x00);
-      out.writeByte(0x00);
-      out.writeByte(0x00);
-
-      // white
-      out.writeByte(0xff);
-      out.writeByte(0xff);
-      out.writeByte(0xff);
-
-      //---------------------------------
-      // Image Descriptor
-
-      out.writeString(',');
-      out.writeShort(0);
-      out.writeShort(0);
-      out.writeShort(_width);
-      out.writeShort(_height);
-      out.writeByte(0);
-
-      //---------------------------------
-      // Local Color Map
-
-      //---------------------------------
-      // Raster Data
-
-      var lzwMinCodeSize = 2;
-      var raster = getLZWRaster(lzwMinCodeSize);
-
-      out.writeByte(lzwMinCodeSize);
-
-      var offset = 0;
-
-      while (raster.length - offset > 255) {
-        out.writeByte(255);
-        out.writeBytes(raster, offset, 255);
-        offset += 255;
-      }
-
-      out.writeByte(raster.length - offset);
-      out.writeBytes(raster, offset, raster.length - offset);
-      out.writeByte(0x00);
-
-      //---------------------------------
-      // GIF Terminator
-      out.writeString(';');
-    };
-
-    var bitOutputStream = function(out) {
-
-      var _out = out;
-      var _bitLength = 0;
-      var _bitBuffer = 0;
-
-      var _this = {};
-
-      _this.write = function(data, length) {
-
-        if ( (data >>> length) != 0) {
-          throw 'length over';
-        }
-
-        while (_bitLength + length >= 8) {
-          _out.writeByte(0xff & ( (data << _bitLength) | _bitBuffer) );
-          length -= (8 - _bitLength);
-          data >>>= (8 - _bitLength);
-          _bitBuffer = 0;
-          _bitLength = 0;
-        }
-
-        _bitBuffer = (data << _bitLength) | _bitBuffer;
-        _bitLength = _bitLength + length;
-      };
-
-      _this.flush = function() {
-        if (_bitLength > 0) {
-          _out.writeByte(_bitBuffer);
-        }
-      };
-
-      return _this;
-    };
-
-    var getLZWRaster = function(lzwMinCodeSize) {
-
-      var clearCode = 1 << lzwMinCodeSize;
-      var endCode = (1 << lzwMinCodeSize) + 1;
-      var bitLength = lzwMinCodeSize + 1;
-
-      // Setup LZWTable
-      var table = lzwTable();
-
-      for (var i = 0; i < clearCode; i += 1) {
-        table.add(String.fromCharCode(i) );
-      }
-      table.add(String.fromCharCode(clearCode) );
-      table.add(String.fromCharCode(endCode) );
-
-      var byteOut = byteArrayOutputStream();
-      var bitOut = bitOutputStream(byteOut);
-
-      // clear code
-      bitOut.write(clearCode, bitLength);
-
-      var dataIndex = 0;
-
-      var s = String.fromCharCode(_data[dataIndex]);
-      dataIndex += 1;
-
-      while (dataIndex < _data.length) {
-
-        var c = String.fromCharCode(_data[dataIndex]);
-        dataIndex += 1;
-
-        if (table.contains(s + c) ) {
-
-          s = s + c;
-
-        } else {
-
-          bitOut.write(table.indexOf(s), bitLength);
-
-          if (table.size() < 0xfff) {
-
-            if (table.size() == (1 << bitLength) ) {
-              bitLength += 1;
-            }
-
-            table.add(s + c);
-          }
-
-          s = c;
-        }
-      }
-
-      bitOut.write(table.indexOf(s), bitLength);
-
-      // end code
-      bitOut.write(endCode, bitLength);
-
-      bitOut.flush();
-
-      return byteOut.toByteArray();
-    };
-
-    var lzwTable = function() {
-
-      var _map = {};
-      var _size = 0;
-
-      var _this = {};
-
-      _this.add = function(key) {
-        if (_this.contains(key) ) {
-          throw 'dup key:' + key;
-        }
-        _map[key] = _size;
-        _size += 1;
-      };
-
-      _this.size = function() {
-        return _size;
-      };
-
-      _this.indexOf = function(key) {
-        return _map[key];
-      };
-
-      _this.contains = function(key) {
-        return typeof _map[key] != 'undefined';
-      };
-
-      return _this;
-    };
-
-    return _this;
-  };
-
-  var createDataURL = function(width, height, getPixel) {
-    var gif = gifImage(width, height);
-    for (var y = 0; y < height; y += 1) {
-      for (var x = 0; x < width; x += 1) {
-        gif.setPixel(x, y, getPixel(x, y) );
-      }
-    }
-
-    var b = byteArrayOutputStream();
-    gif.write(b);
-
-    var base64 = base64EncodeOutputStream();
-    var bytes = b.toByteArray();
-    for (var i = 0; i < bytes.length; i += 1) {
-      base64.writeByte(bytes[i]);
-    }
-    base64.flush();
-
-    return 'data:image/gif;base64,' + base64;
-  };
-
-  //---------------------------------------------------------------------
-  // returns qrcode function.
-
-  return qrcode;
-}();
-
-// multibyte support
-!function() {
-
-  qrcode.stringToBytesFuncs['UTF-8'] = function(s) {
-    // http://stackoverflow.com/questions/18729405/how-to-convert-utf8-string-to-byte-array
-    function toUTF8Array(str) {
-      var utf8 = [];
-      for (var i=0; i < str.length; i++) {
-        var charcode = str.charCodeAt(i);
-        if (charcode < 0x80) utf8.push(charcode);
-        else if (charcode < 0x800) {
-          utf8.push(0xc0 | (charcode >> 6),
-              0x80 | (charcode & 0x3f));
-        }
-        else if (charcode < 0xd800 || charcode >= 0xe000) {
-          utf8.push(0xe0 | (charcode >> 12),
-              0x80 | ((charcode>>6) & 0x3f),
-              0x80 | (charcode & 0x3f));
-        }
-        // surrogate pair
-        else {
-          i++;
-          // UTF-16 encodes 0x10000-0x10FFFF by
-          // subtracting 0x10000 and splitting the
-          // 20 bits of 0x0-0xFFFFF into two halves
-          charcode = 0x10000 + (((charcode & 0x3ff)<<10)
-            | (str.charCodeAt(i) & 0x3ff));
-          utf8.push(0xf0 | (charcode >>18),
-              0x80 | ((charcode>>12) & 0x3f),
-              0x80 | ((charcode>>6) & 0x3f),
-              0x80 | (charcode & 0x3f));
-        }
-      }
-      return utf8;
-    }
-    return toUTF8Array(s);
-  };
-
-}();
-
-(function (factory) {
-  if (typeof define === 'function' && define.amd) {
-      define([], factory);
-  } else if (typeof exports === 'object') {
-      module.exports = factory();
-  }
-}(function () {
-    return qrcode;
-}));
-
-    </script>
     <script>
         var SERVER_ROOT_PATH = <?= json_encode($config['root_path'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const PUBLIC_WORKSPACE_BASE = <?= json_encode($publicWorkspaceBase, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
@@ -7573,6 +5552,91 @@ var qrcode = function() {
             let clickedBtn = null;
             let hasResponseError = false;
 
+            const loginActivityModal = document.getElementById('loginActivityModal');
+            const loginActivityRows = document.getElementById('login-activity-rows');
+            const loginActivityFeedback = document.getElementById('login-activity-feedback');
+            const loginPolicyForm = document.getElementById('login-policy-form');
+            let loginActivityBusy = false, loginActivityClock = null, loginActivityOffset = 0;
+            const loginDate = timestamp => timestamp ? new Date(timestamp * 1000).toLocaleString('en-GB') : '—';
+            const loginResultLabels = {success:'Success', wrong_password:'Wrong password', blocked:'Blocked', limit_reset:'Limit reset', global_limit_reset:'Global limit reset', policy_changed:'Limits changed'};
+            function updateLoginActivityTimers() {
+                const now = Date.now() / 1000 + loginActivityOffset;
+                loginActivityModal.querySelectorAll('[data-login-until]').forEach(label => {
+                    const remaining = Math.max(0, Math.ceil(Number(label.dataset.loginUntil) - now));
+                    label.textContent = remaining ? (label.dataset.loginScope === 'global' ? 'Global block · ' : 'Blocked · ') + Math.ceil(remaining / 60) + ' min' : 'Expired · refresh';
+                });
+            }
+            function showLoginDetails(row) {
+                const panel = document.getElementById('login-activity-details'); panel.hidden = false; panel.replaceChildren();
+                const heading = document.createElement('strong'); heading.textContent = row.ip; panel.append(heading);
+                for (const [label, value] of [['First recorded',loginDate(row.first)],['Last attempt',loginDate(row.last)],['Last success',loginDate(row.last_success)],['Browser',row.agent || 'Not recorded']]) {
+                    const line = document.createElement('p'); line.className = 'mb-1'; line.textContent = label + ': ' + value; panel.append(line);
+                }
+                const events = document.createElement('ul'); events.className = 'mt-2 mb-0';
+                row.events.forEach(event => {
+                    const item = document.createElement('li');
+                    item.textContent = loginDate(event.last) + ' · ' + (loginResultLabels[event.result] || event.result) + (event.count > 1 ? ' × ' + event.count : '') + (event.actor ? ' · by ' + event.actor : '');
+                    events.append(item);
+                });
+                panel.append(events);
+            }
+            function renderLoginActivity(data) {
+                loginActivityOffset = data.now - Date.now() / 1000;
+                document.getElementById('login-activity-summary').textContent = 'Failures (24h): ' + data.failures_24h + ' · Blocked IPs: ' + data.blocked_ips + ' · Last success: ' + loginDate(data.last_success);
+                const global = document.getElementById('login-global-limit'); global.hidden = !data.global_blocked_until; global.replaceChildren();
+                if (data.global_blocked_until) {
+                    const text = document.createElement('span'); text.textContent = 'Global login limit is active until ' + loginDate(data.global_blocked_until) + '. ';
+                    const reset = document.createElement('button'); reset.type = 'button'; reset.className = 'btn btn-secondary btn-sm'; reset.textContent = 'Reset global limit';
+                    reset.addEventListener('click', () => loadLoginActivity('reset', {key:'global'})); global.append(text, reset);
+                }
+                loginActivityRows.replaceChildren();
+                if (!data.rows.length) {
+                    const row = document.createElement('tr'), cell = document.createElement('td'); cell.colSpan = 5; cell.textContent = 'No login activity recorded yet.'; row.append(cell); loginActivityRows.append(row);
+                }
+                data.rows.forEach(item => {
+                    const row = document.createElement('tr'); row.tabIndex = 0; row.style.cursor = 'pointer';
+                    const values = [item.ip + (item.ip === data.current_ip ? ' (you)' : ''),loginDate(item.last),String(item.failures)];
+                    values.forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
+                    const state = document.createElement('td');
+                    if (item.blocked_until || data.global_blocked_until) {
+                        const badge = document.createElement('span'); badge.dataset.loginUntil = item.blocked_until || data.global_blocked_until; badge.dataset.loginScope = item.blocked_until ? 'ip' : 'global'; badge.style.color = 'var(--accent-warning)'; state.append(badge);
+                    } else state.textContent = 'Allowed';
+                    row.append(state);
+                    const actions = document.createElement('td');
+                    if (item.attempts > 0) {
+                        const reset = document.createElement('button'); reset.type = 'button'; reset.className = 'btn btn-secondary btn-sm'; reset.textContent = 'Reset limit';
+                        reset.addEventListener('click', event => { event.stopPropagation(); loadLoginActivity('reset', {key:item.key}); }); actions.append(reset);
+                    }
+                    row.append(actions);
+                    row.addEventListener('click', () => showLoginDetails(item));
+                    row.addEventListener('keydown', event => { if (event.target !== row) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showLoginDetails(item); } });
+                    loginActivityRows.append(row);
+                });
+                for (const key of ['per_ip','global','window_minutes']) loginPolicyForm.elements[key].value = data.policy[key];
+                document.getElementById('login-activity-details').hidden = true;
+                updateLoginActivityTimers();
+            }
+            async function loadLoginActivity(operation = 'read', fields = {}) {
+                if (loginActivityBusy) return;
+                loginActivityBusy = true; loginActivityFeedback.textContent = operation === 'read' ? 'Loading…' : 'Saving…';
+                loginActivityModal.querySelectorAll('button:not([data-bs-dismiss])').forEach(button => { button.disabled = true; });
+                try {
+                    const data = await requestWorkspace('login_activity', {operation, ...fields});
+                    renderLoginActivity(data); loginActivityFeedback.textContent = operation === 'read' ? '' : 'Saved.';
+                } catch (error) { loginActivityFeedback.textContent = error.message || 'Could not load login activity.'; }
+                finally { loginActivityBusy = false; loginActivityModal.querySelectorAll('button:not([data-bs-dismiss])').forEach(button => { button.disabled = false; }); }
+            }
+            loginActivityModal.addEventListener('shown.bs.modal', () => {
+                loadLoginActivity(); clearInterval(loginActivityClock); loginActivityClock = setInterval(updateLoginActivityTimers, 1000);
+            });
+            loginActivityModal.addEventListener('hidden.bs.modal', () => { clearInterval(loginActivityClock); });
+            document.getElementById('login-activity-refresh').addEventListener('click', () => loadLoginActivity());
+            loginPolicyForm.addEventListener('submit', event => {
+                event.preventDefault();
+                if (!loginPolicyForm.reportValidity()) return;
+                loadLoginActivity('policy', {per_ip:loginPolicyForm.elements.per_ip.value, global:loginPolicyForm.elements.global.value, window_minutes:loginPolicyForm.elements.window_minutes.value});
+            });
+
             const folderPicker = document.getElementById('folder-picker');
             const pickerList = document.getElementById('folder-picker-list');
             const pickerMessage = document.getElementById('folder-picker-message');
@@ -7645,7 +5709,7 @@ var qrcode = function() {
                 fileListController = new AbortController();
                 refreshGitStatus();
                 const tbody = document.getElementById('files-list');
-                tbody.innerHTML = `<tr><td colspan="7" style="padding:32px;text-align:center;color:var(--text-muted)">
+                tbody.innerHTML = `<tr><td colspan="8" style="padding:32px;text-align:center;color:var(--text-muted)">
                 <i class="fas fa-spinner fa-spin me-2"></i> Loading files…</td></tr>`;
                 selectedItems = [];
                 fileList = [];
@@ -7661,7 +5725,7 @@ var qrcode = function() {
                     if (request !== fileListRequest || error.name === 'AbortError') return;
                     const row = document.createElement('tr');
                     const cell = document.createElement('td');
-                    cell.colSpan = 7; cell.style.padding = '20px';
+                    cell.colSpan = 8; cell.style.padding = '20px';
                     cell.textContent = error.message || 'Failed to load file list';
                     row.append(cell); tbody.replaceChildren(row);
                     showAlert('Error', cell.textContent);
@@ -7753,7 +5817,7 @@ var qrcode = function() {
                 const tbody = document.getElementById('files-list');
 
                 if (files.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="7">
+                    tbody.innerHTML = `<tr><td colspan="8">
                     <div class="empty-state">
                         <i class="fas fa-folder-open d-block"></i>
                         <p>This directory is empty</p>
@@ -7770,8 +5834,14 @@ var qrcode = function() {
                     <td class="file-date">${file.last_modified}</td>
                     <td class="file-type">${file.type === 'dir' ? 'directory' : getMimeType(file.name)}</td>
                     <td class="permissions">${file.permissions} (${file.permissions_octal.padStart(3, '0')})</td>
+                    <td class="file-ownership"></td>
                 </tr>`).join('');
 
+                document.querySelectorAll('#files-list .file-item').forEach((row, index) => {
+                    const file = files[index], cell = row.querySelector('.file-ownership');
+                    cell.textContent = (file.owner ?? '—') + ':' + (file.group ?? '—');
+                    cell.title = 'Owner: ' + (file.owner ?? '—') + ' (UID ' + (file.uid ?? 'unknown') + ') · Group: ' + (file.group ?? '—') + ' (GID ' + (file.gid ?? 'unknown') + ')';
+                });
                 document.querySelectorAll('.file-item').forEach(row => {
                     row.addEventListener('click', function(e) {
                         if (e.target.closest('.checkbox-col')) return;
@@ -8330,57 +6400,78 @@ var qrcode = function() {
                 this.value = '';
             });
 
-            function uploadFiles(files) {
-                if (!files.length) return;
-                const fd = new FormData();
-                fd.append('path', currentPath);
-                for (let i = 0; i < files.length; i++) fd.append('files[]', files[i]);
-
+            let uploadBusy = false;
+            function confirmUploadReplacement(names) {
+                const element = document.getElementById('uploadReplaceModal');
+                const list = document.getElementById('upload-replace-names');
+                list.replaceChildren(...names.map(name => { const item = document.createElement('li'); item.textContent = name; return item; }));
+                return new Promise(resolve => {
+                    let confirmed = false;
+                    const modal = bootstrap.Modal.getOrCreateInstance(element);
+                    const button = document.getElementById('upload-replace-confirm');
+                    button.onclick = () => { confirmed = true; modal.hide(); };
+                    element.addEventListener('hidden.bs.modal', () => { button.onclick = null; resolve(confirmed); }, {once:true});
+                    modal.show();
+                });
+            }
+            async function uploadFiles(files) {
+                const selected = Array.from(files);
+                if (!selected.length) return;
+                if (uploadBusy) { showAlert('Error', 'Another upload is still in progress.'); return; }
+                uploadBusy = true;
+                const directory = currentPath;
                 const bar = document.getElementById('upload-progress');
                 const fill = bar.querySelector('.progress-bar');
-                bar.style.display = 'block';
-                fill.style.width = '0%';
-                fill.textContent = 'Preparing…';
-
-                const xhr = new XMLHttpRequest();
-                xhr.open('POST', window.location.pathname, true);
-                xhr.upload.addEventListener('progress', e => {
-                    if (e.lengthComputable) {
-                        const pct = Math.round(e.loaded / e.total * 100);
-                        fill.style.width = pct + '%';
-                        fill.textContent = pct + '%';
-                        if (pct >= 100) {
-                            fill.classList.remove('progress-bar-animated');
-                            fill.textContent = 'Processing…';
+                try {
+                    const check = await requestWorkspace('upload_check', {path: directory, files: JSON.stringify(selected.map(file => ({name:file.name, size:file.size})))});
+                    const replacements = Object.keys(check.files).filter(name => check.files[name] !== null);
+                    for (const name of replacements) {
+                        const tab = editorTabs.get(editorFilePath(name, directory));
+                        if (tabHasChanges(tab)) throw new Error('Save or close unsaved edits in ' + name + ' before replacing it.');
+                    }
+                    if (replacements.length && !await confirmUploadReplacement(replacements)) return;
+                    const fd = new FormData(); fd.append('path', directory);
+                    fd.append('upload_manifest', JSON.stringify(check.files));
+                    selected.forEach(file => fd.append('files[]', file));
+                    bar.style.display = 'block'; fill.style.width = '0%'; fill.textContent = 'Preparing…';
+                    fill.classList.add('progress-bar-animated');
+                    const response = await new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest(); xhr.open('POST', window.location.pathname, true);
+                        xhr.upload.addEventListener('progress', event => {
+                            if (!event.lengthComputable) return;
+                            const percent = Math.round(event.loaded / event.total * 100);
+                            fill.style.width = percent + '%'; fill.textContent = percent >= 100 ? 'Verifying…' : percent + '%';
+                        });
+                        xhr.addEventListener('load', () => {
+                            try {
+                                const result = JSON.parse(xhr.responseText);
+                                if (xhr.status >= 400 && !result.failedFiles) throw new Error(result.message || 'Upload failed (HTTP ' + xhr.status + ').');
+                                resolve(result);
+                            } catch (error) { reject(new Error(error instanceof SyntaxError ? 'Invalid server response. Upload was not confirmed.' : error.message)); }
+                        });
+                        xhr.addEventListener('error', () => reject(new Error('Network error. Upload was not confirmed.')));
+                        xhr.addEventListener('abort', () => reject(new Error('Upload cancelled.')));
+                        xhr.send(fd);
+                    });
+                    const detail = response.failedFiles?.length ? '\n' + response.failedFiles.join('\n') : '';
+                    const keptEdits = [];
+                    if (response.status === 'success' || response.status === 'partial') {
+                        loadFileList(); loadDirectoryTree();
+                        for (const name of response.uploaded || []) {
+                            const path = editorFilePath(name, directory), tab = editorTabs.get(path);
+                            // Do not discard edits made while the transfer was in progress.
+                            if (!tab) continue;
+                            if (tabHasChanges(tab)) { keptEdits.push(name); continue; }
+                            const active = activeEditorPath === path, point = tabLocation(tab);
+                            removeEditorTab(path, tab);
+                            openFileEditor(name, directory, point, active);
                         }
                     }
-                });
-                xhr.addEventListener('load', () => {
-                    setTimeout(() => {
-                        bar.style.display = 'none';
-                        fill.classList.add('progress-bar-animated');
-                    }, 600);
-                    if (xhr.status === 200) {
-                        try {
-                            const resp = JSON.parse(xhr.responseText);
-                            if (resp.status === 'success' || resp.status === 'partial') {
-                                loadFileList();
-                                showAlert('Success', resp.message);
-                            } else {
-                                showAlert('Error', resp.message || 'Upload failed');
-                            }
-                        } catch {
-                            showAlert('Error', 'Failed to parse server response');
-                        }
-                    } else {
-                        showAlert('Error', 'HTTP ' + xhr.status);
-                    }
-                });
-                xhr.addEventListener('error', () => {
-                    bar.style.display = 'none';
-                    showAlert('Error', 'Network error during upload');
-                });
-                xhr.send(fd);
+                    if (response.status === 'success' && keptEdits.length) window.workspaceAlert(response.message + '\nUnsaved edits were kept in these tabs: ' + keptEdits.join(', ') + '. Reopen the file to see the uploaded version.', 'Upload completed', 'warning');
+                    else if (response.status === 'success') showAlert('Success', response.message);
+                    else window.workspaceAlert((response.message || 'Upload failed.') + detail, 'Upload failed', 'error');
+                } catch (error) { window.workspaceAlert(error.message || 'Upload failed.', 'Upload failed', 'error'); }
+                finally { uploadBusy = false; bar.style.display = 'none'; fill.classList.add('progress-bar-animated'); }
             }
 
             // ── Download ──────────────────────────────────────────────
@@ -8492,6 +6583,8 @@ var qrcode = function() {
             const filesPanel = document.getElementById('dropzone');
             const filesTab = document.getElementById('files-tab');
             let activeEditorPath = null;
+            let openRequestSerial = 0;
+            const pendingEditorOpens = new Map();
             let nextTabId = 0;
             // A bounded, per-workspace cookie contains locations only, never file text.
             const workspaceRoot = SERVER_ROOT_PATH.replace(/\/+$/, '');
@@ -8531,27 +6624,29 @@ var qrcode = function() {
                 clearTimeout(saveTabsTimer);
                 saveTabsTimer = setTimeout(saveWorkspaceTabs, 400);
             }
-            function restoreWorkspaceTabs() {
+            async function restoreWorkspaceTabs() {
                 const cookie = document.cookie.split('; ').find(item => item.startsWith(tabsCookieName + '='));
                 if (!cookie) return;
                 try {
                     const state = JSON.parse(decodeURIComponent(cookie.substring(tabsCookieName.length + 1)));
                     if (state.v !== 1 || !Array.isArray(state.tabs)) return;
                     restoringTabs = true;
+                    const interaction = openRequestSerial;
                     for (const item of state.tabs.slice(0, 50)) {
                         if (!Array.isArray(item) || typeof item[0] !== 'string' || !item[0].startsWith('/') || item[0].split('/').some(part => part === '..' || part === '.') || item[0].includes('\0')) continue;
                         const split = item[0].lastIndexOf('/');
                         const name = item[0].substring(split + 1);
                         if (!name) continue;
                         const number = n => Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
-                        openFileEditor(name, item[0].substring(0, split), {row: number(item[1]), column: number(item[2]), top: number(item[3]), left: number(item[4])});
+                        await openFileEditor(name, item[0].substring(0, split), {row: number(item[1]), column: number(item[2]), top: number(item[3]), left: number(item[4])}, false);
                     }
                     const activePath = typeof state.active === 'string' ? workspaceRoot + state.active : null;
-                    activateTab(editorTabs.has(activePath) ? activePath : null);
+                    if (interaction === openRequestSerial) activateTab(editorTabs.has(activePath) ? activePath : null);
                 } catch (_) {
                     // Ignore stale or malformed cookies.
                 } finally {
                     restoringTabs = false;
+                    scheduleSaveTabs();
                 }
             }
             window.addEventListener('pagehide', saveWorkspaceTabs);
@@ -8606,6 +6701,7 @@ var qrcode = function() {
                 window.setWorkspaceDocumentTitle(name, activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.dirty);
             }
             function activateTab(path) {
+                openRequestSerial++;
                 document.body.classList.toggle('mobile-editor', path !== null);
                 document.body.classList.remove('mobile-file-list');
                 closeMobileMenu();
@@ -8765,11 +6861,42 @@ var qrcode = function() {
                 }
             });
 
-            function openFileEditor(name, directory = currentPath, savedLocation = null) {
+            function editorFilePath(name, directory) {
                 const full = SERVER_ROOT_PATH + (directory.startsWith('/') ? directory : '/' + directory);
-                const path = full.replace(/\/+$/, '') + '/' + name;
+                return full.replace(/\/+$/, '') + '/' + name;
+            }
+            function openFileEditor(name, directory = currentPath, savedLocation = null, activate = true) {
+                const path = editorFilePath(name, directory);
+                const serial = activate ? ++openRequestSerial : null;
                 if (editorTabs.has(path)) {
-                    activateTab(path);
+                    if (activate) activateTab(path);
+                    return Promise.resolve();
+                }
+                const pending = pendingEditorOpens.get(path);
+                if (pending) {
+                    if (activate) pending.serial = serial;
+                    return pending.promise;
+                }
+                const entry = {serial, promise: null};
+                entry.promise = (async () => {
+                    try {
+                        const response = await fetch(window.location.pathname + '?editor=1&check=1&filename=' + encodeURIComponent(path));
+                        let result;
+                        try { result = await response.json(); }
+                        catch (_) { throw new Error('Could not check this file. Reload the page and try again.'); }
+                        if (!response.ok || result.status !== 'success') throw new Error(result.message || 'Cannot open this file.');
+                        createEditorTab(name, directory, savedLocation, entry.serial !== null && entry.serial === openRequestSerial);
+                    } catch (error) {
+                        window.workspaceAlert(error.message || 'Cannot open this file.', 'Cannot open file', 'warning');
+                    } finally { pendingEditorOpens.delete(path); }
+                })();
+                pendingEditorOpens.set(path, entry);
+                return entry.promise;
+            }
+            function createEditorTab(name, directory, savedLocation, activate = true) {
+                const path = editorFilePath(name, directory);
+                if (editorTabs.has(path)) {
+                    if (activate) activateTab(path);
                     return;
                 }
                 const id = 'editor-panel-' + (++nextTabId);
@@ -8795,6 +6922,7 @@ var qrcode = function() {
                 const frame = document.createElement('iframe');
                 frame.id = id;
                 frame.className = 'editor-panel';
+                frame.hidden = !activate;
                 frame.title = 'Editor: ' + name;
                 frame.src = window.location.pathname + '?editor=1&filename=' + encodeURIComponent(path);
                 frame.setAttribute('allow', 'fullscreen');
@@ -8817,8 +6945,10 @@ var qrcode = function() {
                     const source = frame.contentWindow.editor;
                     if (!source) {
                         if (frame.contentWindow.fmImagePreview) { tab.loaded = true; updateEditorMenu(); scheduleSaveTabs(); }
-                        if (frame.contentDocument.body.textContent.trim() === 'Invalid file specified.') {
-                            removeEditorTab(path, tab);
+                        const error = frame.contentWindow.fmEditorOpenError;
+                        if (typeof error === 'string' && editorTabs.get(path) === tab) {
+                            removeEditorTab(path, tab, true);
+                            window.workspaceAlert(error, 'Cannot open file', 'warning');
                         }
                         return;
                     }
@@ -8838,8 +6968,12 @@ var qrcode = function() {
                     if (activeEditorPath === path) source.resize();
                     scheduleSaveTabs();
                 });
-                activateTab(path);
-                button.scrollIntoView({block: 'nearest', inline: 'nearest'});
+                if (activate) {
+                    activateTab(path);
+                    button.scrollIntoView({block: 'nearest', inline: 'nearest'});
+                } else {
+                    refreshMobileTabs(); scheduleSaveTabs();
+                }
             }
 
             document.getElementById('edit-btn').addEventListener('click', e => {
@@ -8873,10 +7007,46 @@ var qrcode = function() {
                 try { window.open(browserFileURL(name, directory), '_blank', 'noopener,noreferrer'); }
                 catch (error) { showAlert('Error', error.message); }
             }
-            function showPhoneQR(name, directory) {
+            let phoneQRLibraryPromise = null;
+            let phoneQRRequest = 0;
+            let phoneQRFile = null;
+            function loadPhoneQRLibrary() {
+                if (typeof window.qrcode === 'function') return Promise.resolve();
+                if (phoneQRLibraryPromise) return phoneQRLibraryPromise;
+                phoneQRLibraryPromise = new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    const timer = setTimeout(() => finish(new Error('Loading timed out.')), 15000);
+                    function finish(error) {
+                        clearTimeout(timer);
+                        script.onload = script.onerror = null;
+                        if (error) { script.remove(); phoneQRLibraryPromise = null; reject(error); }
+                        else resolve();
+                    }
+                    script.src = 'https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js';
+                    script.onload = () => finish(typeof window.qrcode === 'function' ? null : new Error('QR library unavailable.'));
+                    script.onerror = () => finish(new Error('Could not load the QR library.'));
+                    document.head.appendChild(script);
+                });
+                return phoneQRLibraryPromise;
+            }
+            async function showPhoneQR(name, directory) {
+                let url;
+                try { url = browserFileURL(name, directory); }
+                catch (error) { showAlert('Error', error.message); return; }
+                const request = ++phoneQRRequest;
+                const status = document.getElementById('phone-qr-status');
+                const retry = document.getElementById('phone-qr-retry');
+                const preview = document.getElementById('phone-qr');
                 try {
-                    const url = browserFileURL(name, directory);
-                    const code = qrcode(0, 'M');
+                    phoneQRFile = {name, directory};
+                    document.getElementById('phone-file-name').textContent = name;
+                    const link = document.getElementById('phone-file-link'); link.href = url; link.textContent = url;
+                    preview.hidden = true; retry.hidden = true;
+                    status.textContent = 'Loading QR code…';
+                    bootstrap.Modal.getOrCreateInstance(document.getElementById('phoneModal')).show();
+                    await loadPhoneQRLibrary();
+                    if (request !== phoneQRRequest) return;
+                    const code = window.qrcode(0, 'M');
                     code.addData(url, 'Byte');
                     code.make();
                     const canvas = document.getElementById('phone-qr');
@@ -8888,11 +7058,24 @@ var qrcode = function() {
                     for (let row = 0; row < modules; row++) for (let column = 0; column < modules; column++) {
                         if (code.isDark(row, column)) ctx.fillRect((column + quiet) * scale, (row + quiet) * scale, scale, scale);
                     }
-                    document.getElementById('phone-file-name').textContent = name;
-                    const link = document.getElementById('phone-file-link'); link.href = url; link.textContent = url;
-                    bootstrap.Modal.getOrCreateInstance(document.getElementById('phoneModal')).show();
-                } catch (error) { showAlert('Error', 'Could not create QR code: ' + error.message); }
+                    preview.hidden = false;
+                    status.textContent = '';
+                } catch (error) {
+                    if (request !== phoneQRRequest) return;
+                    status.textContent = 'Could not create QR code. You can retry or copy the link.';
+                    retry.hidden = false;
+                }
             }
+            document.getElementById('phone-qr-retry').addEventListener('click', () => {
+                if (phoneQRFile) showPhoneQR(phoneQRFile.name, phoneQRFile.directory);
+            });
+            document.getElementById('phoneModal').addEventListener('hidden.bs.modal', () => { ++phoneQRRequest; });
+            document.getElementById('phone-copy-link').addEventListener('click', async () => {
+                try {
+                    await navigator.clipboard.writeText(document.getElementById('phone-file-link').href);
+                    window.workspaceToast('Link copied.', 'Copied');
+                } catch (_) { showAlert('Copy link', 'Select and copy the link shown in this window.'); }
+            });
             function selectedBrowserFile() {
                 if (activeEditorPath !== null) {
                     const relative = activeEditorPath.substring(workspaceRoot.length);
@@ -9023,6 +7206,8 @@ var qrcode = function() {
             init();
             restoreWorkspaceTabs();
             window.fmWorkspaceReady = true;
+            const blockedLoginIPs = <?= json_encode($loginBlockedNotice) ?>;
+            if (blockedLoginIPs > 0) window.workspaceToast(blockedLoginIPs + (blockedLoginIPs === 1 ? ' IP address is' : ' IP addresses are') + ' temporarily blocked. See Tools → Login activity.', 'Login activity', 'warning');
         });
     </script>
 </body>

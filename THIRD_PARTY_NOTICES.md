@@ -12,11 +12,11 @@ Source: https://github.com/JosephChuks/cwp-codeEditor
 
 MIT License, Copyright (c) 2024 Joseph Chuks. The verified original license is preserved verbatim in [docs/CWP-EDITOR-LICENSE.txt](docs/CWP-EDITOR-LICENSE.txt), and in the application source so single-file deployments retain it.
 
-## Embedded icon assets
+## Icon assets
 
-Material Icon Theme: MIT, Copyright (c) 2025 Material Extensions. Source revision `13025adc5ad10a5cc649528a2c1edec93069f1b9`. Full license is embedded immediately before `$materialIconData` in `filemanager.php`.
+Material Icon Theme: MIT, Copyright (c) 2025 Material Extensions. SVG icons load from jsDelivr, pinned to source revision `13025adc5ad10a5cc649528a2c1edec93069f1b9`. Icon mappings and the full license remain embedded immediately before `$materialIconData` in `filemanager.php`.
 
-Seti UI: MIT, Copyright (c) 2014 Jesse Weed. Original notice is embedded with the Seti data in `filemanager.php`.
+Seti UI: MIT, Copyright (c) 2014 Jesse Weed. Icon mappings and the original notice are embedded in `filemanager.php`. The font loads from [jsDelivr](https://cdn.jsdelivr.net/gh/microsoft/vscode@8993bc4913b5ecd98a639457ac1dabf5e4c58787/extensions/theme-seti/icons/seti.woff), pinned to VS Code revision `8993bc4913b5ecd98a639457ac1dabf5e4c58787`.
 
 ## CDN components
 
@@ -34,4 +34,5 @@ These are embedded Ace/workspace adaptations of upstream palettes. Full notices 
 
 ## QR code generation
 
-Embedded qrcode-generator 1.4.4 by Kazuhiko Arase (MIT). Source: https://github.com/kazuhikoarase/qrcode-generator. License: [docs/QRCODE-GENERATOR-LICENSE.txt](docs/QRCODE-GENERATOR-LICENSE.txt). QR codes are generated locally in the browser.
+qrcode-generator 1.4.4, loaded on demand from jsDelivr, by Kazuhiko Arase (MIT). Source: https://github.com/kazuhikoarase/qrcode-generator. License: [docs/QRCODE-GENERATOR-LICENSE.txt](docs/QRCODE-GENERATOR-LICENSE.txt). QR codes are generated locally in the browser.
+

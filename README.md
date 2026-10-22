@@ -55,8 +55,10 @@ Settings are stored in `filemanager.php`; PHP needs permission to replace it. Le
 ## Authentication
 
 - Password-only login; the initial password is **`admin123`**. Replace it in **File → Settings**. The PHP file stores a password hash, not the plain password.
-- Login throttling: **8 failed attempts per IP** or **64 failures across all IPs** block further logins until the respective **15-minute window** expires. Windows start with the first recorded failure. The shared limit can temporarily block everyone, including the owner.
-- Counters use SHA-256 hashes of the server-reported IP (`REMOTE_ADDR`) and are stored in `sys_get_temp_dir()/fm-auth-<installation-id>/attempts.json`, outside the PHP source. Clearing browser cookies does not reset them; host cleanup of temporary files can. Behind a proxy, PHP must receive the correct client address or visitors may share one limit.
+- Default login throttling: **8 failed attempts per IP** or **64 failures across all IPs** block further logins until the respective **15-minute window** expires. Windows start with the first recorded failure. The shared limit can temporarily block everyone, including the owner.
+- **Tools → Login activity:** IP addresses, results, browser details, active blocks and per-IP/global limit resets. Limits are configurable here. After login, a one-time notification appears only if IPs are currently blocked.
+- Private server storage: `sys_get_temp_dir()/fm-auth-<installation-id>/`. `attempts.json` holds counters keyed by SHA-256 with the recorded IP; `login-activity.json` keeps up to **7 days / 2,000 entries / 1 MB**, and `login-policy.json` stores custom limits. No passwords are logged. Repeated blocked requests are grouped; statistics use retained entries. Old hash-only counters cannot reveal their original IP.
+- Cookies do not reset server counters; hosting cleanup of temporary files may clear counters, history and custom limits. PHP uses `REMOTE_ADDR`; configure trusted proxies at the server layer to preserve the correct client address.
 - Sessions expire after **30 minutes of inactivity** or **12 hours total**. Cookies are HttpOnly and SameSite=Strict, with Secure on HTTPS. Changing the password invalidates other sessions. State-changing requests require a CSRF token.
 - This limits password guessing; it is **not DDoS protection**. Traffic limits at the hosting/web-server layer are separate.
 

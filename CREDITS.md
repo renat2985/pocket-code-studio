@@ -10,7 +10,7 @@ Pocket Code Studio adds the single-file workspace, internal tabs and restoration
 - [Prettier](https://github.com/prettier/prettier) and [PHP plugin](https://github.com/prettier/plugin-php): explicit code formatting.
 - [Bootstrap](https://github.com/twbs/bootstrap): interface components.
 - [Font Awesome](https://github.com/FortAwesome/Font-Awesome): interface icons.
-- [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme): embedded file and folder SVGs.
+- [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme): file and folder SVGs loaded from jsDelivr.
 - [Seti UI](https://github.com/jesseweed/seti-ui) / [VS Code Seti theme](https://github.com/microsoft/vscode/tree/main/extensions/theme-seti): fallback file-icon font and associations.
 - [CoolAlert](https://www.npmjs.com/package/coolalertjs): alerts (the deployed CDN package is `coolalertjs`).
 - [HTMX](https://github.com/bigskysoftware/htmx): existing client dependency.
