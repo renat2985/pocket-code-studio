@@ -4,7 +4,7 @@ A single-file PHP file manager and code editor with a Visual Studio Code-inspire
 
 [Русский](README.ru.md) · [Issues](https://github.com/Renat2985/pocket-code-studio/issues)
 
-![Pocket Code Studio](screenshots/screen.png)
+![Pocket Code Studio — workspace tabs](screenshots/workspace-tabs.gif)
 
 ## Features
 
@@ -12,9 +12,20 @@ A single-file PHP file manager and code editor with a Visual Studio Code-inspire
 - Syntax highlighting, find/replace, formatting, word wrap, and multi-cursor editing.
 - Minimap, occurrence markers, file icons, and themes for the entire interface.
 - Create, rename, copy, move, upload/download, trash/restore, permissions, and archives where supported.
-- Read-only Git status and comparison with HEAD, including unsaved changes.
+- Git status, comparison with HEAD, and selected-file commits and push to GitHub.
 - Mobile layout with compact menus and code shortcut buttons.
 - Password authentication, CSRF protection, login attempt limits, and verified saves with backups.
+
+- The changed-file list has no 500-file limit. Each commit can select up to 2000 files, 32 MB per file and 128 MB total; content hashes are calculated only for selected files. Push existing commits does not scan working files.
+
+<details>
+<summary>Watch editing and Git previews</summary>
+
+![Editing and verified saves](screenshots/edit-and-save.gif)
+
+![Git HEAD comparison](screenshots/git-diff.gif)
+
+</details>
 
 ## Requirements
 
@@ -45,7 +56,8 @@ Keep your personal password hash and settings when replacing the PHP file. Do no
 **Edit → Copy / Move / Rename / Delete** applies to the active editor file, or to selected items in Files. Save unsaved editor changes before using these operations.
 
 - **Ctrl/⌘ S:** save. **Ctrl/⌘ + click:** add cursors. **Escape:** return to one cursor.
-- **View → Color theme:** choose a theme. Language and editor font size are in the bottom status bar.
+- **View → Show Changes Since Save:** highlight unsaved additions and deletions; reset the comparison after a verified save.
+- **View → Color theme:** 43 Ace themes; the interface follows the selected theme. Language and editor font size are in the bottom status bar.
 - **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.
 - **Browse…** in Copy/Move selects an existing destination folder inside the workspace. The workspace picker can explore other folders permitted by PHP and hosting restrictions. Save open edits before switching roots.
 - **Save Settings** saves all changes together; **Cancel** discards them. Leave password fields empty to keep the current password.
@@ -68,7 +80,9 @@ Settings are stored in `filemanager.php`; PHP needs permission to replace it. Le
 - The editor accepts UTF-8 text up to **8 MB**. Binary files, mixed line endings, and hard links are refused. UTF-8 BOM and uniform LF/CRLF/CR endings are preserved.
 - Saves check disk revisions and create verified private backups. Temporary backups may be cleared by the host and do not replace permanent backups. External writes can still race with saves; filesystem ACLs/extended attributes may not survive replacement.
 - Saving does not validate code syntax. Unsaved document text is not restored after reload.
-- Git requires the workspace root to match the repository root. No commits, resets, branch switching, or inline Git change bars are provided.
+- Git requires the workspace root to match an existing repository with at least one commit. **Tools → GitHub: Commit & Push** configures the HTTPS GitHub URL, current branch, author and a fine-grained token (Contents: Read and write; workflow changes may also require Workflows permission). Private repositories are supported.
+- The token is stored with owner-only permissions in the private temporary authentication directory, separately for each workspace. It is never returned to the browser; clearing temporary storage removes it. Blank keeps the token; changing repositories clears it unless a new token is supplied.
+- Select saved files and enter a message, then Commit & Push. After a failed or uncertain push, refresh and use Push existing commits. Staged changes, conflicts, symlinks and Git clean filters require a separate Git client. No automatic pull, force push, branch switching or inline Git change bars.
 
 ## Credits and support
 

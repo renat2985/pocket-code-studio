@@ -20,17 +20,11 @@ Seti UI: MIT, Copyright (c) 2014 Jesse Weed. Icon mappings and the original noti
 
 ## CDN components
 
+Ace core, language tools, modes, workers, snippets, and themes load from the same pinned `ace-builds@1.45.2/src-min-noconflict/` directory on jsDelivr. Themes and the inline diff extension load on demand.
+
 Ace, Prettier, its PHP plugin, Bootstrap, Font Awesome, CoolAlert (`coolalertjs`), and HTMX remain third-party dependencies with their respective upstream licenses. Their inclusion does not transfer ownership to Pocket Code Studio. Font Awesome uses different licenses for icons, fonts, and code. Consult each version's upstream license and notices when redistributing or vendoring CDN assets.
 
 Visual Studio Code and related marks belong to their respective owners. No Microsoft product logos are used for this project's branding.
-
-## Embedded dark theme palettes
-
-- Tokyo Night: MIT, Copyright (c) 2018-present Enkia. Source: https://github.com/enkia/tokyo-night-vscode-theme. Original license: [docs/TOKYO-NIGHT-LICENSE.txt](docs/TOKYO-NIGHT-LICENSE.txt).
-- Night Owl: MIT, Copyright (c) 2018 Sarah Drasner. Source: https://github.com/sdras/night-owl-vscode-theme. Original license: [docs/NIGHT-OWL-LICENSE.txt](docs/NIGHT-OWL-LICENSE.txt).
-- Ayu Dark: MIT, Copyright (c) 2016 Ike Kurghinyan. Source: https://github.com/ayu-theme/vscode-ayu. Original license: [docs/AYU-DARK-LICENSE.txt](docs/AYU-DARK-LICENSE.txt).
-
-These are embedded Ace/workspace adaptations of upstream palettes. Full notices are also included in `filemanager.php` for single-file deployment.
 
 ## QR code generation
 
