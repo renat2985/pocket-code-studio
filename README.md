@@ -4,7 +4,7 @@ A single-file PHP file manager and code editor with a Visual Studio Code-inspire
 
 [Русский](README.ru.md) · [Issues](https://github.com/Renat2985/pocket-code-studio/issues)
 
-![Pocket Code Studio — workspace tabs](screenshots/workspace-tabs.gif)
+![Pocket Code Studio — workspace tabs](screenshots/screen.png)
 
 ## Features
 

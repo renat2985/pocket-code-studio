@@ -4,7 +4,7 @@
 
 [English](README.md) · [Ошибки и предложения](https://github.com/Renat2985/pocket-code-studio/issues)
 
-![Pocket Code Studio — workspace tabs](screenshots/workspace-tabs.gif)
+![Pocket Code Studio — workspace tabs](screenshots/screen.png)
 
 ## Возможности
 
