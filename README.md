@@ -56,6 +56,7 @@ Keep your personal password hash and settings when replacing the PHP file. Do no
 **Edit → Copy / Move / Rename / Delete** applies to the active editor file, or to selected items in Files. Save unsaved editor changes before using these operations.
 
 - **Ctrl/⌘ S:** save. **Ctrl/⌘ + click:** add cursors. **Escape:** return to one cursor.
+- **View → Emmet (HTML):** enabled by default for HTML/HTM. Expand `.test`, `ul>li*3`, or `!` with Tab; the opt-out is remembered.
 - **View → Show Changes Since Save:** highlight unsaved additions and deletions; reset the comparison after a verified save.
 - **View → Color theme:** 43 Ace themes; the interface follows the selected theme. Language and editor font size are in the bottom status bar.
 - **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.
@@ -77,7 +78,7 @@ Settings are stored in `filemanager.php`; PHP needs permission to replace it. Le
 ## Important limits
 
 - Only requests through this manager are password-protected; public website URLs remain public.
-- The editor accepts UTF-8 text up to **8 MB**. Binary files, mixed line endings, and hard links are refused. UTF-8 BOM and uniform LF/CRLF/CR endings are preserved.
+- The editor accepts UTF-8 text up to **8 MB**. Binary files and hard links are refused. UTF-8 BOM and uniform LF/CRLF/CR endings are preserved. Mixed line endings show a warning and are converted to LF when edits are saved.
 - Saves check disk revisions and create verified private backups. Temporary backups may be cleared by the host and do not replace permanent backups. External writes can still race with saves; filesystem ACLs/extended attributes may not survive replacement.
 - Saving does not validate code syntax. Unsaved document text is not restored after reload.
 - Git requires the workspace root to match an existing repository with at least one commit. **Tools → GitHub: Commit & Push** configures the HTTPS GitHub URL, current branch, author and a fine-grained token (Contents: Read and write; workflow changes may also require Workflows permission). Private repositories are supported.
@@ -91,3 +92,5 @@ Based on [Joseph Chuks’ PHP File Manager](https://github.com/JosephChuks/php-f
 [Credits](CREDITS.md) · [License](LICENSE) · [Third-party notices and upstream license details](THIRD_PARTY_NOTICES.md)
 
 Bugs and requests: [GitHub Issues](https://github.com/Renat2985/pocket-code-studio/issues). Installation and custom development: [Renat2985](https://github.com/Renat2985).
+
+Manual updates: **Tools → Update editor…** → upload a trusted PHP release → check → update. The installed filename, password and settings are preserved; a private backup is created.

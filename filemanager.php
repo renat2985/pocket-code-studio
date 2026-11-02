@@ -1,7 +1,8 @@
 <?php
 
 /**
- * Pocket Code Studio v1.0.0
+ * Pocket Code Studio v1.1.1
+ * Minimum PHP: 7.4
  * A single-file PHP file manager and browser-based code editor.
  * Maintained by Renat2985 — https://github.com/Renat2985/pocket-code-studio
  * Based on Joseph Chuks' PHP File Manager and CWP Code Editor.
@@ -232,6 +233,71 @@ function fmRewriteConfiguration($transform)
         flock($lock, LOCK_UN); fclose($lock);
     }
 }
+// Updates are parsed as data and installed with the same atomic, backed-up writer as settings.
+function fmValidateEditorUpdate($source)
+{
+    if (!is_string($source) || strlen($source) < 10000 || strlen($source) > 4194304 || strpos($source, '<?php') !== 0 || strpos($source, "\0") !== false) throw new RuntimeException('Select the complete Pocket Code Studio PHP file (maximum 4 MiB).');
+    if (!preg_match('/Pocket Code Studio v([0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?)/', substr($source, 0, 2048), $version)) throw new RuntimeException('This is not a recognized Pocket Code Studio release.');
+    $minimum = preg_match('/Minimum PHP: ([0-9]+\.[0-9]+(?:\.[0-9]+)?)/', substr($source, 0, 2048), $required) ? $required[1] : '7.4';
+    if (version_compare(PHP_VERSION, $minimum, '<')) throw new RuntimeException('This release requires PHP ' . $minimum . ' or newer. Server: ' . PHP_VERSION . '.');
+    foreach (['authPasswordHash', 'workspaceSettingsBase64'] as $name) {
+        if (preg_match_all('/^\$' . $name . ' = \'[^\'\r\n]*\';$/m', $source) !== 1) throw new RuntimeException('The uploaded release has an unsupported configuration format.');
+    }
+    if (strpos($source, 'function fmRewriteConfiguration(') === false || strpos($source, 'function fmAuthReply(') === false) throw new RuntimeException('The uploaded file is incomplete or unsupported.');
+    try { token_get_all($source, TOKEN_PARSE); }
+    catch (ParseError $error) { throw new RuntimeException('The uploaded PHP file has invalid syntax for this server (line ' . $error->getLine() . ').'); }
+    return ['version' => $version[1], 'minimum_php' => $minimum];
+}
+function fmClearPendingUpdate()
+{
+    $pending = $_SESSION['editor_update'] ?? null;
+    if (is_array($pending) && preg_match('/^[a-f0-9]{48}$/D', $pending['token'] ?? '')) @unlink(fmPrivateAuthDirectory() . '/update-' . $pending['token'] . '.php');
+    unset($_SESSION['editor_update']);
+}
+function fmHandleEditorUpdate()
+{
+    try {
+        $operation = $_POST['operation'] ?? '';
+        if ($operation === 'preview') {
+            fmClearPendingUpdate();
+            foreach (array_slice(glob(fmPrivateAuthDirectory() . '/update-*.php') ?: [], 0, 100) as $oldStage) {
+                if (!is_link($oldStage) && @filemtime($oldStage) < time() - 900) @unlink($oldStage);
+            }
+            $upload = $_FILES['release'] ?? null;
+            if (!$upload || is_array($upload['error']) || $upload['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($upload['tmp_name'])) throw new RuntimeException('Upload failed. Select a PHP release within the hosting upload limit.');
+            if (filesize($upload['tmp_name']) > 4194304) throw new RuntimeException('The release exceeds the 4 MiB limit.');
+            $source = file_get_contents($upload['tmp_name']);
+            $details = fmValidateEditorUpdate($source);
+            if (!is_writable(dirname(__FILE__))) throw new RuntimeException('PHP cannot replace files in the editor folder. Check hosting permissions.');
+            $token = bin2hex(random_bytes(24));
+            $stage = fmPrivateAuthDirectory() . '/update-' . $token . '.php';
+            try {
+                if (file_put_contents($stage, $source, LOCK_EX) !== strlen($source) || !chmod($stage, 0600) || hash_file('sha256', $stage) !== hash('sha256', $source)) throw new RuntimeException('Cannot store the uploaded release safely.');
+            } catch (Throwable $error) { @unlink($stage); throw $error; }
+            $_SESSION['editor_update'] = ['token' => $token, 'expires' => time() + 900, 'candidate' => hash('sha256', $source), 'current' => hash_file('sha256', __FILE__)];
+            fmAuthReply(200, 'Syntax and PHP compatibility checked. Current password, settings and filename will be preserved.', array_merge($details, ['token' => $token, 'filename' => basename(__FILE__), 'php' => PHP_VERSION]));
+        }
+        if ($operation !== 'install') throw new RuntimeException('Unknown update action.');
+        $pending = $_SESSION['editor_update'] ?? null;
+        if (!$pending || $pending['expires'] < time() || !is_string($_POST['token'] ?? null) || !hash_equals($pending['token'], $_POST['token'])) throw new RuntimeException('The update preview expired. Upload and check the release again.');
+        $source = @file_get_contents(fmPrivateAuthDirectory() . '/update-' . $pending['token'] . '.php');
+        if (!is_string($source) || !hash_equals($pending['candidate'], hash('sha256', $source))) throw new RuntimeException('The uploaded release changed. Upload it again.');
+        fmValidateEditorUpdate($source);
+        fmRewriteConfiguration(function ($current) use ($source, $pending) {
+            if (!hash_equals($pending['current'], hash('sha256', $current))) throw new RuntimeException('The editor or settings changed after preview. Upload and check the release again.');
+            foreach (['authPasswordHash', 'workspaceSettingsBase64'] as $name) {
+                $pattern = '/^\$' . $name . ' = \'[^\'\r\n]*\';$/m';
+                if (preg_match_all($pattern, $current, $matches) !== 1) throw new RuntimeException('Cannot preserve the current configuration.');
+                $line = $matches[0][0];
+                $source = preg_replace_callback($pattern, function () use ($line) { return $line; }, $source, 1);
+            }
+            return $source;
+        });
+        fmClearPendingUpdate();
+        fmAuthReply(200, 'Editor updated. Reloading…');
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
+}
+
 function fmUpdatePasswordHash($oldHash, $newHash)
 {
     fmRewriteConfiguration(function ($source) use ($oldHash, $newHash) {
@@ -342,6 +408,7 @@ if (!$authenticated) {
 <?php session_write_close(); exit;
 }
 $_SESSION['auth_seen'] = $authNow;
+if ($isPostRequest && ($_POST['action'] ?? '') === 'editor_update') fmHandleEditorUpdate();
 if ($isPostRequest && ($_POST['action'] ?? '') === 'login_activity') {
     try {
         $operation = $_POST['operation'] ?? 'read';
@@ -543,19 +610,24 @@ SETI_JSON
 $workspaceThemeScript = <<<'JS'
 <script>
 (function () {
-    // Paint new editor frames with the current workspace palette before CDN scripts finish loading.
-    if (window.parent !== window) {
+    // Hidden Firefox frames cannot reliably measure computed colors; inherit the resolved host palette.
+    function inheritWorkspacePalette(theme) {
+        if (window.parent === window) return false;
         try {
             const host = window.parent.document.documentElement, root = document.documentElement;
+            if (theme && host.dataset.workspaceTheme !== theme) return false;
             for (let i = 0; i < host.style.length; i++) {
                 const key = host.style.item(i);
-                if (key.startsWith('--')) root.style.setProperty(key, host.style.getPropertyValue(key));
+                if (key.startsWith('--') && key !== '--mobile-viewport-height') root.style.setProperty(key, host.style.getPropertyValue(key));
             }
             root.style.colorScheme = host.style.colorScheme;
             root.dataset.workspaceTheme = host.dataset.workspaceTheme || '';
             root.dataset.workspaceLight = host.dataset.workspaceLight || '';
-        } catch (_) { /* A standalone cross-origin embedding cannot share its parent's palette. */ }
+            return !!host.dataset.workspaceTheme;
+        } catch (_) { return false; }
     }
+    if (window.parent !== window) document.documentElement.style.setProperty('--mobile-viewport-height', '100%');
+    inheritWorkspacePalette();
     function workspaceIconURL(hostname) {
         let hash = 2166136261;
         for (const char of hostname.toLowerCase()) hash = Math.imul(hash ^ char.charCodeAt(0), 16777619);
@@ -660,8 +732,21 @@ $workspaceThemeScript = <<<'JS'
     window.getEditorTheme = function() {
         const saved = localStorage.getItem('ke_editor_theme');
         const legacy = localStorage.getItem('ke_theme');
-        return window.editorThemeNames.includes(saved) ? saved : window.editorThemeNames.includes(legacy) ? legacy : 'one_dark';
+        return window.editorThemeNames.includes(saved) ? saved : window.editorThemeNames.includes(legacy) ? legacy : 'cloud_editor_dark';
     };
+    // Apply the new default once, then preserve subsequent theme choices.
+    if (localStorage.getItem('ke_default_theme') !== 'cloud_editor_dark') {
+        localStorage.setItem('ke_theme', 'cloud_editor_dark');
+        localStorage.removeItem('ke_editor_theme');
+        localStorage.setItem('ke_default_theme', 'cloud_editor_dark');
+    }
+    try {
+        const cached = JSON.parse(localStorage.getItem('ke_workspace_palette'));
+        if (cached?.theme === window.getEditorTheme()) {
+            for (const [key,value] of Object.entries(cached.vars)) document.documentElement.style.setProperty('--'+key,value);
+            document.documentElement.style.colorScheme = cached.light ? 'light' : 'dark';
+        }
+    } catch (_) {}
     const themeLoads = new Map();
     function loadThemeScript(url) {
         if (!themeLoads.has(url)) themeLoads.set(url, new Promise((resolve, reject) => {
@@ -693,6 +778,7 @@ $workspaceThemeScript = <<<'JS'
         const style = getComputedStyle(probe), deep = style.backgroundColor, text = style.color;
         let main = color('ace_gutter','backgroundColor');
         if (main === 'rgba(0, 0, 0, 0)') main = deep;
+        if ([deep,text,main].some(value => rgb(value).length !== 3)) { probe.remove(); throw new Error('Theme colors are not available in this document.'); }
         const surface = mix(main,text,0.035), elevated = mix(main,text,0.08);
         const tokens = ['ace_support ace_function','ace_entity ace_name ace_function','ace_keyword','ace_constant ace_numeric'].map(classes => color(classes));
         const accent = readable(tokens.find(value => Math.max(...rgb(value))-Math.min(...rgb(value)) > 25) || text,main);
@@ -709,7 +795,7 @@ $workspaceThemeScript = <<<'JS'
     }
     let themeRequest = 0;
     window.setWorkspaceTheme = async function(theme = window.getEditorTheme(), persist = true) {
-        theme = window.editorThemeNames.includes(theme) ? theme : 'one_dark';
+        theme = window.editorThemeNames.includes(theme) ? theme : 'cloud_editor_dark';
         const request = ++themeRequest;
         try {
             if (!window.ace) await loadThemeScript('https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ace.js');
@@ -717,11 +803,14 @@ $workspaceThemeScript = <<<'JS'
             const module = ace.require('ace/theme/'+theme);
             if (!module) throw new Error('Theme module is unavailable.');
             if (request !== themeRequest) return;
-            const palette = paletteFromAce(module);
-            for (const [key,value] of Object.entries(palette.vars)) document.documentElement.style.setProperty('--'+key,value);
-            document.documentElement.style.colorScheme = palette.light ? 'light' : 'dark';
+            if (!inheritWorkspacePalette(theme)) {
+                const palette = paletteFromAce(module);
+                try { localStorage.setItem('ke_workspace_palette', JSON.stringify({theme,...palette})); } catch (_) {}
+                for (const [key,value] of Object.entries(palette.vars)) document.documentElement.style.setProperty('--'+key,value);
+                document.documentElement.style.colorScheme = palette.light ? 'light' : 'dark';
+                document.documentElement.dataset.workspaceLight = String(palette.light);
+            }
             document.documentElement.dataset.workspaceTheme = theme;
-            document.documentElement.dataset.workspaceLight = String(palette.light);
             const select = document.getElementById('workspace-theme'); if (select) select.value = theme;
             if (persist) { localStorage.setItem('ke_theme',theme); localStorage.removeItem('ke_editor_theme'); }
             if (typeof window.applySelectedTheme === 'function') window.applySelectedTheme(theme);
@@ -751,6 +840,12 @@ $workspaceThemeScript = <<<'JS'
     function escapeAlertText(value) {
         return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     }
+    window.workspaceLoading = function(element, message) {
+        const spinner = document.createElement('span');
+        spinner.className = 'tree-loading-spinner';
+        spinner.setAttribute('aria-hidden', 'true');
+        element.replaceChildren(spinner, document.createTextNode(message));
+    };
     window.workspaceAlert = function(message, title = 'Editor', icon = /error|failed/i.test(title) ? 'error' : 'info') {
         if (window.parent !== window && typeof window.parent.workspaceAlert === 'function') return window.parent.workspaceAlert(message, title, icon);
         if (typeof CoolAlert !== 'undefined') return CoolAlert.show({title: escapeAlertText(title), text: escapeAlertText(message), icon, showCancelButton: false, confirmButtonText: 'OK'});
@@ -803,6 +898,17 @@ $workspaceThemeScript = <<<'JS'
         window.workspaceToastTimer = setTimeout(() => { toast.style.display = 'none'; clearInterval(toast.fmCountdownInterval); }, duration);
         return Promise.resolve();
     };
+    window.loadEmmet = () => Promise.all([
+        loadThemeScript('https://cdn.jsdelivr.net/npm/emmet-core@1.0.0/emmet.min.js'),
+        loadThemeScript('https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ext-emmet.js')
+    ]);
+    window.setEmmetPreference = function(enabled, persist = true) {
+        if (persist) localStorage.setItem('ke_emmet', String(!!enabled));
+        if (typeof window.applyEmmetPreference === 'function') window.applyEmmetPreference();
+        document.querySelectorAll('iframe.editor-panel').forEach(frame => {
+            if (typeof frame.contentWindow.applyEmmetPreference === 'function') frame.contentWindow.applyEmmetPreference();
+        });
+    };
     window.loadInlineDiff = () => loadThemeScript('https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ext-diff.js');
     window.setInlineChangesPreference = function(enabled, persist = true) {
         if (persist) localStorage.setItem('ke_inline_changes', String(!!enabled));
@@ -847,6 +953,7 @@ $workspaceThemeScript = <<<'JS'
         }, 1500);
     });
     window.addEventListener('storage', event => {
+        if (event.key === 'ke_emmet' || event.key === null) window.setEmmetPreference(localStorage.getItem('ke_emmet') !== 'false', false);
         if (event.key === 'ke_inline_changes' || event.key === null) window.setInlineChangesPreference(localStorage.getItem('ke_inline_changes') === 'true', false);
         for (const [key,option,defaultValue] of [['ke_invisibles','showInvisibles',false],['ke_indent_guides','displayIndentGuides',true],['ke_live_autocomplete','enableLiveAutocompletion',true]]) {
             if (event.key === key || event.key === null) window.setEditorPreference(option, localStorage.getItem(key) === null ? defaultValue : localStorage.getItem(key) === 'true', false);
@@ -857,6 +964,9 @@ $workspaceThemeScript = <<<'JS'
 </script>
 
 <style>
+        .tree-loading-spinner {display: inline-block;vertical-align: -0.15em;width: 12px;height: 12px;margin-right: 6px;flex-shrink: 0;border: 2px solid var(--border-default);border-top-color: var(--accent);border-radius: 50%;animation: tree-loading-spin 0.8s linear infinite;}
+        @keyframes tree-loading-spin {to {transform: rotate(360deg);}}
+        @media (prefers-reduced-motion: reduce) {.tree-loading-spinner {animation: none;}}
     /* One text scale for menus and floating UI, independent of Bootstrap defaults. */
     :root {--workspace-ui-font-size: 0.78rem;}
     .modal, .modal .modal-content, #git-diff-dialog, .cool-alert-modal, .cool-alert-toast {font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;font-size: var(--workspace-ui-font-size) !important;line-height: 1.5;}
@@ -888,6 +998,9 @@ $workspaceThemeScript = <<<'JS'
     .modal .table-responsive {max-height: 65vh;overflow: auto;}
     .modal .text-muted, .modal .form-text, .modal small {color: var(--text-muted) !important;}
     .modal .form-select option {background: var(--bg-deep);color: var(--text-primary);}
+    .modal input[type="file"]::file-selector-button {background: var(--bg-elevated);color: var(--text-primary);border-inline-end: 1px solid var(--border-default);transition: background 0.15s;}
+    .modal input[type="file"]:hover:not(:disabled):not([readonly])::file-selector-button {background: var(--bg-hover);color: var(--text-primary);}
+    .modal input[type="file"]:disabled::file-selector-button {background: var(--bg-elevated);color: var(--text-muted);}
     .modal .form-control:focus, .modal .form-select:focus {box-shadow: 0 0 0 2px var(--bg-selected);}
     .modal :is(.form-control, .form-select):disabled {background-color: var(--bg-deep);color: var(--text-secondary);border-color: var(--border-default);opacity: 1;}
     .modal .btn-primary {--bs-btn-bg: var(--accent);--bs-btn-border-color: var(--accent);--bs-btn-hover-bg: var(--accent-hover);--bs-btn-hover-border-color: var(--accent-hover);--bs-btn-active-bg: var(--accent-hover);--bs-btn-active-border-color: var(--accent-hover);color: var(--accent-contrast) !important;}
@@ -1237,17 +1350,15 @@ function editorOpenError($message, $statusCode = 400)
     exit;
 }
 
-function editorTextFormat($text)
+function editorTextFormat($text, &$mixed = null)
 {
     if (strpos($text, "\0") !== false || preg_match('//u', $text) !== 1) {
         throw new RuntimeException('Only UTF-8 text files can be edited safely. Binary files and other encodings are not converted.');
     }
     preg_match_all('/\r\n|\r|\n/', $text, $matches);
     $endings = array_values(array_unique($matches[0]));
-    if (count($endings) > 1) {
-        throw new RuntimeException('This file has mixed line endings. Saving is blocked to avoid changing them automatically.');
-    }
-    return $endings[0] ?? "\n";
+    $mixed = count($endings) > 1;
+    return $mixed ? "\n" : ($endings[0] ?? "\n");
 }
 
 function editorWriteVerified($path, $bytes, $exclusive = false)
@@ -1362,7 +1473,7 @@ if ($isEditorSave) {
         $hasBOM = substr($original, 0, 3) === "\xEF\xBB\xBF";
         if ($hasBOM !== (substr($content, 0, 3) === "\xEF\xBB\xBF")) throw new RuntimeException('UTF-8 BOM changed. Save blocked to preserve the original encoding.');
         preg_match_all('/\r\n|\r|\n/', $content, $newEndings);
-        if (count($newEndings[0]) && array_values(array_unique($newEndings[0])) !== [$ending]) throw new RuntimeException('Line endings changed. Save blocked to preserve the original format.');
+        if ($content !== $original && count($newEndings[0]) && array_values(array_unique($newEndings[0])) !== [$ending]) throw new RuntimeException('Line endings changed. Save blocked to preserve the original format.');
         if ($content !== $original) {
             $backupPath = $backupDirectory . '/' . $fileKey . '-' . gmdate('Ymd-His') . '-' . bin2hex(random_bytes(6)) . '.bak';
             editorWriteVerified($backupPath, $original, true);
@@ -1392,7 +1503,7 @@ if ($isEditorSave) {
 if (filesize($filename) > $maxEditorBytes) editorOpenError('File is too large for safe editing (maximum 8 MB).', 413);
 $fileContents = @file_get_contents($filename);
 if ($fileContents === false) editorOpenError('Cannot read file. Saving is disabled.', 403);
-try { $originalNewline = editorTextFormat($fileContents); }
+try { $originalNewline = editorTextFormat($fileContents, $mixedLineEndings); }
 catch (Throwable $error) { editorOpenError($error->getMessage()); }
 if (isset($_GET['check'])) editorReply(200, 'success', 'Text editor available.', ['kind' => 'text']);
 $fileHash = hash('sha256', $fileContents);
@@ -1518,7 +1629,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             to {opacity: 1;transform: translateY(0);}
         }
         /* ── Spinner (initial load) ───────────────────────────────── */
-        #spinner-overlay {position: fixed;inset: 0;background: var(--bg-deep);display: flex;flex-direction: column;align-items: center;justify-content: center;z-index: 9999;gap: 16px;}
+        #spinner-overlay {position: fixed;inset: 0;background: var(--bg-deep);display: flex;align-items: center;justify-content: center;z-index: 9999;gap: 0;}
         .spinner {width: 32px;height: 32px;border: 3px solid var(--border-default);border-top-color: var(--accent);border-radius: 50%;animation: spin 0.7s linear infinite;}
         @keyframes spin {
             to {transform: rotate(360deg);}
@@ -1545,13 +1656,10 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         .mobile-code-keys, #mobile-status-toggle, #mobile-keys-toggle {display: none;}
         @media (max-width: 760px) {
             html, body {height: var(--mobile-viewport-height, 100dvh);}
-            #statusbar {min-height: 36px;height: auto;padding: 2px 8px;gap: 4px;flex-wrap: wrap;}
-            .statusbar-left, .statusbar-right {gap: 4px;}
-            #statusbar .statusbar-right > .status-item, #fontSize, #indentation {display: none !important;}
-            body.mobile-status-details #statusbar .statusbar-right > .status-item {display: flex !important;}
-            body.mobile-status-details #fontSize, body.mobile-status-details #indentation {display: block !important;}
-            .status-language {max-width: 110px;min-height: 32px;font-size: 13px;}
-            #mobile-status-toggle, #mobile-keys-toggle {display: inline-flex;align-items: center;justify-content: center;width: 36px;height: 32px;background: transparent;color: var(--text-primary);border: 1px solid var(--border-subtle);border-radius: 4px;}
+            #statusbar .statusbar-right {gap: 10px;flex-shrink: 0;}
+            #statusbar .statusbar-left {gap: 10px;flex-shrink: 0;}
+            .status-language {min-height: 32px;font-size: 16px;}
+            #mobile-keys-toggle {display: inline-flex;align-items: center;justify-content: center;width: 36px;height: 32px;background: transparent;color: var(--text-primary);border: 1px solid var(--border-subtle);border-radius: 4px;}
             .mobile-code-keys {display: flex;gap: 4px;padding: 4px 6px;flex-shrink: 0;background: var(--bg-elevated);overflow-x: auto;}
             body.mobile-keys-hidden .mobile-code-keys {display: none;}
             .mobile-code-keys button {flex: 1 0 38px;min-height: 36px;padding: 4px 7px;background: var(--bg-main);color: var(--text-primary);border: 1px solid var(--border-default);border-radius: 4px;font: 13px monospace;touch-action: manipulation;}
@@ -1583,6 +1691,13 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         #editor .ace_scrollbar::-webkit-scrollbar-corner {background: var(--bg-main);}
         #minimap {position: absolute;top: 0;right: 12px;bottom: 10px;z-index: 5;background: transparent;width: 112px;flex-shrink: 0;overflow: hidden;touch-action: none;cursor: pointer;border-left: 1px solid var(--border-subtle);}
         #minimap[hidden] {display: none;}
+        #bookmark-rail {width: 10px;flex-shrink: 0;position: relative;background: var(--bg-main);border-left: 1px solid var(--border-subtle);}
+        #bookmark-rail[hidden] {display: none;}
+        .bookmark-tick {position: absolute;left: 0;width: 100%;height: 8px;padding: 0;border: 0;border-radius: 2px;background: var(--accent);cursor: pointer;}
+        .bookmark-tick:focus-visible {outline: 2px solid var(--text-primary);z-index: 1;}
+        .ace_gutter-cell.fm-bookmark {box-shadow: inset 3px 0 var(--accent);color: var(--accent) !important;font-weight: bold;}
+        .ace_marker-layer .fm-bookmark-jump {position: absolute;background: var(--bg-selected);}
+        #editor-wrap:has(#bookmark-rail:not([hidden])) #minimap {right: 22px;}
         #occurrence-rail {width: 12px;flex-shrink: 0;position: relative;background: var(--bg-main);border-left: 1px solid var(--border-subtle);cursor: pointer;touch-action: none;outline: none;}
         #occurrence-rail:focus-visible {outline: 1px solid var(--accent);outline-offset: -1px;}
         #occurrence-rail canvas {width: 100%;height: 100%;display: block;pointer-events: none;}
@@ -1607,6 +1722,12 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         .statusbar-right {min-width: 0;}
         .status-language {flex-shrink: 0;}
         #statusbar {position: static;flex-shrink: 0;overflow: hidden;white-space: nowrap;}
+        @media (max-width: 760px) {
+            #statusbar {height: auto;min-height: 40px;flex-wrap: nowrap;justify-content: flex-start;gap: 14px;padding: 3px 8px max(3px, env(safe-area-inset-bottom));overflow-x: auto;}
+            #statusbar .statusbar-right > .status-item {display: flex;}
+            #fontSize, #indentation {display: block;}
+            #statusbar .statusbar-left {order: 2;}
+        }
     </style>
 </head>
 
@@ -1615,7 +1736,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
     <dialog id="git-diff-dialog"><div class="git-diff-title"><strong id="git-diff-heading">Git changes</strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
     <!-- ── Spinner ───────────────────────────────────────────────── -->
     <div id="spinner-overlay">
-        <div class="spinner"></div>
+        <span class="tree-loading-spinner" aria-hidden="true"></span>
         <span class="spinner-label">Loading editor…</span>
     </div>
 
@@ -1631,6 +1752,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             <canvas aria-hidden="true"></canvas>
             <div id="minimap-viewport"></div>
         </div>
+        <div id="bookmark-rail" hidden role="group" aria-label="Temporary bookmarks"></div>
         <div id="occurrence-rail" tabindex="0" role="slider" aria-label="Selected text occurrences" aria-valuemin="1" aria-valuemax="1" aria-valuenow="1" title="Select a word to see its occurrences across the file">
             <canvas aria-hidden="true"></canvas>
         </div>
@@ -1663,7 +1785,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 <option value="20px">20px</option>
             </select>
             <span class="status-item" title="File encoding"><?= substr($fileContents, 0, 3) === "\xEF\xBB\xBF" ? 'UTF-8 BOM' : 'UTF-8' ?></span>
-            <span class="status-item" title="Line endings"><?= $originalNewline === "\r\n" ? 'CRLF' : ($originalNewline === "\r" ? 'CR' : 'LF') ?></span>
+            <span class="status-item" id="status-line-endings" title="Line endings"><?= $mixedLineEndings ? 'Mixed → LF' : ($originalNewline === "\r\n" ? 'CRLF' : ($originalNewline === "\r" ? 'CR' : 'LF')) ?></span>
             <select id="indentation" class="status-language status-detail" aria-label="Indentation" title="Indentation for typing; existing text stays unchanged">
                 <option value="spaces:2">Spaces: 2</option><option value="spaces:4">Spaces: 4</option><option value="spaces:8">Spaces: 8</option>
                 <option value="tabs:2">Tab Size: 2</option><option value="tabs:4">Tab Size: 4</option><option value="tabs:8">Tab Size: 8</option>
@@ -1707,6 +1829,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         window.finishEditorLoading = function() {
             document.getElementById('spinner-overlay').style.display = 'none';
             window.fmEditorThemeReady = true;
+            window.warnMixedLineEndings();
             if (window.frameElement) {
                 delete window.frameElement.dataset.loading;
                 window.frameElement.style.visibility = '';
@@ -1716,6 +1839,12 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         // ── Ace Editor ───────────────────────────────────────────────
         const originalContent = <?= json_encode($fileContents, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const originalNewline = <?= json_encode($originalNewline) ?>;
+        let mixedLineEndings = <?= json_encode($mixedLineEndings) ?>, lineEndingWarningShown = false;
+        window.warnMixedLineEndings = function() {
+            if (!mixedLineEndings || lineEndingWarningShown || !window.fmEditorThemeReady || window.frameElement?.hidden) return;
+            lineEndingWarningShown = true;
+            window.workspaceAlert('This file contains different line endings (Enter formats). If you edit and save it, all line endings will be converted to LF.', 'Mixed line endings', 'warning');
+        };
         const editorFilename = <?= json_encode($basename, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         let fileRevision = <?= json_encode($fileHash) ?>;
         var editor = ace.edit("editor");
@@ -1744,6 +1873,64 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             tabSize: 4,
             useSoftTabs: true,
         });
+
+        // Temporary bookmarks belong to this open editor only; anchors follow document edits.
+        const bookmarkRail = document.getElementById('bookmark-rail');
+        const bookmarks = [];
+        let bookmarkRows = [], bookmarkFrame = 0, bookmarkFlash = null, bookmarkTimer;
+        function renderBookmarks() {
+            bookmarkFrame = 0;
+            for (const row of bookmarkRows) editor.session.removeGutterDecoration(row, 'fm-bookmark');
+            const seen = new Set();
+            for (let i = bookmarks.length - 1; i >= 0; i--) {
+                const row = bookmarks[i].row;
+                if (seen.has(row)) bookmarks.splice(i, 1)[0].detach();
+                else seen.add(row);
+            }
+            bookmarkRows = [...seen].sort((a, b) => a - b);
+            bookmarkRail.hidden = bookmarkRows.length === 0;
+            bookmarkRail.replaceChildren();
+            const height = Math.max(0, bookmarkRail.clientHeight - 8);
+            const last = Math.max(1, editor.session.getLength() - 1);
+            for (const row of bookmarkRows) {
+                editor.session.addGutterDecoration(row, 'fm-bookmark');
+                const tick = document.createElement('button');
+                tick.type = 'button'; tick.className = 'bookmark-tick';
+                tick.style.top = (row / last * height) + 'px';
+                tick.title = 'Bookmark: line ' + (row + 1);
+                tick.setAttribute('aria-label', tick.title);
+                tick.addEventListener('click', () => {
+                    editor.gotoLine(row + 1, 0, false); editor.focus();
+                    clearTimeout(bookmarkTimer);
+                    if (bookmarkFlash !== null) editor.session.removeMarker(bookmarkFlash);
+                    const Range = ace.require('ace/range').Range;
+                    bookmarkFlash = editor.session.addMarker(new Range(row, 0, row, 1), 'fm-bookmark-jump', 'fullLine');
+                    bookmarkTimer = setTimeout(() => { editor.session.removeMarker(bookmarkFlash); bookmarkFlash = null; }, 700);
+                });
+                bookmarkRail.append(tick);
+            }
+        }
+        function scheduleBookmarks() {
+            if (!bookmarkFrame) bookmarkFrame = requestAnimationFrame(renderBookmarks);
+        }
+        editor.on('guttermousedown', event => {
+            // Preserve folding, diagnostic markers, modified clicks and their normal Ace actions.
+            if (event.getButton() !== 0 || event.domEvent.shiftKey || event.domEvent.ctrlKey || event.domEvent.metaKey || event.domEvent.altKey) return;
+            if (!event.domEvent.target.classList.contains('ace_gutter-cell') || editor.renderer.$gutterLayer.getRegion(event)) return;
+            const row = event.getDocumentPosition().row;
+            const index = bookmarks.findIndex(anchor => anchor.row === row);
+            if (index >= 0) bookmarks.splice(index, 1)[0].detach();
+            else {
+                const anchor = editor.session.doc.createAnchor(row, 0);
+                anchor.$insertRight = true;
+                anchor.on('change', scheduleBookmarks);
+                bookmarks.push(anchor);
+            }
+            scheduleBookmarks();
+            event.stop();
+        });
+        editor.session.on('change', () => { if (bookmarks.length || bookmarkRows.length) scheduleBookmarks(); });
+        new ResizeObserver(scheduleBookmarks).observe(bookmarkRail);
 
         // Remove Ace's default border
         editor.container.style.lineHeight = '1.6';
@@ -1884,6 +2071,55 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             }
         })();
 
+        // Emmet expands abbreviations with Tab only in HTML mode; plain Tab remains available elsewhere.
+        let emmetRequest = 0;
+        window.emmetEnabled = false;
+        window.emmetAvailable = () => editor.session.getMode().$id === 'ace/mode/html';
+        window.applyEmmetPreference = async function() {
+            const request = ++emmetRequest;
+            const enabled = window.emmetAvailable() && localStorage.getItem('ke_emmet') !== 'false';
+            window.emmetEnabled = enabled;
+            try {
+                if (enabled) {
+                    await window.loadEmmet();
+                    if (request !== emmetRequest) return;
+                    const extension = ace.require('ace/ext/emmet');
+                    if (!extension || !window.emmet) throw new Error('Emmet could not be loaded.');
+                    extension.setCore(window.emmet);
+                    // Our loader has already fetched the core, including timeout/retry handling.
+                    extension.load = callback => { if (callback) callback(); return true; };
+                    if (editor.completer && !editor.completer.fmEmmetTab) {
+                        editor.completer.fmEmmetTab = true;
+                        const normalTab = editor.completer.commands.Tab;
+                        editor.completer.keyboardHandler.bindKeys({Tab: target => {
+                            const command = extension.commands.commands['emmet:expand_abbreviation_with_tab'];
+                            if (window.emmetEnabled && window.emmetAvailable() && extension.isAvailable(target, command.name) && extension.runEmmetCommand.call(command, target)) {
+                                target.completer.detach(); return true;
+                            }
+                            return normalTab(target);
+                        }});
+                    }
+                    editor.setOption('enableEmmet', true);
+                } else if (ace.require('ace/ext/emmet')) editor.setOption('enableEmmet', false);
+            } catch (error) {
+                if (request !== emmetRequest) return;
+                window.emmetEnabled = false;
+                window.workspaceAlert(error.message || 'Cannot load Emmet.', 'Emmet unavailable', 'warning');
+            } finally {
+                const host = window.parent !== window ? window.parent : window;
+                if (window.parent === window || !window.frameElement?.hidden) host.document.querySelectorAll('[data-editor-command="emmet"]').forEach(button => {
+                    button.disabled = !window.emmetAvailable();
+                    button.setAttribute('aria-pressed', String(window.emmetEnabled));
+                });
+            }
+        };
+        function toggleEmmet() {
+            const host = window.parent !== window ? window.parent : window;
+            host.setEmmetPreference(localStorage.getItem('ke_emmet') === 'false');
+        }
+        editor.session.on('changeMode', () => queueMicrotask(() => window.applyEmmetPreference()));
+        document.addEventListener('DOMContentLoaded', () => window.applyEmmetPreference());
+
         // Inline comparison uses the last verified save, never the Git index or HEAD.
         var inlineDiffView = null;
         let inlineDiffRequest = 0;
@@ -1960,6 +2196,10 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 savedEditorValue = editorValue;
                 refreshInlineChangesBaseline();
                 lastSavedContent = content;
+                if (mixedLineEndings && !content.includes('\r')) {
+                    mixedLineEndings = false;
+                    document.getElementById('status-line-endings').textContent = 'LF';
+                }
                 hasUnsavedChanges = editor.getValue() !== savedEditorValue;
                 notifyWorkspace();
                 window.setWorkspaceDocumentTitle(editorFilename, hasUnsavedChanges);
@@ -2109,7 +2349,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             const dialog = document.getElementById('git-diff-dialog');
             const output = document.getElementById('git-diff-output');
             const heading = document.getElementById('git-diff-heading');
-            output.textContent = 'Loading Git comparison…';
+            window.workspaceLoading(output, 'Loading Git comparison…');
             heading.textContent = 'Changes compared with HEAD';
             if (!dialog.open) dialog.showModal();
             try {
@@ -3529,8 +3769,8 @@ if (isset($_FILES["files"])) {
     exit();
 }
 
-$versionInfo = 'Pocket Code Studio v1.0.0';
-$version = '1.0.0';
+$versionInfo = 'Pocket Code Studio v1.1.1';
+$version = '1.1.1';
 
 if ($username == null) {
     $username = "";
@@ -3547,7 +3787,7 @@ if ($username == null) {
         .file-type-icon img {width: 20px;height: 20px;object-fit: contain;display: block;}
         .file-type-icon.folder-type-icon {color: var(--text-secondary);}
         .folder-type-icon svg {width: 16px;height: 16px;}
-        .workspace-tab button[role="tab"] {display: inline-flex;align-items: center;gap: 6px;}
+        .workspace-tab button[role="tab"], #mobile-files-btn {display: inline-flex;align-items: center;gap: 6px;}
     </style>
 
     <?= $workspaceThemeScript ?>
@@ -3610,13 +3850,6 @@ if ($username == null) {
         .file-tree li {margin: 0;}
         .tree-name {overflow: hidden;text-overflow: ellipsis;}
         .tree-loading {display: flex;align-items: center;gap: 6px;padding: 3px 10px;font-size: 0.8rem;line-height: 20px;color: var(--text-muted);}
-        .tree-loading-spinner {width: 12px;height: 12px;flex-shrink: 0;border: 2px solid var(--border-default);border-top-color: var(--accent);border-radius: 50%;animation: tree-loading-spin 0.8s linear infinite;}
-        @keyframes tree-loading-spin {
-            to {transform: rotate(360deg);}
-        }
-        @media (prefers-reduced-motion: reduce) {
-            .tree-loading-spinner {animation: none;}
-        }
         .tree-message {padding: 4px 10px;color: var(--text-muted);font-size: 0.75rem;}
         .tree-file {padding-left: 25px !important;}
         .file-tree .folder-item {display: flex;width: 100%;border: 0;background: transparent;text-align: left;align-items: center;gap: 5px;padding: 3px 10px;font-size: 0.8rem;color: var(--text-secondary);cursor: pointer;border-radius: 0;transition: all 0.12s;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;}
@@ -3652,7 +3885,7 @@ if ($username == null) {
         }
         #workspace-theme option {background: var(--bg-elevated);color: var(--text-primary);}
         /* Internal editor tabs */
-        .workspace {flex: 1;min-width: 0;display: flex;flex-direction: column;}
+        .workspace {flex: 1;min-width: 0;min-height: 0;display: flex;flex-direction: column;}
         .workspace-tabs {display: flex;flex-shrink: 0;overflow-x: auto;background: var(--bg-main);border-bottom: 1px solid var(--border-subtle);}
         .workspace-tab {display: flex;align-items: center;flex-shrink: 0;border-right: 1px solid var(--border-subtle);border-top: 2px solid transparent;}
         .workspace-tab.active {background: var(--bg-deep);border-top-color: var(--accent);}
@@ -3662,8 +3895,9 @@ if ($username == null) {
         .workspace-tab .tab-close:hover {background: var(--bg-elevated);}
         .tab-dirty {color: var(--accent);margin-left: 6px;}
         .workspace-panels {position: relative;flex: 1;min-height: 0;display: flex;background: var(--bg-deep);}
-        .workspace-panels:has(> .editor-panel[data-loading="true"]:not([hidden]))::after {content: "Loading editor…";position: absolute;inset: 0;z-index: 2;display: grid;place-items: center;background: var(--bg-deep);color: var(--text-muted);font-size: 0.8rem;}
-        .editor-panel {flex: 1;min-width: 0;border: 0;background: var(--bg-deep);}
+        .editor-loading-message {display: none;position: absolute;inset: 0;z-index: 2;align-items: center;justify-content: center;background: var(--bg-deep);color: var(--text-muted);font-size: 0.8rem;}
+        .workspace-panels:has(> .editor-panel[data-loading="true"]:not([hidden])) > .editor-loading-message {display: flex;}
+        .editor-panel {position: absolute;inset: 0;width: 100%;height: 100%;min-width: 0;min-height: 0;border: 0;background: var(--bg-deep);}
         .workspace-panels > [hidden] {display: none !important;}
         /* ── Main Content Area ───────────────────────────────────── */
         .main-content {flex: 1;background: var(--bg-deep);display: flex;flex-direction: column;overflow: hidden;}
@@ -3840,7 +4074,7 @@ if ($username == null) {
             <button type="button" id="mobile-list-btn">List</button>
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
@@ -3886,6 +4120,7 @@ if ($username == null) {
                 </div>
             </div>
             <div class="workspace-panels" id="workspace-panels">
+                <div class="editor-loading-message" role="status"><span class="tree-loading-spinner" aria-hidden="true"></span>Loading editor…</div>
         <!-- Main File Area -->
         <div class="main-content" id="dropzone">
             <!-- Nav bar -->
@@ -3923,7 +4158,7 @@ if ($username == null) {
                     <tbody id="files-list">
                         <tr>
                             <td colspan="8" class="text-center" style="padding: 32px; color: var(--text-muted);">
-                                <i class="fas fa-spinner fa-spin me-2"></i> Loading files…
+                                <span class="tree-loading-spinner" aria-hidden="true"></span> Loading files…
                             </td>
                         </tr>
                     </tbody>
@@ -4432,6 +4667,14 @@ if ($username == null) {
         </div></div>
     </div>
 
+    <div class="modal fade" id="updateEditorModal" tabindex="-1" aria-labelledby="update-editor-title" data-bs-backdrop="static"><div class="modal-dialog"><div class="modal-content">
+        <div class="modal-header"><h5 class="modal-title" id="update-editor-title"><i class="fas fa-cloud-arrow-up me-2" aria-hidden="true"></i>Update editor</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-body"><p>Choose a trusted Pocket Code Studio PHP release. Your current filename, password and settings will be preserved. A private backup is created before replacement.</p>
+            <label for="update-editor-file" class="form-label">PHP release (maximum 4 MiB)</label><input id="update-editor-file" class="form-control" type="file" accept=".php">
+            <p id="update-editor-feedback" class="mt-3 mb-0" role="status" aria-live="polite"></p>
+        </div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="update-editor-check">Upload and check</button><button type="button" class="btn btn-primary" id="update-editor-install" hidden>Update and reload</button></div>
+    </div></div></div>
+
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-lg">
@@ -4784,7 +5027,7 @@ if ($username == null) {
                 const controls = [...githubModal.querySelectorAll('button,input,textarea,summary')];
                 const disabled = controls.map(control => control.disabled);
                 controls.forEach(control => { control.disabled = true; });
-                githubFeedback.textContent = operation === 'commit_push' ? 'Creating commit and pushing…' : operation === 'push' ? 'Pushing…' : 'Loading…';
+                window.workspaceLoading(githubFeedback, operation === 'commit_push' ? 'Creating commit and pushing…' : operation === 'push' ? 'Pushing…' : 'Loading…');
                 try {
                     if (operation === 'commit_push') {
                         const prepared = await requestWorkspace('github', {operation:'prepare', files:fields.files, preview:fields.preview, head:fields.head, branch:fields.branch});
@@ -4902,7 +5145,7 @@ if ($username == null) {
             }
             async function loadLoginActivity(operation = 'read', fields = {}) {
                 if (loginActivityBusy) return;
-                loginActivityBusy = true; loginActivityFeedback.textContent = operation === 'read' ? 'Loading…' : 'Saving…';
+                loginActivityBusy = true; window.workspaceLoading(loginActivityFeedback, operation === 'read' ? 'Loading…' : 'Saving…');
                 loginActivityModal.querySelectorAll('button:not([data-bs-dismiss])').forEach(button => { button.disabled = true; });
                 try {
                     const data = await requestWorkspace('login_activity', {operation, ...fields});
@@ -4930,7 +5173,7 @@ if ($username == null) {
             async function loadPickerFolder(folder) {
                 const request = ++pickerRequest;
                 pickerUse.disabled = true; pickerUp.disabled = true;
-                pickerMessage.textContent = 'Loading folders…'; pickerList.replaceChildren();
+                window.workspaceLoading(pickerMessage, 'Loading folders…'); pickerList.replaceChildren();
                 try {
                     const data = await requestWorkspace('browse_folders', {scope: pickerScope, folder});
                     if (request !== pickerRequest || !folderPicker.open) return;
@@ -4998,7 +5241,7 @@ if ($username == null) {
                 refreshGitStatus();
                 const tbody = document.getElementById('files-list');
                 tbody.innerHTML = `<tr><td colspan="8" style="padding:32px;text-align:center;color:var(--text-muted)">
-                <i class="fas fa-spinner fa-spin me-2"></i> Loading files…</td></tr>`;
+                <span class="tree-loading-spinner" aria-hidden="true"></span> Loading files…</td></tr>`;
                 selectedItems = [];
                 fileList = [];
                 updateButtonStates();
@@ -5768,6 +6011,36 @@ if ($username == null) {
                 }
             });
 
+            // Manual self-update: preview first, then explicitly install the checked bytes.
+            const updateModal = document.getElementById('updateEditorModal');
+            const updateFile = document.getElementById('update-editor-file');
+            const updateFeedback = document.getElementById('update-editor-feedback');
+            const updateCheck = document.getElementById('update-editor-check');
+            const updateInstall = document.getElementById('update-editor-install');
+            let updateToken = null, updateBusy = false;
+            updateFile.addEventListener('change', () => { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = ''; });
+            async function runEditorUpdate(install) {
+                if (updateBusy) return;
+                if (install && [...editorTabs.values()].some(tab => tab.dirty)) { updateFeedback.textContent = 'Save or close all unsaved files before updating.'; return; }
+                if (install && !updateToken) return;
+                const file = updateFile.files[0];
+                if (!install && (!file || file.size > 4194304)) { updateFeedback.textContent = 'Choose a PHP release no larger than 4 MiB.'; return; }
+                const body = new FormData(); body.set('operation', install ? 'install' : 'preview');
+                if (install) body.set('token', updateToken); else body.set('release', file);
+                updateBusy = true;
+                updateModal.querySelectorAll('button,input').forEach(control => control.disabled = true);
+                window.workspaceLoading(updateFeedback, install ? 'Updating editor…' : 'Loading and checking release…');
+                try {
+                    const data = await requestWorkspace('editor_update', body);
+                    if (install) { updateFeedback.textContent = data.message; location.reload(); return; }
+                    updateToken = data.token; updateInstall.hidden = false;
+                    updateFeedback.textContent = 'Release ' + data.version + ' → ' + data.filename + ' · PHP ' + data.php + '. ' + data.message;
+                } catch (error) { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = error.message; }
+                finally { updateBusy = false; updateModal.querySelectorAll('button,input').forEach(control => control.disabled = false); }
+            }
+            updateCheck.addEventListener('click', () => runEditorUpdate(false));
+            updateInstall.addEventListener('click', () => runEditorUpdate(true));
+
             // ── Search ────────────────────────────────────────────────
             let searchRequest = 0;
             let searchController = null;
@@ -5780,7 +6053,7 @@ if ($username == null) {
 
                 const tbody = document.getElementById('search-results');
                 tbody.innerHTML =
-                    `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)"><i class="fas fa-spinner fa-spin me-2"></i>Searching…</td></tr>`;
+                    `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)"><span class="tree-loading-spinner" aria-hidden="true"></span>Searching…</td></tr>`;
 
                 const request = ++searchRequest;
                 searchController?.abort();
@@ -5860,6 +6133,8 @@ if ($username == null) {
             document.getElementById('search-input').addEventListener('keypress', e => {
                 if (e.key === 'Enter') searchFiles();
             });
+
+            ['files-tab', 'mobile-files-btn'].forEach(id => document.getElementById(id).prepend(createFileIcon('', true)));
 
             // ── Internal editor tabs ─────────────────────────────────
             const editorTabs = new Map();
@@ -6006,6 +6281,7 @@ if ($username == null) {
                     if (active && tab.frame.contentWindow.editor) {
                         tab.frame.contentWindow.editor.resize();
                         tab.frame.contentWindow.editor.focus();
+                        tab.frame.contentWindow.warnMixedLineEndings?.();
                     }
                 });
             }
@@ -6089,14 +6365,15 @@ if ($username == null) {
                 invisibles: {run: target => target.toggleInvisibles(), pressed: target => target.editor.getOption('showInvisibles'), keepFocus: true},
                 indentguides: {run: target => target.toggleEditorPreference('displayIndentGuides'), pressed: target => target.editor.getOption('displayIndentGuides'), keepFocus: true},
                 autocomplete: {run: target => target.toggleEditorPreference('enableLiveAutocompletion'), pressed: target => target.editor.getOption('enableLiveAutocompletion'), keepFocus: true},
+                emmet: {run: target => target.toggleEmmet(), available: target => target.emmetAvailable(), pressed: target => target.emmetEnabled, keepFocus: true},
                 fullscreen: {run: target => target.toggleFullscreen(), pressed: target => !!target.document.fullscreenElement, keepFocus: true},
                 format: {run: target => target.formatCode()}
             };
             function updateEditorMenu() {
                 const ready = activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.frame.contentWindow.editor;
                 document.querySelectorAll('.editor-menu-action').forEach(button => {
-                    button.disabled = !ready || !Object.hasOwn(editorCommands, button.dataset.editorCommand);
-                    const command = editorCommands[button.dataset.editorCommand];
+                    const command = Object.hasOwn(editorCommands, button.dataset.editorCommand) ? editorCommands[button.dataset.editorCommand] : null;
+                    button.disabled = !ready || !command || !!(command.available && !command.available(editorTabs.get(activeEditorPath).frame.contentWindow));
                     if (command?.pressed) button.setAttribute('aria-pressed', String(ready && !!command.pressed(editorTabs.get(activeEditorPath).frame.contentWindow)));
                 });
                 updateButtonStates();
@@ -6345,7 +6622,7 @@ if ($username == null) {
                     document.getElementById('phone-file-name').textContent = name;
                     const link = document.getElementById('phone-file-link'); link.href = url; link.textContent = url;
                     preview.hidden = true; retry.hidden = true;
-                    status.textContent = 'Loading QR code…';
+                    window.workspaceLoading(status, 'Loading QR code…');
                     bootstrap.Modal.getOrCreateInstance(document.getElementById('phoneModal')).show();
                     await loadPhoneQRLibrary();
                     if (request !== phoneQRRequest) return;
