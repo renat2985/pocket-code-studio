@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pocket Code Studio v1.1.1
+ * Pocket Code Studio v1.3.0
  * Minimum PHP: 7.4
  * A single-file PHP file manager and browser-based code editor.
  * Maintained by Renat2985 — https://github.com/Renat2985/pocket-code-studio
@@ -837,6 +837,34 @@ $workspaceThemeScript = <<<'JS'
         }
         window.setWorkspaceTheme(window.getEditorTheme(),false);
     });
+        function renderGitDiff(diff) {
+            const lines = document.createElement('div');
+            lines.className = 'git-diff-lines';
+            function appendRow(text, before = '', after = '', type = '') {
+                const row = document.createElement('div'); row.className = 'git-diff-row' + (type ? ' ' + type : '');
+                const gutter = document.createElement('span'); gutter.className = 'git-diff-gutter';
+                for (const value of [before, after]) {
+                    const number = document.createElement('span'); number.className = 'git-diff-number'; number.textContent = String(value); gutter.append(number);
+                }
+                const code = document.createElement('span'); code.className = 'git-diff-code'; code.textContent = text || ' ';
+                row.append(gutter, code); lines.append(row);
+            }
+            appendRow('', 'HEAD', 'Current', 'git-diff-column-head');
+            let before = 0, after = 0, inHunk = false;
+            const rows = diff.split('\n');
+            if (rows[rows.length - 1] === '') rows.pop();
+            for (const line of rows) {
+                const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (hunk) { before = Number(hunk[1]); after = Number(hunk[2]); inHunk = true; appendRow(line, '', '', 'git-hunk'); }
+                else if (inHunk && line.startsWith('+')) appendRow(line, '', after++, 'git-added');
+                else if (inHunk && line.startsWith('-')) appendRow(line, before++, '', 'git-removed');
+                else if (inHunk && line.startsWith(' ')) appendRow(line, before++, after++);
+                else appendRow(line);
+            }
+            return lines;
+        }
+
+        window.renderGitDiff = renderGitDiff;
     function escapeAlertText(value) {
         return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
     }
@@ -967,6 +995,22 @@ $workspaceThemeScript = <<<'JS'
         .tree-loading-spinner {display: inline-block;vertical-align: -0.15em;width: 12px;height: 12px;margin-right: 6px;flex-shrink: 0;border: 2px solid var(--border-default);border-top-color: var(--accent);border-radius: 50%;animation: tree-loading-spin 0.8s linear infinite;}
         @keyframes tree-loading-spin {to {transform: rotate(360deg);}}
         @media (prefers-reduced-motion: reduce) {.tree-loading-spinner {animation: none;}}
+        #git-diff-dialog {margin: auto;width: min(1000px, 94vw);max-height: 88vh;background: var(--bg-main);color: var(--text-primary);border: 1px solid var(--border-default);border-radius: 6px;padding: 0;}
+        #git-diff-dialog::backdrop {background: #0008;}
+        .git-diff-title {display: flex;justify-content: space-between;align-items: center;padding: 10px 14px;background: var(--bg-elevated);}
+        #git-diff-close {background: transparent;border: 0;color: var(--text-primary);font-size: 24px;cursor: pointer;}
+        #git-diff-output {margin: 0;padding: 12px;max-height: 72vh;overflow: auto;font: 12px/1.6 monospace;white-space: pre;}
+        .git-diff-lines {width: max-content;min-width: 100%;}
+        .git-diff-row {display: flex;box-sizing: border-box;border-left: 3px solid transparent;}
+        .git-diff-gutter {display: flex;flex-shrink: 0;position: sticky;left: 0;background: var(--bg-main);color: var(--text-muted);border-right: 1px solid var(--border-subtle);user-select: none;}
+        .git-diff-number {display: block;box-sizing: border-box;width: 9ch;padding: 0 1ch;text-align: right;font-variant-numeric: tabular-nums;}
+        .git-diff-code {display: block;padding-left: 12px;}
+        .git-diff-column-head {color: var(--text-secondary);border-bottom: 1px solid var(--border-subtle);}
+        .git-added .git-diff-gutter {color: var(--accent-success);}
+        .git-removed .git-diff-gutter {color: var(--accent-danger);}
+        .git-added {background: #33995522;color: var(--text-primary);border-left: 3px solid #43a866;}
+        .git-removed {background: #dd445522;color: var(--text-primary);border-left: 3px solid #e06c75;}
+        .git-hunk {color: var(--text-link);}
     /* One text scale for menus and floating UI, independent of Bootstrap defaults. */
     :root {--workspace-ui-font-size: 0.78rem;}
     .modal, .modal .modal-content, #git-diff-dialog, .cool-alert-modal, .cool-alert-toast {font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;font-size: var(--workspace-ui-font-size) !important;line-height: 1.5;}
@@ -1255,7 +1299,7 @@ if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff']
             if (!$file || !is_file($file) || strpos($file,$root.DIRECTORY_SEPARATOR)!==0) throw new RuntimeException('Invalid file.');
             $relative=substr($file,strlen($root)+1);
             if (in_array('.git',explode(DIRECTORY_SEPARATOR,$relative),true)) throw new RuntimeException('Git metadata cannot be compared.');
-            $content=base64_decode($_POST['content_base64'] ?? '',true);
+            $content = ($_POST['source'] ?? '') === 'disk' ? @file_get_contents($file, false, null, 0, 8*1024*1024+1) : base64_decode($_POST['content_base64'] ?? '',true);
             if ($content===false || strlen($content)>8*1024*1024 || strpos($content,"\0")!==false || !preg_match('//u',$content)) throw new RuntimeException('Only UTF-8 text up to 8 MB can be compared.');
             $tracked = fmGitRun($root,['ls-tree','-z','HEAD','--',$relative],[0,128]);
             $baseline='';
@@ -1637,22 +1681,6 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         .spinner-label {font-size: 0.8rem;color: var(--text-muted);}
         /* ── Kbd shortcuts hint ──────────────────────────────────── */
         kbd {display: inline-block;background: var(--bg-deep);border: 1px solid var(--border-default);border-radius: 3px;padding: 1px 5px;font-size: 0.65rem;color: var(--text-muted);font-family: var(--font-mono);}
-        #git-diff-dialog {margin: auto;width: min(1000px, 94vw);max-height: 88vh;background: var(--bg-main);color: var(--text-primary);border: 1px solid var(--border-default);border-radius: 6px;padding: 0;}
-        #git-diff-dialog::backdrop {background: #0008;}
-        .git-diff-title {display: flex;justify-content: space-between;align-items: center;padding: 10px 14px;background: var(--bg-elevated);}
-        #git-diff-close {background: transparent;border: 0;color: var(--text-primary);font-size: 24px;cursor: pointer;}
-        #git-diff-output {margin: 0;padding: 12px;max-height: 72vh;overflow: auto;font: 12px/1.6 monospace;white-space: pre;}
-        .git-diff-lines {width: max-content;min-width: 100%;}
-        .git-diff-row {display: flex;box-sizing: border-box;border-left: 3px solid transparent;}
-        .git-diff-gutter {display: flex;flex-shrink: 0;position: sticky;left: 0;background: var(--bg-main);color: var(--text-muted);border-right: 1px solid var(--border-subtle);user-select: none;}
-        .git-diff-number {display: block;box-sizing: border-box;width: 9ch;padding: 0 1ch;text-align: right;font-variant-numeric: tabular-nums;}
-        .git-diff-code {display: block;padding-left: 12px;}
-        .git-diff-column-head {color: var(--text-secondary);border-bottom: 1px solid var(--border-subtle);}
-        .git-added .git-diff-gutter {color: var(--accent-success);}
-        .git-removed .git-diff-gutter {color: var(--accent-danger);}
-        .git-added {background: #33995522;color: var(--text-primary);border-left: 3px solid #43a866;}
-        .git-removed {background: #dd445522;color: var(--text-primary);border-left: 3px solid #e06c75;}
-        .git-hunk {color: var(--text-link);}
         .mobile-code-keys, #mobile-status-toggle, #mobile-keys-toggle {display: none;}
         @media (max-width: 760px) {
             html, body {height: var(--mobile-viewport-height, 100dvh);}
@@ -2318,33 +2346,10 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             }
         });
 
-        function renderGitDiff(diff) {
-            const lines = document.createElement('div');
-            lines.className = 'git-diff-lines';
-            function appendRow(text, before = '', after = '', type = '') {
-                const row = document.createElement('div'); row.className = 'git-diff-row' + (type ? ' ' + type : '');
-                const gutter = document.createElement('span'); gutter.className = 'git-diff-gutter';
-                for (const value of [before, after]) {
-                    const number = document.createElement('span'); number.className = 'git-diff-number'; number.textContent = String(value); gutter.append(number);
-                }
-                const code = document.createElement('span'); code.className = 'git-diff-code'; code.textContent = text || ' ';
-                row.append(gutter, code); lines.append(row);
-            }
-            appendRow('', 'HEAD', 'Current', 'git-diff-column-head');
-            let before = 0, after = 0, inHunk = false;
-            const rows = diff.split('\n');
-            if (rows[rows.length - 1] === '') rows.pop();
-            for (const line of rows) {
-                const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-                if (hunk) { before = Number(hunk[1]); after = Number(hunk[2]); inHunk = true; appendRow(line, '', '', 'git-hunk'); }
-                else if (inHunk && line.startsWith('+')) appendRow(line, '', after++, 'git-added');
-                else if (inHunk && line.startsWith('-')) appendRow(line, before++, '', 'git-removed');
-                else if (inHunk && line.startsWith(' ')) appendRow(line, before++, after++);
-                else appendRow(line);
-            }
-            return lines;
-        }
-
+        window.getGitComparisonContent = function() {
+            const value = editor.getValue();
+            return value === savedEditorValue ? lastSavedContent : value.replace(/\r\n|\r|\n/g, originalNewline);
+        };
         async function showGitDiff() {
             const dialog = document.getElementById('git-diff-dialog');
             const output = document.getElementById('git-diff-output');
@@ -2356,8 +2361,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 const body = new FormData();
                 body.append('action','git_diff');
                 body.append('file', <?= json_encode($filename, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>);
-                const editorValue = editor.getValue();
-                const content = editorValue === savedEditorValue ? lastSavedContent : editorValue.replace(/\r\n|\r|\n/g, originalNewline);
+                const content = window.getGitComparisonContent();
                 const bytes = new TextEncoder().encode(content);
                 let binary = '';
                 for (let i=0;i<bytes.length;i+=8192) binary += String.fromCharCode(...bytes.subarray(i,i+8192));
@@ -3769,8 +3773,8 @@ if (isset($_FILES["files"])) {
     exit();
 }
 
-$versionInfo = 'Pocket Code Studio v1.1.1';
-$version = '1.1.1';
+$versionInfo = 'Pocket Code Studio v1.3.0';
+$version = '1.3.0';
 
 if ($username == null) {
     $username = "";
@@ -3907,6 +3911,8 @@ if ($username == null) {
         .nav-links i {font-size: 0.72rem;}
         .nav-links:hover {color: var(--text-link);background: var(--bg-selected);}
         .nav-links.disabled {color: var(--text-muted) !important;pointer-events: none;opacity: 0.45;}
+        .git-status-action {cursor: pointer;border-radius: 3px;padding: 2px 3px;}
+        .git-status-action:hover, .git-status-action:focus-visible {background: var(--bg-selected);outline: 1px solid var(--accent);}
         .git-status-badge {margin-left: 8px;font-size: 0.7rem;font-weight: 600;color: var(--text-link);}
         /* Keep search central and sign-out independent from the application menus. */
         .toolbar-utilities {grid-column: 2;grid-row: 1;width: 100%;min-width: 0;margin: 0;padding: 0;flex-shrink: 0;}
@@ -4208,7 +4214,8 @@ if ($username == null) {
         <div class="context-menu-item" id="ctx-compress"><i class="fas fa-file-archive"></i> Compress</div>
         <div class="context-menu-item" id="ctx-extract"><i class="fas fa-box-open"></i> Extract</div>
         <div class="context-menu-divider"></div>
-        <div class="context-menu-item danger" id="ctx-delete"><i class="fas fa-trash"></i> Delete</div>
+        <div class="context-menu-item" id="ctx-restore"><i class="fas fa-undo"></i> Restore</div>
+        <div class="context-menu-item danger" id="ctx-delete"><i class="fas fa-trash"></i> <span id="ctx-delete-label">Delete</span></div>
     </div>
 
     <!-- ── Modals ─────────────────────────────────────────────────── -->
@@ -4672,9 +4679,11 @@ if ($username == null) {
         <div class="modal-body"><p>Choose a trusted Pocket Code Studio PHP release. Your current filename, password and settings will be preserved. A private backup is created before replacement.</p>
             <label for="update-editor-file" class="form-label">PHP release (maximum 4 MiB)</label><input id="update-editor-file" class="form-control" type="file" accept=".php">
             <p id="update-editor-feedback" class="mt-3 mb-0" role="status" aria-live="polite"></p>
+            <section id="update-editor-notes" class="mt-3 overflow-auto" style="max-height: 30vh" aria-label="What's new" aria-live="polite" hidden></section>
         </div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="update-editor-check">Upload and check</button><button type="button" class="btn btn-primary" id="update-editor-install" hidden>Update and reload</button></div>
     </div></div></div>
 
+    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong id="git-diff-heading">Git changes</strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-lg">
@@ -4994,11 +5003,20 @@ if ($username == null) {
             let clickedBtn = null;
             let hasResponseError = false;
 
-            function createGitStatusBadge(status) {
+            function createGitStatusBadge(status, path = null) {
                 if (status.length > 1) status = status === '??' ? 'U' : status.includes('D') ? 'D' : status.includes('A') ? 'A' : 'M';
                 const badge = document.createElement('span');
                 badge.className = 'git-status-badge'; badge.textContent = status;
                 badge.title = {M:'Modified compared with Git',U:'Untracked file',A:'Added to Git',D:'Deleted'}[status] || status;
+                if (status === 'M' && path !== null) {
+                    badge.classList.add('git-status-action'); badge.tabIndex = 0; badge.setAttribute('role', 'button');
+                    badge.title = 'View changes against HEAD'; badge.setAttribute('aria-label', 'View Git changes: ' + path);
+                    badge.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); showGitBadgeDiff(path); });
+                    badge.addEventListener('dblclick', event => { event.preventDefault(); event.stopPropagation(); });
+                    badge.addEventListener('keydown', event => {
+                        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); showGitBadgeDiff(path); }
+                    });
+                }
                 return badge;
             }
             const githubModal = document.getElementById('githubModal');
@@ -5018,7 +5036,7 @@ if ($username == null) {
                     const label = document.createElement('label'); label.className = 'd-flex align-items-center gap-2 py-1';
                     const input = document.createElement('input'); input.type = 'checkbox'; input.className = 'form-check-input'; input.value = file.path; input.disabled = !file.allowed;
                     const text = document.createElement('span'); text.textContent = file.path + (file.allowed ? '' : ' (unsupported: directory, symlink or large file)'); text.style.overflowWrap = 'anywhere';
-                    label.append(input, text, createGitStatusBadge(file.status)); list.append(label);
+                    label.append(input, text, createGitStatusBadge(file.status, file.path)); list.append(label);
                 });
             }
             async function githubOperation(operation, fields = {}) {
@@ -5333,7 +5351,7 @@ if ($username == null) {
                     const appendBadge = (element, path) => {
                         const status = data.files[path.replace(/^\/+/, '')];
                         if (!status) return;
-                        element.append(createGitStatusBadge(status));
+                        element.append(createGitStatusBadge(status, path));
                     };
                     document.querySelectorAll('#files-list .file-item').forEach(row => {
                         if (row.dataset.type !== 'dir') appendBadge(row.querySelector('.file-name'), currentPath + '/' + row.dataset.name);
@@ -5418,6 +5436,9 @@ if ($username == null) {
 
             function showContextMenu(x, y, type) {
                 const menu = document.getElementById('context-menu');
+                const inTrash = contextTarget.directory === '/.trash';
+                document.getElementById('ctx-restore').style.display = inTrash ? 'flex' : 'none';
+                document.getElementById('ctx-delete-label').textContent = inTrash ? 'Delete permanently' : 'Delete';
                 document.getElementById('ctx-download').style.display = type === 'file' ? 'flex' : 'none';
                 document.getElementById('ctx-open-divider').style.display = type === 'file' && canOpenBrowserFile(contextTarget) ? 'block' : 'none';
                 document.getElementById('ctx-browser').style.display = type === 'file' && canOpenBrowserFile(contextTarget) ? 'flex' : 'none';
@@ -5493,7 +5514,7 @@ if ($username == null) {
                     'rename-btn': n === 1 && !inTrash,
                     'copy-btn': n > 0 && !inTrash,
                     'move-btn': n > 0 && !inTrash,
-                    'delete-btn': n > 0 && !inTrash,
+                    'delete-btn': n > 0,
                     'compress-btn': n > 0 && !inTrash,
                     'download-btn': isFile && !inTrash,
                     'open-browser-btn': publicFile && !inTrash && (activeEditorPath !== null || isFile),
@@ -5861,11 +5882,14 @@ if ($username == null) {
                     item.textContent = name;
                     return item;
                 }));
-                document.getElementById('deleteAction').value = 'trash';
-                document.getElementById('deleteButtonText').textContent = 'Move to Trash';
-                document.getElementById('deleteInfoAlert').style.display = 'block';
-                document.getElementById('permanentDeleteAlert').style.display = 'none';
-                document.getElementById('permanentDeleteCheck').checked = false;
+                const inTrash = selection.directory === '/.trash';
+                document.getElementById('deleteAction').value = inTrash ? 'delete' : 'trash';
+                document.getElementById('deleteButtonText').textContent = inTrash ? 'Delete Permanently' : 'Move to Trash';
+                document.getElementById('deleteInfoAlert').style.display = inTrash ? 'none' : 'block';
+                document.getElementById('permanentDeleteAlert').style.display = inTrash ? 'block' : 'none';
+                const permanent = document.getElementById('permanentDeleteCheck');
+                permanent.checked = inTrash;
+                permanent.disabled = inTrash;
                 new bootstrap.Modal(document.getElementById('deleteModal')).show();
             });
 
@@ -5884,12 +5908,15 @@ if ($username == null) {
                     showAlert('Error', 'Please select items to restore');
                     return;
                 }
-                if (!currentPath.includes('/.trash')) {
+                if (currentPath !== '/.trash') {
                     showAlert('Error', 'Restore is only available inside the Trash folder');
                     return;
                 }
                 document.getElementById('restorePath').value = currentPath;
-                document.getElementById('restoreItems').value = selectedItems;
+                document.getElementById('restoreItems').value = selectedItems.join(',');
+                document.getElementById('restoreItemsList').replaceChildren(...selectedItems.map(name => {
+                    const item = document.createElement('li'); item.className = 'list-group-item'; item.textContent = name; return item;
+                }));
                 new bootstrap.Modal(document.getElementById('restoreModal')).show();
             });
 
@@ -6011,6 +6038,35 @@ if ($username == null) {
                 }
             });
 
+            let gitBadgeRequest = 0;
+            async function showGitBadgeDiff(path) {
+                const request = ++gitBadgeRequest;
+                const dialog = document.getElementById('git-diff-dialog');
+                const output = document.getElementById('git-diff-output');
+                const heading = document.getElementById('git-diff-heading');
+                const full = SERVER_ROOT_PATH.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '');
+                const target = editorTabs.get(full)?.frame.contentWindow;
+                window.workspaceLoading(output, 'Loading Git comparison…');
+                heading.textContent = path + ' — changes compared with HEAD';
+                if (!dialog.open) dialog.showModal();
+                try {
+                    const fields = {file: full, source: 'disk'};
+                    const content = target?.getGitComparisonContent?.();
+                    if (typeof content === 'string') {
+                        const bytes = new TextEncoder().encode(content); let binary = '';
+                        for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+                        fields.content_base64 = btoa(binary); delete fields.source;
+                    }
+                    const data = await requestWorkspace('git_diff', fields);
+                    if (request !== gitBadgeRequest) return;
+                    heading.textContent = path + (typeof content === 'string' ? ' — HEAD → current editor (including unsaved changes)' : ' — HEAD → saved file');
+                    output.replaceChildren();
+                    if (!data.diff.trim()) output.textContent = 'No changes compared with HEAD.';
+                    else output.append(window.renderGitDiff(data.diff));
+                } catch (error) { if (request === gitBadgeRequest) output.textContent = error.message; }
+            }
+            document.getElementById('git-diff-close').addEventListener('click', () => { gitBadgeRequest++; document.getElementById('git-diff-dialog').close(); });
+
             // Manual self-update: preview first, then explicitly install the checked bytes.
             const updateModal = document.getElementById('updateEditorModal');
             const updateFile = document.getElementById('update-editor-file');
@@ -6018,7 +6074,56 @@ if ($username == null) {
             const updateCheck = document.getElementById('update-editor-check');
             const updateInstall = document.getElementById('update-editor-install');
             let updateToken = null, updateBusy = false;
-            updateFile.addEventListener('change', () => { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = ''; });
+            const updateNotes = document.getElementById('update-editor-notes');
+            const installedVersion = <?= json_encode($version) ?>;
+            let updateNotesRequest = 0;
+            function releaseNotesBetween(markdown, installed, uploaded) {
+                const parts = value => /^\d+\.\d+\.\d+$/.test(value) ? value.split('.').map(Number) : null;
+                const compare = (a,b) => a[0]-b[0] || a[1]-b[1] || a[2]-b[2];
+                const from = parts(installed), to = parts(uploaded);
+                if (!from || !to || compare(to,from) <= 0) return [];
+                return markdown.split(/^##[ \t]+/m).slice(1).flatMap(section => {
+                    const [heading, ...lines] = section.split(/\r?\n/);
+                    const version = heading.trim(), number = parts(version);
+                    if (!number || compare(number,from) <= 0 || compare(number,to) > 0) return [];
+                    const items = lines.filter(line => line.startsWith('- ')).map(line => line.slice(2));
+                    return items.length ? [{version, number, items}] : [];
+                }).sort((a,b) => compare(b.number,a.number));
+            }
+            async function showUpdateNotes(version) {
+                const request = ++updateNotesRequest;
+                updateNotes.hidden = false;
+                window.workspaceLoading(updateNotes, 'Loading release notes…');
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 8000);
+                try {
+                    const response = await fetch('https://raw.githubusercontent.com/renat2985/pocket-code-studio/main/dist/CHANGELOG.md', {signal:controller.signal, credentials:'omit', cache:'no-cache'});
+                    if (!response.ok) throw new Error('Release notes unavailable');
+                    const notes = releaseNotesBetween(await response.text(), installedVersion, version);
+                    if (request !== updateNotesRequest) return;
+                    const heading = document.createElement('h6');
+                    heading.textContent = "What's new · " + installedVersion + ' → ' + version;
+                    updateNotes.replaceChildren(heading);
+                    if (!notes.some(note => note.version === version)) {
+                        const hint = document.createElement('p');
+                        hint.textContent = 'Release notes for this version are not available yet.';
+                        updateNotes.append(hint);
+                    }
+                    for (const note of notes) {
+                        const title = document.createElement('strong'), list = document.createElement('ul');
+                        title.textContent = note.version;
+                        for (const item of note.items) {
+                            const row = document.createElement('li'); row.textContent = item; list.append(row);
+                        }
+                        updateNotes.append(title,list);
+                    }
+                } catch (_) {
+                    if (request === updateNotesRequest) updateNotes.textContent = 'Could not load release notes. You can still update.';
+                } finally { clearTimeout(timer); }
+            }
+            function clearUpdateNotes() { updateNotesRequest++; updateNotes.hidden = true; updateNotes.replaceChildren(); }
+
+            updateFile.addEventListener('change', () => { clearUpdateNotes(); updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = ''; });
             async function runEditorUpdate(install) {
                 if (updateBusy) return;
                 if (install && [...editorTabs.values()].some(tab => tab.dirty)) { updateFeedback.textContent = 'Save or close all unsaved files before updating.'; return; }
@@ -6027,6 +6132,7 @@ if ($username == null) {
                 if (!install && (!file || file.size > 4194304)) { updateFeedback.textContent = 'Choose a PHP release no larger than 4 MiB.'; return; }
                 const body = new FormData(); body.set('operation', install ? 'install' : 'preview');
                 if (install) body.set('token', updateToken); else body.set('release', file);
+                clearUpdateNotes();
                 updateBusy = true;
                 updateModal.querySelectorAll('button,input').forEach(control => control.disabled = true);
                 window.workspaceLoading(updateFeedback, install ? 'Updating editor…' : 'Loading and checking release…');
@@ -6034,7 +6140,8 @@ if ($username == null) {
                     const data = await requestWorkspace('editor_update', body);
                     if (install) { updateFeedback.textContent = data.message; location.reload(); return; }
                     updateToken = data.token; updateInstall.hidden = false;
-                    updateFeedback.textContent = 'Release ' + data.version + ' → ' + data.filename + ' · PHP ' + data.php + '. ' + data.message;
+                    updateFeedback.textContent = 'Release ' + installedVersion + ' → ' + data.version + ' · ' + data.filename + ' · PHP ' + data.php + '. ' + data.message;
+                    void showUpdateNotes(data.version);
                 } catch (error) { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = error.message; }
                 finally { updateBusy = false; updateModal.querySelectorAll('button,input').forEach(control => control.disabled = false); }
             }
@@ -6677,7 +6784,7 @@ if ($username == null) {
             // ── Context menu actions ──────────────────────────────────
             const contextActions = {
                 'ctx-copy': 'copy-btn', 'ctx-cut': 'move-btn', 'ctx-rename': 'rename-btn',
-                'ctx-delete': 'delete-btn', 'ctx-permissions': 'permissions-btn', 'ctx-compress': 'compress-btn', 'ctx-extract': 'extract-btn'
+                'ctx-restore': 'restore-btn', 'ctx-delete': 'delete-btn', 'ctx-permissions': 'permissions-btn', 'ctx-compress': 'compress-btn', 'ctx-extract': 'extract-btn'
             };
             let contextActionBusy = false;
             document.getElementById('context-menu').addEventListener('click', async event => {
