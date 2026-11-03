@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pocket Code Studio v1.3.0
+ * Pocket Code Studio v1.3.1
  * Minimum PHP: 7.4
  * A single-file PHP file manager and browser-based code editor.
  * Maintained by Renat2985 — https://github.com/Renat2985/pocket-code-studio
@@ -409,19 +409,6 @@ if (!$authenticated) {
 }
 $_SESSION['auth_seen'] = $authNow;
 if ($isPostRequest && ($_POST['action'] ?? '') === 'editor_update') fmHandleEditorUpdate();
-if ($isPostRequest && ($_POST['action'] ?? '') === 'login_activity') {
-    try {
-        $operation = $_POST['operation'] ?? 'read';
-        if ($operation === 'reset') fmResetLoginLimit($_POST['key'] ?? null);
-        elseif ($operation === 'policy') {
-            $policy = fmValidateLoginPolicy($_POST);
-            fmWithActivityLock(function ($directory) use ($policy) { fmWriteAuthData($directory . '/login-policy.json', $policy); });
-            fmRecordLoginEvent($_SERVER['REMOTE_ADDR'] ?? 'unknown', 'policy_changed');
-        } elseif ($operation !== 'read') throw new RuntimeException('Unknown login activity action.');
-        fmAuthReply(200, 'Login activity loaded.', fmLoginActivitySnapshot());
-    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
-}
-
 if ($authAction === 'logout' && $isPostRequest) {
     $_SESSION = [];
     session_destroy();
@@ -499,7 +486,7 @@ $config = [
     "root_path" => $root_path,
     "allowed_extensions" => ["*"],
     "timezone" => "Africa/Lagos",
-    "date_format" => "M j Y, H:i:s",
+    "date_format" => "d M Y, H:i:s",
     "font_size" => "16px",
 ];
 
@@ -520,6 +507,9 @@ try {
         }
     }
 } catch (Throwable $error) { fmAuthReply(503, 'Settings configuration unavailable.'); }
+
+// Upgrade the previous default while preserving custom date formats.
+if (in_array($config['date_format'], ['M j Y, H:i:s', 'M d Y, H:i:s'], true)) $config['date_format'] = 'd M Y, H:i:s';
 
 // Map the workspace to its public URL only when it is inside the document root.
 $publicDocumentRoot = realpath($_SERVER['DOCUMENT_ROOT']);
@@ -564,6 +554,41 @@ if ($isPostRequest && ($_POST['action'] ?? '') === 'browse_folders') {
 
 // Set timezone
 date_default_timezone_set($config["timezone"]);
+
+function fmModifiedDate($timestamp, $format)
+{
+    $day = date('Y-m-d', $timestamp);
+    if ($day === date('Y-m-d')) return 'Today, ' . date('H:i:s', $timestamp);
+    if ($day === date('Y-m-d', strtotime('yesterday'))) return 'Yesterday, ' . date('H:i:s', $timestamp);
+    return date($format, $timestamp);
+}
+
+if ($isPostRequest && ($_POST['action'] ?? '') === 'login_activity') {
+    try {
+        $operation = $_POST['operation'] ?? 'read';
+        if ($operation === 'reset') fmResetLoginLimit($_POST['key'] ?? null);
+        elseif ($operation === 'policy') {
+            $policy = fmValidateLoginPolicy($_POST);
+            fmWithActivityLock(function ($directory) use ($policy) { fmWriteAuthData($directory . '/login-policy.json', $policy); });
+            fmRecordLoginEvent($_SERVER['REMOTE_ADDR'] ?? 'unknown', 'policy_changed');
+        } elseif ($operation !== 'read') throw new RuntimeException('Unknown login activity action.');
+        $activity = fmLoginActivitySnapshot();
+        $dates = [];
+        $addDate = function ($timestamp) use (&$dates, $config) {
+            if ($timestamp) $dates[$timestamp] = fmModifiedDate((int) $timestamp, $config['date_format']);
+        };
+        $addDate($activity['last_success']);
+        $addDate($activity['global_blocked_until']);
+        foreach ($activity['rows'] as $row) {
+            foreach (['first', 'last', 'last_success'] as $field) $addDate($row[$field]);
+            foreach ($row['events'] as $event) $addDate($event['last']);
+        }
+        $activity['display_dates'] = (object) $dates;
+        fmAuthReply(200, 'Login activity loaded.', $activity);
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
+}
+
+
 
 /*
 Seti icon mappings from microsoft/vscode/extensions/theme-seti.
@@ -1024,16 +1049,20 @@ $workspaceThemeScript = <<<'JS'
     .workspace-toast[data-type="error"] > i {color: var(--accent-danger);}
     .workspace-toast[data-type="warning"] > i {color: var(--accent-warning);}
     .workspace-toast[data-type="info"] > i {color: var(--accent);}
-    #folder-picker {width:min(540px,calc(100vw - 24px));max-height:85dvh;padding:0;border:1px solid var(--border-default);border-radius:6px;background:var(--bg-main);color:var(--text-primary);font:var(--workspace-ui-font-size)/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+    #folder-picker {margin:auto;pointer-events:auto;width:min(500px,calc(100vw - 24px));max-height:85dvh;padding:0;overflow:auto;}
+    #folder-picker:not([open]) {display:none;}
     #folder-picker::backdrop {background:#0007;}
-    .folder-picker-head, .folder-picker-footer {padding:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
-    #folder-picker-path {flex-basis:100%;overflow-wrap:anywhere;}
-    #folder-picker-list {max-height:48dvh;overflow:auto;border-block:1px solid var(--border-subtle);}
-    #folder-picker button {padding:7px 10px;border:1px solid var(--border-default);border-radius:4px;background:var(--bg-elevated);color:var(--text-primary);font:inherit;cursor:pointer;}
+    .folder-picker-nav {display:flex;align-items:center;gap:4px;flex-wrap:wrap;width:100%;min-width:0;}
+    #folder-picker-path {flex:1 1 140px;min-width:0;padding:5px 8px;border:1px solid var(--border-default);border-radius:4px;background:var(--bg-elevated);color:var(--text-primary);font:inherit;}
+    #folder-picker .folder-picker-nav button {display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:0;background:transparent;color:var(--text-secondary);white-space:nowrap;}
+    #folder-picker .folder-picker-nav button:hover:not(:disabled) {background:var(--bg-hover);color:var(--text-primary);}
+    #folder-picker-list {max-height:48dvh;overflow:auto;margin-top:8px;border-block:1px solid var(--border-subtle);}
+    :is(#folder-picker, #goto-dialog) button.dialog-primary {background:var(--accent);border-color:var(--accent);color:var(--accent-contrast);}
+    :is(#folder-picker, #goto-dialog) button.dialog-primary:hover:not(:disabled) {background:var(--accent-hover);border-color:var(--accent-hover);}
+    :is(#folder-picker, #goto-dialog) button:focus-visible, .modal .btn:focus-visible {outline:2px solid var(--accent);outline-offset:2px;}
     #folder-picker button:disabled {opacity:.45;cursor:default;}
-    #folder-picker-list button {display:flex;gap:8px;width:100%;text-align:left;background:transparent;border:0;border-radius:0;overflow-wrap:anywhere;min-height:38px;}
+    #folder-picker-list button {display:flex;align-items:baseline;gap:8px;width:100%;text-align:left;background:transparent;color:inherit;font:inherit;padding:7px 10px;border:0;border-radius:0;overflow-wrap:anywhere;min-height:38px;}
     #folder-picker-list button:hover {background:var(--bg-selected);}
-    #folder-picker-message {padding:0 12px;color:var(--text-secondary);}
     /* Shared floating surfaces follow the workspace theme, including light palettes. */
     .modal {--bs-body-color: var(--text-primary);--bs-body-bg: var(--bg-main);--bs-border-color: var(--border-default);}
     .modal .table {--bs-table-color: var(--text-primary);--bs-table-bg: var(--bg-surface);--bs-table-border-color: var(--border-subtle);--bs-table-striped-color: var(--text-primary);--bs-table-striped-bg: var(--bg-hover);--bs-table-hover-color: var(--text-primary);--bs-table-hover-bg: var(--bg-selected);--bs-table-active-color: var(--text-primary);--bs-table-active-bg: var(--bg-selected);color: var(--text-primary);}
@@ -1045,6 +1074,7 @@ $workspaceThemeScript = <<<'JS'
     .modal input[type="file"]::file-selector-button {background: var(--bg-elevated);color: var(--text-primary);border-inline-end: 1px solid var(--border-default);transition: background 0.15s;}
     .modal input[type="file"]:hover:not(:disabled):not([readonly])::file-selector-button {background: var(--bg-hover);color: var(--text-primary);}
     .modal input[type="file"]:disabled::file-selector-button {background: var(--bg-elevated);color: var(--text-muted);}
+    .modal .modal-title > i, .dialog-title > i {color: var(--accent);}
     .modal .form-control:focus, .modal .form-select:focus {box-shadow: 0 0 0 2px var(--bg-selected);}
     .modal :is(.form-control, .form-select):disabled {background-color: var(--bg-deep);color: var(--text-secondary);border-color: var(--border-default);opacity: 1;}
     .modal .btn-primary {--bs-btn-bg: var(--accent);--bs-btn-border-color: var(--accent);--bs-btn-hover-bg: var(--accent-hover);--bs-btn-hover-border-color: var(--accent-hover);--bs-btn-active-bg: var(--accent-hover);--bs-btn-active-border-color: var(--accent-hover);color: var(--accent-contrast) !important;}
@@ -1535,7 +1565,7 @@ if ($isEditorSave) {
             if (!@rename($temporary, $filename)) throw new RuntimeException('Cannot replace original file. Your previous version is intact.');
             $temporary = null;
         }
-        $result = ['hash' => hash('sha256', $content), 'byte_length' => strlen($content), 'backup_created' => $content !== $original];
+        $result = ['hash' => hash('sha256', $content), 'byte_length' => strlen($content), 'backup_created' => $content !== $original, 'saved_time' => date('H:i:s')];
     } catch (Throwable $error) {
         if ($temporary && is_file($temporary)) @unlink($temporary);
         if (is_resource($lock)) { flock($lock, LOCK_UN); fclose($lock); }
@@ -1603,7 +1633,7 @@ $modeOptions = [
 ];
 
 $fileSize = strlen($fileContents);
-$lastModified = date("M j Y, H:i:s", filemtime($filename));
+$lastModified = fmModifiedDate(filemtime($filename), $config["date_format"]);
 $lineCount = substr_count($fileContents, "\n") + 1;
 ?>
 <!DOCTYPE html>
@@ -1761,7 +1791,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
 
 <body>
 
-    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong id="git-diff-heading">Git changes</strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
+    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong class="dialog-title"><i class="fas fa-code-branch" aria-hidden="true"></i> <span id="git-diff-heading">Git changes</span></strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
     <!-- ── Spinner ───────────────────────────────────────────────── -->
     <div id="spinner-overlay">
         <span class="tree-loading-spinner" aria-hidden="true"></span>
@@ -1837,7 +1867,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
     <dialog id="goto-dialog" aria-labelledby="goto-title"><form id="goto-form">
         <label id="goto-title" for="goto-line">Go to line</label>
         <input id="goto-line" type="number" min="1" step="1" required inputmode="numeric">
-        <div style="display:flex;justify-content:flex-end;gap:8px"><button type="button" id="goto-cancel">Cancel</button><button type="submit">Go</button></div>
+        <div style="display:flex;justify-content:flex-end;gap:8px"><button type="button" id="goto-cancel">Cancel</button><button type="submit" class="dialog-primary">Go</button></div>
     </form></dialog>
     <!-- Ace Editor -->
     <script src="https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ace.js"></script>
@@ -2061,7 +2091,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         function updateSaveStatus() {
             const status = document.getElementById('status-saved');
             status.dataset.state = savingFile ? 'saving' : hasUnsavedChanges ? 'unsaved' : 'saved';
-            status.textContent = savingFile ? 'Saving…' : hasUnsavedChanges ? 'Unsaved' : 'Saved' + (lastSavedAt ? ' ' + lastSavedAt.toLocaleTimeString('en-GB', {hour12:false}) : '');
+            status.textContent = savingFile ? 'Saving…' : hasUnsavedChanges ? 'Unsaved' : 'Saved' + (lastSavedAt ? ' ' + lastSavedAt : '');
         }
 
         // ── Theme / Mode / Font ───────────────────────────────────────
@@ -2232,7 +2262,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 notifyWorkspace();
                 window.setWorkspaceDocumentTitle(editorFilename, hasUnsavedChanges);
                 window.workspaceToast('File saved and verified.', 'Saved');
-                lastSavedAt = new Date();
+                lastSavedAt = result.saved_time || null;
             } catch (error) {
                 window.workspaceAlert(error.message || 'Save failed. Your edits remain in the tab.', 'Save failed');
             } finally {
@@ -2781,6 +2811,8 @@ function getFileOwnership($file)
 // Function to get directory contents
 function getDirectoryContents($dir, $sort = "name", $order = "asc")
 {
+    $keys = ['name'=>'name', 'size'=>'size_raw', 'last_modified'=>'modified_raw', 'extension'=>'extension', 'permissions'=>'permissions_octal', 'owner'=>'owner'];
+    $sort = is_string($sort) ? ($keys[$sort] ?? 'name') : 'name';
     $result = [];
     $cdir = scandir($dir);
 
@@ -2788,6 +2820,7 @@ function getDirectoryContents($dir, $sort = "name", $order = "asc")
         if (!in_array($value, [".", ".."])) {
             $fullPath = $dir . DIRECTORY_SEPARATOR . $value;
 
+            $modified = filemtime($fullPath);
             $fileInfo = [
                 "name" => $value,
                 "type" => is_dir($fullPath) ? "dir" : "file",
@@ -2795,7 +2828,8 @@ function getDirectoryContents($dir, $sort = "name", $order = "asc")
                 "size_raw" => is_dir($fullPath) ? 0 : filesize($fullPath),
                 "extension" => is_dir($fullPath) ? "" : pathinfo($value, PATHINFO_EXTENSION),
                 "date_added" => date($GLOBALS["config"]["date_format"], filectime($fullPath)),
-                "last_modified" => date($GLOBALS["config"]["date_format"], filemtime($fullPath)),
+                "last_modified" => fmModifiedDate($modified, $GLOBALS["config"]["date_format"]),
+                "modified_raw" => $modified,
                 "permissions" => getPermissions($fullPath),
                 "permissions_octal" => decoct(fileperms($fullPath) & 07777),
                 "icon" => getFileIcon($fullPath),
@@ -2810,17 +2844,10 @@ function getDirectoryContents($dir, $sort = "name", $order = "asc")
         if ($a["type"] != $b["type"]) {
             return $a["type"] == "dir" ? -1 : 1;
         }
-        $valA = $a[$sort];
-        $valB = $b[$sort];
-        if ($sort == "size") {
-            $valA = $a["size_raw"];
-            $valB = $b["size_raw"];
-        }
-        if ($order == "asc") {
-            return $valA <=> $valB;
-        } else {
-            return $valB <=> $valA;
-        }
+        $compare = $sort === 'extension' ? strcasecmp($a[$sort], $b[$sort]) : $a[$sort] <=> $b[$sort];
+        if (!$compare && $sort === 'owner') $compare = $a['group'] <=> $b['group'];
+        if (!$compare) $compare = $a['name'] <=> $b['name'];
+        return $order === 'desc' ? -$compare : $compare;
     });
 
     return $result;
@@ -3551,7 +3578,7 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
                     foreach ($iterator as $file) {
                         if (stripos($file->getFilename(), $query) !== false) {
                             $relativePath = str_replace($config["root_path"], "", $file->getPathname());
-                            $results[] = ["name" => $file->getFilename(), "path" => $relativePath, "type" => $file->isDir() ? "dir" : "file", "size" => $file->isDir() ? "" : formatSize($file->getSize()), "last_modified" => date($config["date_format"], $file->getMTime()), "icon" => getFileIcon($file->getPathname())];
+                            $results[] = ["name" => $file->getFilename(), "path" => $relativePath, "type" => $file->isDir() ? "dir" : "file", "size" => $file->isDir() ? "" : formatSize($file->getSize()), "last_modified" => fmModifiedDate($file->getMTime(), $config["date_format"]), "icon" => getFileIcon($file->getPathname())];
                         }
                     }
                 }
@@ -3773,8 +3800,8 @@ if (isset($_FILES["files"])) {
     exit();
 }
 
-$versionInfo = 'Pocket Code Studio v1.3.0';
-$version = '1.3.0';
+$versionInfo = 'Pocket Code Studio v1.3.1';
+$version = '1.3.1';
 
 if ($username == null) {
     $username = "";
@@ -3980,6 +4007,10 @@ if ($username == null) {
         .file-table-wrap {flex: 1;overflow-y: auto;padding: 0;}
         .file-table {width: 100%;border-collapse: collapse;font-size: 0.8rem;}
         .file-table thead th {background: var(--bg-surface);border-bottom: 1px solid var(--border-default);padding: 7px 10px;font-weight: 600;font-size: 0.72rem;text-transform: uppercase;letter-spacing: 0.06em;color: var(--text-muted);position: sticky;top: 0;z-index: 10;white-space: nowrap;}
+        .file-sort {padding:0;border:0;background:none;color:inherit;font:inherit;text-transform:inherit;letter-spacing:inherit;text-align:left;cursor:pointer;}
+        .file-sort:hover, .file-sort:focus-visible, th[aria-sort] > .file-sort {color:var(--accent);}
+        th[aria-sort="ascending"] > .file-sort::after {content:" ↑";}
+        th[aria-sort="descending"] > .file-sort::after {content:" ↓";}
         .file-table tbody tr.file-item {border-bottom: 1px solid var(--border-subtle);transition: background 0.1s;cursor: pointer;}
         .file-table tbody tr.file-item:hover {background: var(--bg-hover);}
         .file-table tbody tr.file-item.selected {background: var(--bg-selected);}
@@ -3987,6 +4018,7 @@ if ($username == null) {
         .checkbox-col {width: 32px;}
         .icon-col {width: 32px;padding-right: 0;}
         .file-name {color: var(--text-primary);text-decoration: none;font-weight: 500;}
+        .file-name-cell {max-width: min(24ch, 32vw);overflow-wrap: anywhere;}
         .file-name:hover {color: var(--text-primary);text-decoration: none;}
         .folder-icon {color: var(--folder-color);}
         .file-size, .file-date, .file-type {color: var(--text-secondary);font-size: 0.75rem;}
@@ -4080,7 +4112,7 @@ if ($username == null) {
             <button type="button" id="mobile-list-btn">List</button>
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file-circle-plus"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
@@ -4141,7 +4173,6 @@ if ($username == null) {
                 <a href="#" class="nav-links" id="select-all-btn"><i class="fas fa-check-square"></i> Select All</a>
                 <a href="#" class="nav-links disabled" id="unselect-all-btn"><i class="fas fa-square"></i> Unselect</a>
                 <a href="#" class="nav-links" id="view-trash-btn"><i class="fas fa-trash-alt"></i> Trash</a>
-                <a href="#" class="nav-links" id="sort-btn"><i class="fas fa-sort-amount-down"></i> Sort</a>
             </div>
 
             <!-- File table -->
@@ -4153,12 +4184,9 @@ if ($username == null) {
                                 <input type="checkbox" class="form-check-input" id="select-all-checkbox">
                             </th>
                             <th class="icon-col"></th>
-                            <th>Name</th>
-                            <th>Size</th>
-                            <th>Modified</th>
-                            <th>Type</th>
-                            <th>Permissions</th>
-                            <th>Owner / Group</th>
+                            <?php foreach (['name'=>'Name', 'size'=>'Size', 'last_modified'=>'Modified', 'extension'=>'Type', 'permissions'=>'Permissions', 'owner'=>'Owner / Group'] as $key => $label): ?>
+                                <th scope="col"<?= $key === 'name' ? ' aria-sort="ascending"' : '' ?>><button type="button" class="file-sort" data-sort="<?= $key ?>"><?= $label ?></button></th>
+                            <?php endforeach; ?>
                         </tr>
                     </thead>
                     <tbody id="files-list">
@@ -4187,13 +4215,13 @@ if ($username == null) {
 
     <div class="modal fade" id="editorHelpModal" tabindex="-1" aria-labelledby="editorHelpTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="editorHelpTitle">Editor help</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="editorHelpTitle"><i class="fas fa-keyboard me-2" aria-hidden="true"></i>Editor help</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
             <div class="modal-body">
                 <p>Click a folder in the sidebar to expand it; click a file to open an editor tab. Drag the sidebar border to resize it.</p>
                 <p><strong>Ctrl / ⌘ S</strong> — Save<br><strong>Ctrl / ⌘ Z</strong> — Undo<br><strong>Ctrl / ⌘ + click</strong> — Add cursor<br><strong>Escape</strong> — Return to one cursor<br><strong>Ctrl H</strong> — Find / Replace<br><strong>Shift Alt F</strong> — Format<br><strong>F11</strong> — Fullscreen</p>
                 <p>Choose a color theme in View. Use View to toggle the minimap and word wrap. Unsaved tabs show a dot.</p>
             </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
         </div></div>
     </div>
 
@@ -4226,8 +4254,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-box-open me-2 text-warning"></i>Extract Archive</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-box-open me-2"></i>Extract Archive</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Archive: <strong id="extractFileName"
@@ -4249,8 +4276,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-box-open" aria-hidden="true"></i>
                             <span>Extract</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4268,9 +4295,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-folder-plus me-2"
-                                style="color:var(--folder-color)"></i>Create New Folder</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-folder-plus me-2" aria-hidden="true"></i>Create New Folder</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <label class="form-label">Folder Name</label>
                         <input type="text" name="name" class="form-control" id="folderName" placeholder="my-new-folder"
@@ -4279,8 +4304,8 @@ if ($username == null) {
                         <input type="hidden" name="action" value="create_dir">
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-plus" aria-hidden="true"></i>
                             <span>Create</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4298,9 +4323,8 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-file-plus me-2" style="color:var(--accent)"></i>Create
-                            New File</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-file-circle-plus me-2"></i>Create
+                            New File</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">File Name</label>
@@ -4315,8 +4339,8 @@ if ($username == null) {
                             placeholder="// File contents..."></textarea>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-plus" aria-hidden="true"></i>
                             <span>Create</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4334,9 +4358,8 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-tag me-2" style="color:var(--accent)"></i>Rename Item
-                        </h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-tag me-2"></i>Rename Item
+                        </h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <label class="form-label">New Name</label>
                         <input type="text" name="new_name" class="form-control" id="newName">
@@ -4345,8 +4368,8 @@ if ($username == null) {
                         <input type="hidden" name="action" value="rename">
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-tag" aria-hidden="true"></i>
                             <span>Rename</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4364,9 +4387,8 @@ if ($username == null) {
             <div class="modal-content">
                 <form method="post" id="workspace-settings-form">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-cog me-2" style="color:var(--accent)"></i>File Manager
-                            Settings</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-cog me-2"></i>File Manager
+                            Settings</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label" for="settings-root">Workspace root</label>
@@ -4387,7 +4409,7 @@ if ($username == null) {
                         <div class="mb-3">
                             <label class="form-label">Date Format</label>
                             <input type="text" class="form-control" name="dateformat"
-                                value="<?= htmlspecialchars($config['date_format']) ?>" placeholder="M j Y, H:i:s"
+                                value="<?= htmlspecialchars($config['date_format']) ?>" placeholder="d M Y, H:i:s"
                                 required>
                             <div class="form-text">PHP date() format string</div>
                         </div>
@@ -4406,8 +4428,8 @@ if ($username == null) {
                         <p class="form-text mb-0" id="settings-result" role="status" aria-live="polite"></p>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-floppy-disk" aria-hidden="true"></i>
                             <span>Save Settings</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4426,9 +4448,8 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-shield-alt me-2" style="color:var(--accent)"></i>Change
-                            Permissions</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-shield-alt me-2"></i>Change
+                            Permissions</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Item: <span id="permItem"
@@ -4490,8 +4511,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-check" aria-hidden="true"></i>
                             <span>Apply</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4509,9 +4530,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-file-archive me-2"
-                                style="color:var(--accent-warning)"></i>Compress Items</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-file-archive me-2"></i>Compress Items</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Archive Name</label>
@@ -4536,8 +4555,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-file-archive" aria-hidden="true"></i>
                             <span>Compress</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4555,9 +4574,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-trash me-2"
-                                style="color:var(--accent-danger)"></i>Confirm Delete</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-trash me-2"></i>Confirm Delete</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Are you sure you want to delete the
                             selected item(s)?</p>
@@ -4579,8 +4596,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-trash" aria-hidden="true"></i>
                             <span id="deleteButtonText">Move to Trash</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4604,22 +4621,30 @@ if ($username == null) {
                 <a id="phone-file-link" target="_blank" rel="noopener noreferrer" style="overflow-wrap:anywhere"></a>
                 <p class="form-text mt-2">Opens the saved file on the website, just like Open in browser.</p>
             </div>
-            <div class="modal-footer"><button type="button" id="phone-copy-link" class="btn btn-primary">Copy link</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+            <div class="modal-footer"><button type="button" id="phone-copy-link" class="btn btn-primary"><i class="fas fa-copy me-2" aria-hidden="true"></i>Copy link</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
         </div></div>
     </div>
 
-    <dialog id="folder-picker" aria-labelledby="folder-picker-title">
-        <div class="folder-picker-head"><strong id="folder-picker-title">Choose folder</strong><span id="folder-picker-path"></span>
-        <button type="button" id="folder-picker-home">Home</button><button type="button" id="folder-picker-up">Up</button><button type="button" id="folder-picker-website">Website folder</button></div>
-        <div id="folder-picker-list"></div><p id="folder-picker-message" role="status"></p>
-        <div class="folder-picker-footer" style="justify-content:flex-end"><button type="button" id="folder-picker-cancel">Cancel</button><button type="button" id="folder-picker-use">Use this folder</button></div>
+    <dialog id="folder-picker" class="modal-dialog modal-content" aria-labelledby="folder-picker-title">
+        <div class="modal-header">
+            <h5 class="modal-title"><i class="fas fa-folder-open" aria-hidden="true"></i> <span id="folder-picker-title">Choose folder</span></h5><button type="button" class="btn-close" id="folder-picker-close" aria-label="Close"></button></div>
+        <div class="modal-body">
+            <div class="folder-picker-nav">
+                <button type="button" id="folder-picker-home"><i class="fas fa-home" aria-hidden="true"></i> Home</button>
+                <button type="button" id="folder-picker-up"><i class="fas fa-level-up-alt" aria-hidden="true"></i> Up</button>
+                <button type="button" id="folder-picker-reload"><i class="fas fa-sync-alt" aria-hidden="true"></i> Reload</button>
+                <input id="folder-picker-path" type="text" aria-label="Current folder path" readonly>
+            </div>
+            <div id="folder-picker-list"></div><p id="folder-picker-message" class="mb-0" role="status"></p>
+        </div>
+        <div class="modal-footer"><button type="button" id="folder-picker-cancel" class="btn btn-secondary"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" id="folder-picker-use" class="btn btn-primary"><i class="fas fa-check me-2" aria-hidden="true"></i>Use this folder</button></div>
     </dialog>
 
     <div class="modal fade" id="uploadReplaceModal" tabindex="-1" aria-labelledby="uploadReplaceTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle">Replace existing files?</h5></div>
+            <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle"><i class="fas fa-copy me-2" aria-hidden="true"></i>Replace existing files?</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
             <div class="modal-body"><p>These files already exist in the destination folder. Replace them with the uploaded versions?</p><ul id="upload-replace-names" style="max-height:40vh;overflow:auto;overflow-wrap:anywhere"></ul></div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="upload-replace-confirm">Replace</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" class="btn btn-primary" id="upload-replace-confirm"><i class="fas fa-right-left me-2" aria-hidden="true"></i>Replace</button></div>
         </div></div>
     </div>
 
@@ -4636,7 +4661,11 @@ if ($username == null) {
                         <label class="form-label" for="github-token">GitHub token</label><input id="github-token" name="token" type="password" class="form-control" autocomplete="new-password" placeholder="Leave blank to keep the saved token">
                         <p id="github-token-state" class="form-text"></p>
                         <p class="form-text"><a href="https://github.com/settings/personal-access-tokens/new?name=Pocket%20Code%20Studio&amp;contents=write&amp;expires_in=90" target="_blank" rel="noopener noreferrer"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Create GitHub token</a> — choose Only select repositories and select your repository.</p>
-                        <p class="form-text">Use a fine-grained token for this repository with Contents: Read and write. Workflow files may also require Workflows permission. Stored privately on this server, never in the repository.</p>
+                        <ul class="form-text list-unstyled d-grid gap-1">
+                            <li><i class="fas fa-key fa-fw me-2" aria-hidden="true"></i>Fine-grained token: Contents → Read and write.</li>
+                            <li><i class="fas fa-code-branch fa-fw me-2" aria-hidden="true"></i>Workflow files may also require Workflows permission.</li>
+                            <li><i class="fas fa-lock fa-fw me-2" aria-hidden="true"></i>Stored privately on this server, outside the repository.</li>
+                        </ul>
                         <label class="form-check-label mb-2"><input type="checkbox" name="remove_token" value="1" class="form-check-input"> Remove saved token</label><br>
                         <button type="submit" class="btn btn-secondary">Save connection</button>
                     </form>
@@ -4647,7 +4676,7 @@ if ($username == null) {
                 <label class="form-label mt-2" for="github-message">Commit message</label><textarea id="github-message" class="form-control" rows="2" maxlength="4000"></textarea>
                 <p id="github-feedback" class="form-text mt-2" role="status" aria-live="polite" style="white-space:pre-line;overflow-wrap:anywhere"></p>
             </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" id="github-refresh">Refresh</button><button type="button" class="btn btn-secondary" id="github-push">Push existing commits</button><button type="button" class="btn btn-primary" id="github-commit">Commit &amp; Push</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" id="github-refresh"><i class="fas fa-sync-alt me-2" aria-hidden="true"></i>Refresh</button><button type="button" class="btn btn-secondary" id="github-push"><i class="fas fa-upload me-2" aria-hidden="true"></i>Push existing commits</button><button type="button" class="btn btn-primary" id="github-commit"><i class="fas fa-code-branch me-2" aria-hidden="true"></i>Commit &amp; Push</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
         </div></div>
     </div>
 
@@ -4670,28 +4699,31 @@ if ($username == null) {
                 </form>
                 <p id="login-activity-feedback" class="form-text mt-2 mb-0" role="status"></p>
             </div>
-            <div class="modal-footer"><button type="button" class="btn btn-secondary" id="login-activity-refresh">Refresh</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button></div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" id="login-activity-refresh"><i class="fas fa-sync-alt me-2" aria-hidden="true"></i>Refresh</button><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
         </div></div>
     </div>
 
     <div class="modal fade" id="updateEditorModal" tabindex="-1" aria-labelledby="update-editor-title" data-bs-backdrop="static"><div class="modal-dialog"><div class="modal-content">
         <div class="modal-header"><h5 class="modal-title" id="update-editor-title"><i class="fas fa-cloud-arrow-up me-2" aria-hidden="true"></i>Update editor</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-        <div class="modal-body"><p>Choose a trusted Pocket Code Studio PHP release. Your current filename, password and settings will be preserved. A private backup is created before replacement.</p>
+        <div class="modal-body"><ul class="list-unstyled d-grid gap-2 mb-3">
+                <li><i class="fas fa-file-code fa-fw me-2" aria-hidden="true"></i>Choose a trusted Pocket Code Studio PHP release.</li>
+                <li><i class="fas fa-lock fa-fw me-2" aria-hidden="true"></i>Keep your filename, password and settings.</li>
+                <li><i class="fas fa-box-archive fa-fw me-2" aria-hidden="true"></i>Create a private backup before replacing the editor.</li>
+            </ul>
             <label for="update-editor-file" class="form-label">PHP release (maximum 4 MiB)</label><input id="update-editor-file" class="form-control" type="file" accept=".php">
             <p id="update-editor-feedback" class="mt-3 mb-0" role="status" aria-live="polite"></p>
             <section id="update-editor-notes" class="mt-3 overflow-auto" style="max-height: 30vh" aria-label="What's new" aria-live="polite" hidden></section>
-        </div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="button" class="btn btn-primary" id="update-editor-check">Upload and check</button><button type="button" class="btn btn-primary" id="update-editor-install" hidden>Update and reload</button></div>
+        </div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" class="btn btn-primary" id="update-editor-check"><i class="fas fa-upload me-2" aria-hidden="true"></i>Upload and check</button><button type="button" class="btn btn-primary" id="update-editor-install" hidden><i class="fas fa-sync-alt me-2" aria-hidden="true"></i>Update and reload</button></div>
     </div></div></div>
 
-    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong id="git-diff-heading">Git changes</strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
+    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong class="dialog-title"><i class="fas fa-code-branch" aria-hidden="true"></i> <span id="git-diff-heading">Git changes</span></strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-lg">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h5 class="modal-title"><i class="fas fa-search me-2" style="color:var(--accent)"></i>Search Results
-                    </h5>
-                </div>
+                    <h5 class="modal-title"><i class="fas fa-search me-2"></i>Search Results
+                    </h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                 <div class="modal-body" style="padding:0">
                     <div class="table-responsive">
                         <table class="table table-hover mb-0" id="search-results-table">
@@ -4714,7 +4746,7 @@ if ($username == null) {
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-danger" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button>
                 </div>
             </div>
         </div>
@@ -4726,8 +4758,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title" id="fileOpTitle">File Operation</h5>
-                    </div>
+                        <h5 class="modal-title"><i id="fileOpIcon" class="fas fa-copy me-2" aria-hidden="true"></i><span id="fileOpTitle">File Operation</span></h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <input type="hidden" name="action" id="fileOpType" value="copy">
                         <div class="mb-3" id="fileOpItems" style="font-size:0.8rem;color:var(--text-secondary)"></div>
@@ -4742,8 +4773,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-check" aria-hidden="true"></i>
                             <span>Execute</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4764,9 +4795,7 @@ if ($username == null) {
                     <input type="hidden" name="items" id="restoreItems">
                     <input type="hidden" name="action" value="restore">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-undo me-2"
-                                style="color:var(--accent-success)"></i>Restore Items</h5>
-                    </div>
+                        <h5 class="modal-title"><i class="fas fa-undo me-2"></i>Restore Items</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Restore selected items to their
                             original locations?</p>
@@ -4777,8 +4806,8 @@ if ($username == null) {
                         </div>
                     </div>
                     <div class="modal-footer">
-                        <button type="button" class="btn btn-danger" data-bs-dismiss="modal">Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2">
+                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-undo" aria-hidden="true"></i>
                             <span>Restore</span>
                             <div class="spinner-container my-indicator">
                                 <div class="spinners"></div>
@@ -4796,11 +4825,10 @@ if ($username == null) {
         var SERVER_ROOT_PATH = <?= json_encode($config['root_path'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const PUBLIC_WORKSPACE_BASE = <?= json_encode($publicWorkspaceBase, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const PUBLIC_WEBSITE_PREFIX = <?= json_encode($publicWebsitePrefix, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
-        const WEBSITE_FOLDER = <?= json_encode(realpath($_SERVER['DOCUMENT_ROOT']), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
     </script>
 
     <div class="modal fade" id="aboutPocketModal" tabindex="-1" aria-labelledby="aboutPocketTitle" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
-        <div class="modal-header"><h5 class="modal-title" id="aboutPocketTitle">Pocket Code Studio</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-header"><h5 class="modal-title" id="aboutPocketTitle"><i class="fas fa-circle-info me-2" aria-hidden="true"></i>Pocket Code Studio</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
         <div class="modal-body"><p>A single-file PHP workspace maintained by <a href="https://github.com/Renat2985" target="_blank" rel="noopener noreferrer">Renat2985</a>.</p>
         <p><a href="https://github.com/Renat2985/pocket-code-studio" target="_blank" rel="noopener noreferrer">Project, documentation &amp; issues</a></p>
         <p>Based on Joseph Chuks’ <a href="https://github.com/JosephChuks/php-file-manager-with-code-editor" target="_blank" rel="noopener noreferrer">PHP File Manager</a> and <a href="https://github.com/JosephChuks/cwp-codeEditor" target="_blank" rel="noopener noreferrer">CWP Code Editor</a>. Editor powered by Ace; icons from Material Icon Theme and Seti UI.</p>
@@ -4876,9 +4904,8 @@ if ($username == null) {
             try { browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch (_) {}
             function updateTimezonePreview() {
                 try {
-                    timezonePreview.textContent = 'Current time: ' + new Intl.DateTimeFormat('en-GB', {
-                        timeZone: timezoneSelect.value, year: 'numeric', month: 'short', day: '2-digit',
-                        hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', timeZoneName: 'short'
+                    timezonePreview.textContent = 'Current time: Today, ' + new Intl.DateTimeFormat('en-GB', {
+                        timeZone: timezoneSelect.value, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
                     }).format(new Date());
                 } catch (_) { timezonePreview.textContent = 'Time preview is unavailable for this timezone.'; }
                 const supported = browserTimezone && [...timezoneSelect.options].some(option => option.value === browserTimezone);
@@ -5102,7 +5129,8 @@ if ($username == null) {
             const loginActivityFeedback = document.getElementById('login-activity-feedback');
             const loginPolicyForm = document.getElementById('login-policy-form');
             let loginActivityBusy = false, loginActivityClock = null, loginActivityOffset = 0;
-            const loginDate = timestamp => timestamp ? new Date(timestamp * 1000).toLocaleString('en-GB') : '—';
+            let loginDisplayDates = {};
+            const loginDate = timestamp => loginDisplayDates[timestamp] || '—';
             const loginResultLabels = {success:'Success', wrong_password:'Wrong password', blocked:'Blocked', limit_reset:'Limit reset', global_limit_reset:'Global limit reset', policy_changed:'Limits changed'};
             function updateLoginActivityTimers() {
                 const now = Date.now() / 1000 + loginActivityOffset;
@@ -5126,6 +5154,7 @@ if ($username == null) {
                 panel.append(events);
             }
             function renderLoginActivity(data) {
+                loginDisplayDates = data.display_dates || {};
                 loginActivityOffset = data.now - Date.now() / 1000;
                 document.getElementById('login-activity-summary').textContent = 'Failures (24h): ' + data.failures_24h + ' · Blocked IPs: ' + data.blocked_ips + ' · Last success: ' + loginDate(data.last_success);
                 const global = document.getElementById('login-global-limit'); global.hidden = !data.global_blocked_until; global.replaceChildren();
@@ -5143,9 +5172,14 @@ if ($username == null) {
                     const values = [item.ip + (item.ip === data.current_ip ? ' (you)' : ''),loginDate(item.last),String(item.failures)];
                     values.forEach(value => { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); });
                     const state = document.createElement('td');
-                    if (item.blocked_until || data.global_blocked_until) {
+                    const blocked = Boolean(item.blocked_until || data.global_blocked_until);
+                    const icon = document.createElement('i');
+                    icon.className = blocked ? 'fas fa-ban me-2' : 'fas fa-circle-check me-2';
+                    icon.setAttribute('aria-hidden', 'true');
+                    state.append(icon);
+                    if (blocked) {
                         const badge = document.createElement('span'); badge.dataset.loginUntil = item.blocked_until || data.global_blocked_until; badge.dataset.loginScope = item.blocked_until ? 'ip' : 'global'; badge.style.color = 'var(--accent-warning)'; state.append(badge);
-                    } else state.textContent = 'Allowed';
+                    } else { const label = document.createElement('span'); label.textContent = 'Allowed'; state.append(label); }
                     row.append(state);
                     const actions = document.createElement('td');
                     if (item.attempts > 0) {
@@ -5187,16 +5221,18 @@ if ($username == null) {
             const pickerMessage = document.getElementById('folder-picker-message');
             const pickerUse = document.getElementById('folder-picker-use');
             const pickerUp = document.getElementById('folder-picker-up');
+            const pickerPath = document.getElementById('folder-picker-path');
             let pickerScope, pickerTarget, pickerFolder, pickerParent, pickerRequest = 0;
             async function loadPickerFolder(folder) {
                 const request = ++pickerRequest;
+                pickerPath.value = folder;
                 pickerUse.disabled = true; pickerUp.disabled = true;
                 window.workspaceLoading(pickerMessage, 'Loading folders…'); pickerList.replaceChildren();
                 try {
                     const data = await requestWorkspace('browse_folders', {scope: pickerScope, folder});
                     if (request !== pickerRequest || !folderPicker.open) return;
                     pickerFolder = data.folder; pickerParent = data.parent;
-                    document.getElementById('folder-picker-path').textContent = pickerFolder;
+                    pickerPath.value = pickerFolder;
                     pickerUp.disabled = pickerParent === null; pickerUse.disabled = false;
                     pickerMessage.textContent = data.folders.length ? '' : 'No subfolders. You can select this folder.';
                     data.folders.forEach(item => {
@@ -5215,16 +5251,16 @@ if ($username == null) {
                 pickerScope = scope; pickerTarget = input; pickerFolder = null; pickerParent = null;
                 (input.closest('.modal') || document.body).append(folderPicker);
                 document.getElementById('folder-picker-title').textContent = scope === 'server' ? 'Choose workspace folder' : 'Choose destination folder';
-                document.getElementById('folder-picker-website').hidden = scope !== 'server';
                 folderPicker.showModal();
                 loadPickerFolder(input.value || (scope === 'server' ? SERVER_ROOT_PATH : '/'));
             }
             document.getElementById('browse-workspace').addEventListener('click', () => openFolderPicker(document.getElementById('settings-root'), 'server'));
             document.getElementById('browse-destination').addEventListener('click', () => openFolderPicker(document.getElementById('destinationPath'), 'workspace'));
             document.getElementById('folder-picker-home').addEventListener('click', () => loadPickerFolder(pickerScope === 'server' ? SERVER_ROOT_PATH : '/'));
-            document.getElementById('folder-picker-website').addEventListener('click', () => loadPickerFolder(WEBSITE_FOLDER));
+            document.getElementById('folder-picker-reload').addEventListener('click', () => loadPickerFolder(pickerPath.value));
             pickerUp.addEventListener('click', () => { if (pickerParent !== null) loadPickerFolder(pickerParent); });
             document.getElementById('folder-picker-cancel').addEventListener('click', () => folderPicker.close());
+            document.getElementById('folder-picker-close').addEventListener('click', () => folderPicker.close());
             pickerUse.addEventListener('click', () => {
                 if (pickerUse.disabled) return;
                 pickerTarget.value = pickerFolder;
@@ -5359,6 +5395,17 @@ if ($username == null) {
                     document.querySelectorAll('[data-git-path]').forEach(element => appendBadge(element,element.dataset.gitPath));
                 } catch (_) { /* Ordinary file browsing remains available without Git. */ }
             }
+            function shortFileName(name, isDirectory) {
+                const chars = Array.from(name), limit = 20;
+                if (chars.length <= limit) return name;
+                const dot = isDirectory ? -1 : name.lastIndexOf('.');
+                const suffix = dot > 0 ? name.slice(dot) : '';
+                const suffixLength = Array.from(suffix).length;
+                if (suffixLength && suffixLength < limit - 1) {
+                    return chars.slice(0, limit - 1 - suffixLength).join('') + '…' + suffix;
+                }
+                return chars.slice(0, limit - 1).join('') + '…';
+            }
             function showFiles(files) {
                 const tbody = document.getElementById('files-list');
 
@@ -5372,10 +5419,10 @@ if ($username == null) {
                 }
 
                 tbody.innerHTML = files.map(file => `
-                <tr class="file-item" data-name="${file.name}" data-type="${file.type}">
+                <tr class="file-item">
                     <td class="checkbox-col"><input type="checkbox" class="form-check-input item-check"></td>
                     <td class="icon-col">${file.name === 'public_html' ? "<i class='fas fa-globe' style='color:var(--accent)'></i>" : file.icon}</td>
-                    <td><a href="#" class="file-name">${file.name}</a></td>
+                    <td class="file-name-cell"><a href="#" class="file-name"><span class="file-name-label"></span></a></td>
                     <td class="file-size">${file.size}</td>
                     <td class="file-date">${file.last_modified}</td>
                     <td class="file-type">${file.type === 'dir' ? 'directory' : getMimeType(file.name)}</td>
@@ -5385,6 +5432,13 @@ if ($username == null) {
 
                 document.querySelectorAll('#files-list .file-item').forEach((row, index) => {
                     const file = files[index], cell = row.querySelector('.file-ownership');
+                    row.dataset.name = file.name;
+                    row.dataset.type = file.type;
+                    const label = row.querySelector('.file-name-label');
+                    label.textContent = shortFileName(file.name, file.type === 'dir');
+                    const link = label.parentElement;
+                    link.title = file.name;
+                    link.setAttribute('aria-label', file.name);
                     cell.textContent = (file.owner ?? '—') + ':' + (file.group ?? '—');
                     cell.title = 'Owner: ' + (file.owner ?? '—') + ' (UID ' + (file.uid ?? 'unknown') + ') · Group: ' + (file.group ?? '—') + ' (GID ' + (file.gid ?? 'unknown') + ')';
                 });
@@ -5600,7 +5654,7 @@ if ($username == null) {
                             button.addEventListener('click', () => {
                                 document.querySelectorAll('#directory-tree .folder-item.active').forEach(el => el.classList.remove('active'));
                                 button.classList.add('active');
-                                openFileEditor(item.name, item.path.substring(0, item.path.lastIndexOf('/')));
+                                openFileEditor(item.name, item.path.substring(0, item.path.lastIndexOf('/')), null, true, true);
                             });
                             li.append(button);
                         }
@@ -5733,11 +5787,15 @@ if ($username == null) {
                 e.preventDefault();
                 navigateToPath('/.trash');
             });
-            document.getElementById('sort-btn').addEventListener('click', e => {
-                e.preventDefault();
-                currentOrder = currentOrder === 'asc' ? 'desc' : 'asc';
+            const sortHeaders = document.querySelectorAll('.file-sort');
+            sortHeaders.forEach(button => button.addEventListener('click', () => {
+                const sort = button.dataset.sort;
+                currentOrder = sort === currentSort && currentOrder === 'asc' ? 'desc' : 'asc';
+                currentSort = sort;
+                sortHeaders.forEach(header => header.parentElement.removeAttribute('aria-sort'));
+                button.parentElement.setAttribute('aria-sort', currentOrder === 'asc' ? 'ascending' : 'descending');
                 loadFileList();
-            });
+            }));
 
             // ── Select all ────────────────────────────────────────────
             document.getElementById('select-all-checkbox').addEventListener('change', function() {
@@ -5927,6 +5985,7 @@ if ($username == null) {
                 if (selection.target && selection.names[0].includes(',')) { showAlert('Cannot ' + op, 'Files containing commas cannot use this operation.'); return; }
                 setEditorFileTarget('fileOperationModal', selection);
                 document.getElementById('fileOpTitle').textContent = op === 'copy' ? 'Copy Items' : 'Move Items';
+                document.getElementById('fileOpIcon').className = 'fas me-2 ' + (op === 'copy' ? 'fa-copy' : 'fa-arrows-alt');
                 document.getElementById('fileOpType').value = op;
                 document.getElementById('destinationPath').value = selection.directory || '/';
                 document.getElementById('copyPath').value = selection.directory;
@@ -6090,9 +6149,21 @@ if ($username == null) {
                     return items.length ? [{version, number, items}] : [];
                 }).sort((a,b) => compare(b.number,a.number));
             }
+            function updateIconLine(tag, icon, text) {
+                const line = document.createElement(tag);
+                const symbol = document.createElement('i');
+                symbol.className = 'fas fa-fw me-2 ' + icon;
+                symbol.setAttribute('aria-hidden', 'true');
+                line.append(symbol, document.createTextNode(text));
+                return line;
+            }
             async function showUpdateNotes(version) {
                 const request = ++updateNotesRequest;
                 updateNotes.hidden = false;
+                if (version === installedVersion) {
+                    updateNotes.replaceChildren(updateIconLine('p', 'fa-circle-info', 'Same version. There are no newer release notes to compare.'));
+                    return;
+                }
                 window.workspaceLoading(updateNotes, 'Loading release notes…');
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), 8000);
@@ -6101,8 +6172,7 @@ if ($username == null) {
                     if (!response.ok) throw new Error('Release notes unavailable');
                     const notes = releaseNotesBetween(await response.text(), installedVersion, version);
                     if (request !== updateNotesRequest) return;
-                    const heading = document.createElement('h6');
-                    heading.textContent = "What's new · " + installedVersion + ' → ' + version;
+                    const heading = updateIconLine('h6', 'fa-list', "What's new");
                     updateNotes.replaceChildren(heading);
                     if (!notes.some(note => note.version === version)) {
                         const hint = document.createElement('p');
@@ -6140,7 +6210,11 @@ if ($username == null) {
                     const data = await requestWorkspace('editor_update', body);
                     if (install) { updateFeedback.textContent = data.message; location.reload(); return; }
                     updateToken = data.token; updateInstall.hidden = false;
-                    updateFeedback.textContent = 'Release ' + installedVersion + ' → ' + data.version + ' · ' + data.filename + ' · PHP ' + data.php + '. ' + data.message;
+                    updateFeedback.replaceChildren(
+                        updateIconLine('span', 'fa-circle-check', 'Syntax and PHP compatibility checked.'),
+                        document.createElement('br'),
+                        updateIconLine('span', 'fa-code-branch', installedVersion + ' → ' + data.version + ' · ' + data.filename + ' · PHP ' + data.php)
+                    );
                     void showUpdateNotes(data.version);
                 } catch (error) { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = error.message; }
                 finally { updateBusy = false; updateModal.querySelectorAll('button,input').forEach(control => control.disabled = false); }
@@ -6367,7 +6441,11 @@ if ($username == null) {
                 const name = activeEditorPath ? activeEditorPath.split('/').pop() : 'Files';
                 window.setWorkspaceDocumentTitle(name, activeEditorPath !== null && !!editorTabs.get(activeEditorPath)?.dirty);
             }
-            function activateTab(path) {
+            function activateTab(path, keepTreeSelection = false) {
+                if (!keepTreeSelection) {
+                    hideContextMenu();
+                    document.querySelectorAll('#directory-tree .tree-file.active').forEach(button => button.classList.remove('active'));
+                }
                 openRequestSerial++;
                 document.body.classList.toggle('mobile-editor', path !== null);
                 document.body.classList.remove('mobile-file-list');
@@ -6545,19 +6623,19 @@ if ($username == null) {
                 const full = SERVER_ROOT_PATH + (directory.startsWith('/') ? directory : '/' + directory);
                 return full.replace(/\/+$/, '') + '/' + name;
             }
-            function openFileEditor(name, directory = currentPath, savedLocation = null, activate = true) {
+            function openFileEditor(name, directory = currentPath, savedLocation = null, activate = true, keepTreeSelection = false) {
                 const path = editorFilePath(name, directory);
                 const serial = activate ? ++openRequestSerial : null;
                 if (editorTabs.has(path)) {
-                    if (activate) activateTab(path);
+                    if (activate) activateTab(path, keepTreeSelection);
                     return Promise.resolve();
                 }
                 const pending = pendingEditorOpens.get(path);
                 if (pending) {
-                    if (activate) pending.serial = serial;
+                    if (activate) { pending.serial = serial; pending.keepTreeSelection = keepTreeSelection; }
                     return pending.promise;
                 }
-                const entry = {serial, promise: null};
+                const entry = {serial, keepTreeSelection, promise: null};
                 entry.promise = (async () => {
                     try {
                         const response = await fetch(window.location.pathname + '?editor=1&check=1&filename=' + encodeURIComponent(path));
@@ -6565,7 +6643,7 @@ if ($username == null) {
                         try { result = await response.json(); }
                         catch (_) { throw new Error('Could not check this file. Reload the page and try again.'); }
                         if (!response.ok || result.status !== 'success') throw new Error(result.message || 'Cannot open this file.');
-                        createEditorTab(name, directory, savedLocation, entry.serial !== null && entry.serial === openRequestSerial);
+                        createEditorTab(name, directory, savedLocation, entry.serial !== null && entry.serial === openRequestSerial, entry.keepTreeSelection);
                     } catch (error) {
                         window.workspaceAlert(error.message || 'Cannot open this file.', 'Cannot open file', 'warning');
                     } finally { pendingEditorOpens.delete(path); }
@@ -6573,10 +6651,10 @@ if ($username == null) {
                 pendingEditorOpens.set(path, entry);
                 return entry.promise;
             }
-            function createEditorTab(name, directory, savedLocation, activate = true) {
+            function createEditorTab(name, directory, savedLocation, activate = true, keepTreeSelection = false) {
                 const path = editorFilePath(name, directory);
                 if (editorTabs.has(path)) {
-                    if (activate) activateTab(path);
+                    if (activate) activateTab(path, keepTreeSelection);
                     return;
                 }
                 const id = 'editor-panel-' + (++nextTabId);
@@ -6656,7 +6734,7 @@ if ($username == null) {
                     scheduleSaveTabs();
                 });
                 if (activate) {
-                    activateTab(path);
+                    activateTab(path, keepTreeSelection);
                     button.scrollIntoView({block: 'nearest', inline: 'nearest'});
                 } else {
                     refreshMobileTabs(); scheduleSaveTabs();

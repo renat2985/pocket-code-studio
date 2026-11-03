@@ -2,6 +2,26 @@
 
 Each ZIP contains the complete editor release. Entries describe changes from the preceding archived version; the oldest entry summarizes the baseline.
 
+## 1.3.1
+
+Archive: `pocket-code-studio-1.3.1.zip`
+
+- Keep the sidebar file highlighted when opened from the tree, and clear that highlight when switching tabs.
+- Show dates in day–month–year order with a two-digit day, and label recent file changes Today or Yesterday.
+- Shorten long file and folder names in the file list while preserving ordinary file extensions and full names on hover.
+- Add missing dialog title icons and use the active theme accent throughout.
+- Use workspace date and time settings in login activity and show monochrome icons for allowed and blocked IPs.
+- Match folder picker navigation icons to the file manager and align folder icons with their names.
+- Use the theme accent for primary dialog actions and consistent styling for Cancel buttons.
+- Sort the file list by clicking column headers; sort sizes and modification times by their raw values.
+- Match Copy, Move, and file creation command icons to their dialog headers.
+- Restore the New File icon and use the theme accent in both file and folder creation dialogs.
+- Match the folder picker toolbar to the file manager with Home, Up, Reload and a path field, and remove the separate Website folder shortcut.
+- Make update and GitHub dialogs easier to scan with shorter text and monochrome icons.
+- Add action icons to modal and folder picker footer buttons, and emphasize folder picker actions with semibold labels.
+- Use shared modal headers and footers in the folder picker.
+- Add a close button to every modal header, including the folder picker.
+
 ## 1.3.0
 
 Archive: `pocket-code-studio-1.3.0.zip`
