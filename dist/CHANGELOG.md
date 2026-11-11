@@ -2,6 +2,18 @@
 
 Each ZIP contains the complete editor release. Entries describe changes from the preceding archived version; the oldest entry summarizes the baseline.
 
+## 1.4.0
+
+Archive: `pocket-code-studio-1.4.0.zip`
+
+- Browse file history from Tools or a file's context menu, compare a saved copy inline, and restore it into the editor for review before saving.
+- Compare open files, including unsaved edits, against Git HEAD inline. See Git status colors for changed files and folders in the file list and sidebar.
+- Search filenames as you type, use wildcards, or prefix a query with `%` to search file contents and jump to a matching line.
+- Remember the current folder and expanded sidebar folders per workspace. On mobile, open the file manager from Files and switch or close files from the tab selector.
+- Check GitHub for a newer editor version and download the update when one is available.
+- Connect multiple sites through the optional Codex module, each with its own token and deployment history. Copy setup instructions, upload text and binary files, and review changes and upload results.
+- Show the latest Codex deployment and later edits in the file list and sidebar. Track editor saves and verified uploads awaiting sync, and pull those changes with the `sync` shortcut.
+
 ## 1.3.1
 
 Archive: `pocket-code-studio-1.3.1.zip`

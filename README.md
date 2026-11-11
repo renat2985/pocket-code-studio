@@ -38,6 +38,8 @@ No database, Composer, or Node.js build is required.
 
 ## Installation
 
+[Optional Codex module](docs/codex-module.md)
+
 1. Upload **`filemanager.php`** — no other application files are needed.
 2. The initial workspace is the web server document root; change it with **File → Settings → Workspace root → Browse…**.
 3. Open the file over HTTPS. The initial password is **`admin123`**, with no username.
@@ -59,7 +61,7 @@ Keep your personal password hash and settings when replacing the PHP file. Do no
 - **View → Emmet (HTML):** enabled by default for HTML/HTM. Expand `.test`, `ul>li*3`, or `!` with Tab; the opt-out is remembered.
 - **View → Show Changes Since Save:** highlight unsaved additions and deletions; reset the comparison after a verified save.
 - **View → Color theme:** 43 Ace themes; the interface follows the selected theme. Language and editor font size are in the bottom status bar.
-- **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `M j Y, H:i:s`.
+- **File → Settings:** timezone, date format, interface font size, and optional password change. Browser timezone detection is available. Default date format: `d M Y, H:i:s`.
 - **Browse…** in Copy/Move selects an existing destination folder inside the workspace. The workspace picker can explore other folders permitted by PHP and hosting restrictions. Save open edits before switching roots.
 - **Save Settings** saves all changes together; **Cancel** discards them. Leave password fields empty to keep the current password.
 
@@ -94,3 +96,5 @@ Based on [Joseph Chuks’ PHP File Manager](https://github.com/JosephChuks/php-f
 Bugs and requests: [GitHub Issues](https://github.com/Renat2985/pocket-code-studio/issues). Installation and custom development: [Renat2985](https://github.com/Renat2985).
 
 Manual updates: **Tools → Update editor…** → upload a trusted PHP release → check → update. The installed filename, password and settings are preserved; a private backup is created.
+
+- **File history:** open from Tools or a file context menu to compare private save backups inline or restore a copy into the editor before saving. Copies use temporary server storage.

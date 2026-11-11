@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pocket Code Studio v1.3.1
+ * Pocket Code Studio v1.4.0
  * Minimum PHP: 7.4
  * A single-file PHP file manager and browser-based code editor.
  * Maintained by Renat2985 — https://github.com/Renat2985/pocket-code-studio
@@ -589,6 +589,36 @@ if ($isPostRequest && ($_POST['action'] ?? '') === 'login_activity') {
 }
 
 
+if ($isPostRequest && ($_POST['action'] ?? '') === 'file_history') {
+    try {
+        $root = realpath($config['root_path']);
+        $requested = $_POST['file'] ?? null;
+        $file = is_string($requested) ? realpath($requested) : false;
+        if (!$root || !$file || !is_file($file) || strpos($file, rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR) !== 0) throw new RuntimeException('Invalid history file.');
+        $directory = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/fm-editor-' . substr(hash('sha256', __FILE__ . '|' . $root), 0, 24);
+        if (is_link($directory)) throw new RuntimeException('Invalid history directory.');
+        $key = hash('sha256', $file);
+        $id = $_POST['id'] ?? '';
+        $valid = function ($name) use ($key) { return is_string($name) && preg_match('/^' . $key . '-[0-9]{8}-[0-9]{6}-[a-f0-9]{12}\.bak$/D', $name); };
+        if ($id !== '') {
+            if (!$valid($id) || is_link($directory . '/' . $id) || !is_file($directory . '/' . $id)) throw new RuntimeException('History copy is unavailable.');
+            $bytes = @file_get_contents($directory . '/' . $id, false, null, 0, 1048577);
+            if (!is_string($bytes) || strlen($bytes) > 1048576) throw new RuntimeException('Inline history supports copies up to 1 MiB.');
+            if (strpos($bytes, "\0") !== false || preg_match('//u', $bytes) !== 1) throw new RuntimeException('Only UTF-8 text copies can be compared.');
+            fmAuthReply(200, 'History copy loaded.', ['content_base64'=>base64_encode($bytes)]);
+        }
+        $items = [];
+        foreach (glob($directory . '/' . $key . '-*.bak') ?: [] as $path) {
+            if (!$valid(basename($path)) || is_link($path) || !is_file($path)) continue;
+            $stamp = DateTimeImmutable::createFromFormat('!Ymd-His', substr(basename($path), 65, 15), new DateTimeZone('UTC'));
+            if (!$stamp) continue;
+            $items[] = ['id'=>basename($path), 'date'=>fmModifiedDate($stamp->getTimestamp(), $config['date_format']), 'size'=>filesize($path)];
+        }
+        usort($items, function ($a,$b) { return strcmp($b['id'],$a['id']); });
+        fmAuthReply(200, 'History loaded.', ['items'=>array_slice($items,0,500), 'total'=>count($items)]);
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
+}
+
 
 /*
 Seti icon mappings from microsoft/vscode/extensions/theme-seti.
@@ -765,6 +795,7 @@ $workspaceThemeScript = <<<'JS'
         localStorage.removeItem('ke_editor_theme');
         localStorage.setItem('ke_default_theme', 'cloud_editor_dark');
     }
+    const cloudEditorAccent = '#e96a71';
     try {
         const cached = JSON.parse(localStorage.getItem('ke_workspace_palette'));
         if (cached?.theme === window.getEditorTheme()) {
@@ -772,6 +803,12 @@ $workspaceThemeScript = <<<'JS'
             document.documentElement.style.colorScheme = cached.light ? 'light' : 'dark';
         }
     } catch (_) {}
+    if (window.getEditorTheme() === 'cloud_editor_dark') {
+        const style = document.documentElement.style;
+        style.setProperty('--accent', cloudEditorAccent);
+        style.setProperty('--accent-hover', cloudEditorAccent);
+        style.setProperty('--accent-contrast', '#000');
+    }
     const themeLoads = new Map();
     function loadThemeScript(url) {
         if (!themeLoads.has(url)) themeLoads.set(url, new Promise((resolve, reject) => {
@@ -784,7 +821,7 @@ $workspaceThemeScript = <<<'JS'
         }));
         return themeLoads.get(url);
     }
-    function paletteFromAce(module) {
+    function paletteFromAce(module, theme) {
         // Ace defers theme CSS until an editor exists; the file manager also needs it before probing.
         ace.require('ace/lib/dom').importCssString(module.cssText, module.cssClass, document);
         const probe = document.createElement('div');
@@ -806,7 +843,7 @@ $workspaceThemeScript = <<<'JS'
         if ([deep,text,main].some(value => rgb(value).length !== 3)) { probe.remove(); throw new Error('Theme colors are not available in this document.'); }
         const surface = mix(main,text,0.035), elevated = mix(main,text,0.08);
         const tokens = ['ace_support ace_function','ace_entity ace_name ace_function','ace_keyword','ace_constant ace_numeric'].map(classes => color(classes));
-        const accent = readable(tokens.find(value => Math.max(...rgb(value))-Math.min(...rgb(value)) > 25) || text,main);
+        const accent = theme === 'cloud_editor_dark' ? cloudEditorAccent : readable(tokens.find(value => Math.max(...rgb(value))-Math.min(...rgb(value)) > 25) || text,main);
         const secondary = readable(mix(text,main,0.25),main), muted = readable(color('ace_comment'),main);
         const folder = readable(color('ace_constant ace_numeric'),main);
         const selection = mix(deep,accent,0.18), danger = module.isDark ? '#ef596f' : '#cf222e';
@@ -829,7 +866,7 @@ $workspaceThemeScript = <<<'JS'
             if (!module) throw new Error('Theme module is unavailable.');
             if (request !== themeRequest) return;
             if (!inheritWorkspacePalette(theme)) {
-                const palette = paletteFromAce(module);
+                const palette = paletteFromAce(module, theme);
                 try { localStorage.setItem('ke_workspace_palette', JSON.stringify({theme,...palette})); } catch (_) {}
                 for (const [key,value] of Object.entries(palette.vars)) document.documentElement.style.setProperty('--'+key,value);
                 document.documentElement.style.colorScheme = palette.light ? 'light' : 'dark';
@@ -862,9 +899,12 @@ $workspaceThemeScript = <<<'JS'
         }
         window.setWorkspaceTheme(window.getEditorTheme(),false);
     });
+        window.getEditorFontSize = () => localStorage.getItem('ke_font') || '12px';
+
         function renderGitDiff(diff) {
             const lines = document.createElement('div');
             lines.className = 'git-diff-lines';
+            lines.style.fontSize = window.getEditorFontSize();
             function appendRow(text, before = '', after = '', type = '') {
                 const row = document.createElement('div'); row.className = 'git-diff-row' + (type ? ' ' + type : '');
                 const gutter = document.createElement('span'); gutter.className = 'git-diff-gutter';
@@ -951,12 +991,25 @@ $workspaceThemeScript = <<<'JS'
         window.workspaceToastTimer = setTimeout(() => { toast.style.display = 'none'; clearInterval(toast.fmCountdownInterval); }, duration);
         return Promise.resolve();
     };
+    function editorPreferenceCookie() {
+        return document.cookie.split('; ').find(item => item.startsWith('fm_editor_prefs='))?.slice(16);
+    }
+    window.readEditorPreference = function(key, fallback) {
+        const saved = new URLSearchParams(editorPreferenceCookie()).get(key);
+        return saved === null ? fallback : saved === '1';
+    };
+    window.writeEditorPreference = function(key, enabled) {
+        const prefs = new URLSearchParams(editorPreferenceCookie());
+        prefs.set(key, enabled ? '1' : '0');
+        document.cookie = 'fm_editor_prefs=' + prefs + '; Max-Age=31536000; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+        localStorage.setItem(key, String(enabled));
+    };
     window.loadEmmet = () => Promise.all([
         loadThemeScript('https://cdn.jsdelivr.net/npm/emmet-core@1.0.0/emmet.min.js'),
         loadThemeScript('https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ext-emmet.js')
     ]);
     window.setEmmetPreference = function(enabled, persist = true) {
-        if (persist) localStorage.setItem('ke_emmet', String(!!enabled));
+        if (persist) window.writeEditorPreference('ke_emmet', enabled);
         if (typeof window.applyEmmetPreference === 'function') window.applyEmmetPreference();
         document.querySelectorAll('iframe.editor-panel').forEach(frame => {
             if (typeof frame.contentWindow.applyEmmetPreference === 'function') frame.contentWindow.applyEmmetPreference();
@@ -964,7 +1017,7 @@ $workspaceThemeScript = <<<'JS'
     };
     window.loadInlineDiff = () => loadThemeScript('https://cdn.jsdelivr.net/npm/ace-builds@1.45.2/src-min-noconflict/ext-diff.js');
     window.setInlineChangesPreference = function(enabled, persist = true) {
-        if (persist) localStorage.setItem('ke_inline_changes', String(!!enabled));
+        if (persist) window.writeEditorPreference('ke_inline_changes', enabled);
         if (typeof window.setInlineChanges === 'function') window.setInlineChanges(!!enabled);
         document.querySelectorAll('iframe.editor-panel').forEach(frame => {
             if (typeof frame.contentWindow.setInlineChanges === 'function') frame.contentWindow.setInlineChanges(!!enabled);
@@ -975,7 +1028,7 @@ $workspaceThemeScript = <<<'JS'
         if (!Object.hasOwn(options, option)) return;
         const [key, command] = options[option];
         enabled = !!enabled;
-        if (persist) localStorage.setItem(key, String(enabled));
+        if (persist) window.writeEditorPreference(key, enabled);
         const apply = target => {
             if (!target.editor) return;
             target.editor.setOption(option, enabled);
@@ -1006,10 +1059,10 @@ $workspaceThemeScript = <<<'JS'
         }, 1500);
     });
     window.addEventListener('storage', event => {
-        if (event.key === 'ke_emmet' || event.key === null) window.setEmmetPreference(localStorage.getItem('ke_emmet') !== 'false', false);
-        if (event.key === 'ke_inline_changes' || event.key === null) window.setInlineChangesPreference(localStorage.getItem('ke_inline_changes') === 'true', false);
+        if (event.key === 'ke_emmet' || event.key === null) window.setEmmetPreference(window.readEditorPreference('ke_emmet', true), false);
+        if (event.key === 'ke_inline_changes' || event.key === null) window.setInlineChangesPreference(window.readEditorPreference('ke_inline_changes', false), false);
         for (const [key,option,defaultValue] of [['ke_invisibles','showInvisibles',false],['ke_indent_guides','displayIndentGuides',true],['ke_live_autocomplete','enableLiveAutocompletion',true]]) {
-            if (event.key === key || event.key === null) window.setEditorPreference(option, localStorage.getItem(key) === null ? defaultValue : localStorage.getItem(key) === 'true', false);
+            if (event.key === key || event.key === null) window.setEditorPreference(option, window.readEditorPreference(key, defaultValue), false);
         }
         if (event.key === 'ke_theme' || event.key === 'ke_editor_theme' || event.key === null) window.setWorkspaceTheme(window.getEditorTheme(),false);
     });
@@ -1022,9 +1075,8 @@ $workspaceThemeScript = <<<'JS'
         @media (prefers-reduced-motion: reduce) {.tree-loading-spinner {animation: none;}}
         #git-diff-dialog {margin: auto;width: min(1000px, 94vw);max-height: 88vh;background: var(--bg-main);color: var(--text-primary);border: 1px solid var(--border-default);border-radius: 6px;padding: 0;}
         #git-diff-dialog::backdrop {background: #0008;}
-        .git-diff-title {display: flex;justify-content: space-between;align-items: center;padding: 10px 14px;background: var(--bg-elevated);}
-        #git-diff-close {background: transparent;border: 0;color: var(--text-primary);font-size: 24px;cursor: pointer;}
-        #git-diff-output {margin: 0;padding: 12px;max-height: 72vh;overflow: auto;font: 12px/1.6 monospace;white-space: pre;}
+        #git-diff-output {min-height: 0;overscroll-behavior: contain;margin: 0;padding: 12px;max-height: 60vh;overflow: auto;font: 12px/1.6 monospace;white-space: pre;}
+        .git-status-badge {margin-left: 8px;font-size: 0.7rem;font-weight: 600;color: var(--text-link);}
         .git-diff-lines {width: max-content;min-width: 100%;}
         .git-diff-row {display: flex;box-sizing: border-box;border-left: 3px solid transparent;}
         .git-diff-gutter {display: flex;flex-shrink: 0;position: sticky;left: 0;background: var(--bg-main);color: var(--text-muted);border-right: 1px solid var(--border-subtle);user-select: none;}
@@ -1036,6 +1088,38 @@ $workspaceThemeScript = <<<'JS'
         .git-added {background: #33995522;color: var(--text-primary);border-left: 3px solid #43a866;}
         .git-removed {background: #dd445522;color: var(--text-primary);border-left: 3px solid #e06c75;}
         .git-hunk {color: var(--text-link);}
+    #file-history-dialog {margin:auto;padding:0;width:min(560px,94vw);max-height:85dvh;overflow:hidden;border:1px solid var(--border-default);border-radius:6px;background:var(--bg-surface);color:var(--text-primary);}
+    :is(#file-history-dialog, #folder-picker, #git-diff-dialog)[open] {display:flex;flex-direction:column;overflow:hidden;}
+    :is(#file-history-dialog, #folder-picker, #git-diff-dialog) > :is(.modal-header, .modal-footer) {flex-shrink:0;}
+    :is(#file-history-dialog, #folder-picker) > .modal-body {display:flex;flex-direction:column;min-height:0;overflow:hidden;}
+    :is(#file-history-dialog p, #folder-picker .folder-picker-nav, #folder-picker-message) {flex-shrink:0;}
+    #file-history-items {min-height:0;overflow:auto;overscroll-behavior:contain;padding:4px;}
+    #file-history-dialog::backdrop {background:#0007;}
+    .editor-dialog {font:var(--workspace-ui-font-size)/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;box-shadow:0 8px 32px #0006;}
+    .editor-dialog .modal-header {display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 16px;background:var(--bg-elevated);border-bottom:1px solid var(--border-subtle);}
+    .editor-dialog .modal-title {margin:0;font-size:0.875rem;font-weight:600;}
+    .editor-dialog .modal-body {padding:16px;}
+    .editor-dialog .modal-footer {display:flex;justify-content:flex-end;gap:8px;padding:10px 16px;background:var(--bg-elevated);border-top:1px solid var(--border-subtle);}
+    .editor-dialog .btn {padding:6px 12px;border:1px solid var(--border-default);border-radius:4px;background:var(--bg-elevated);color:var(--text-primary);font:inherit;font-weight:600;cursor:pointer;}
+    .editor-dialog .btn-primary {background:var(--accent);border-color:var(--accent);color:var(--accent-contrast);}
+    .editor-dialog .btn-primary:hover:not(:disabled) {background:var(--accent-hover);border-color:var(--accent-hover);}
+    .editor-dialog .btn:disabled {opacity:.6;cursor:default;}
+    .editor-dialog .modal-footer:has(> [hidden]:only-child) {display:none;}
+
+    .editor-dialog .modal-body p {margin:0 0 12px;color:var(--text-secondary);font-size:inherit;}
+    .editor-dialog .me-2 {margin-right:8px;}
+    .editor-dialog .btn-close {box-sizing:content-box;width:1em;height:1em;padding:0.25em;margin:-0.5rem -0.5rem -0.5rem auto;border:0;border-radius:0.375rem;font-size:1rem;line-height:1;cursor:pointer;background:transparent url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath d='M.293.293a1 1 0 0 1 1.414 0L8 6.586 14.293.293a1 1 0 1 1 1.414 1.414L9.414 8l6.293 6.293a1 1 0 0 1-1.414 1.414L8 9.414l-6.293 6.293a1 1 0 0 1-1.414-1.414L6.586 8 .293 1.707a1 1 0 0 1 0-1.414z'/%3e%3c/svg%3e") center/1em auto no-repeat;}
+    .editor-dialog button:focus-visible {outline:2px solid var(--accent);outline-offset:2px;}
+
+    #file-history-items button {display:block;width:100%;padding:8px;text-align:left;background:var(--bg-elevated);color:var(--text-primary);border:1px solid var(--border-default);border-radius:4px;margin-bottom:6px;cursor:pointer;}
+    :is(#file-history-items button, #history-comparison button, .editor-dialog .btn-secondary, #goto-dialog button:not(.dialog-primary)):is(:hover, :focus-visible):not(:disabled) {background:var(--bg-selected);border-color:var(--accent);color:var(--text-primary);}
+    :is(#file-history-items button, #history-comparison button, .editor-dialog .btn, #goto-dialog button):focus-visible {outline:2px solid var(--accent);outline-offset:2px;}
+    :is(.modal, .editor-dialog) .btn-close:is(:hover, :focus-visible) {opacity:1;}
+    #history-comparison {flex-shrink:0;padding:6px 8px;background:var(--bg-elevated);color:var(--text-primary);font-size:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+    #history-comparison[hidden] {display:none;}
+    #history-comparison button {background:var(--bg-main);color:var(--text-primary);border:1px solid var(--border-default);border-radius:4px;padding:4px 8px;cursor:pointer;}
+    /* Keep horizontal edge scrolling inside the workspace, including editor iframe documents. */
+    html, body, #editor .ace_scroller, #editor .ace_scrollbar-h {overscroll-behavior-x: none;}
     /* One text scale for menus and floating UI, independent of Bootstrap defaults. */
     :root {--workspace-ui-font-size: 0.78rem;}
     .modal, .modal .modal-content, #git-diff-dialog, .cool-alert-modal, .cool-alert-toast {font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;font-size: var(--workspace-ui-font-size) !important;line-height: 1.5;}
@@ -1056,7 +1140,7 @@ $workspaceThemeScript = <<<'JS'
     #folder-picker-path {flex:1 1 140px;min-width:0;padding:5px 8px;border:1px solid var(--border-default);border-radius:4px;background:var(--bg-elevated);color:var(--text-primary);font:inherit;}
     #folder-picker .folder-picker-nav button {display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border:0;background:transparent;color:var(--text-secondary);white-space:nowrap;}
     #folder-picker .folder-picker-nav button:hover:not(:disabled) {background:var(--bg-hover);color:var(--text-primary);}
-    #folder-picker-list {max-height:48dvh;overflow:auto;margin-top:8px;border-block:1px solid var(--border-subtle);}
+    #folder-picker-list {min-height:0;max-height:48dvh;overflow:auto;overscroll-behavior:contain;margin-top:8px;border-block:1px solid var(--border-subtle);}
     :is(#folder-picker, #goto-dialog) button.dialog-primary {background:var(--accent);border-color:var(--accent);color:var(--accent-contrast);}
     :is(#folder-picker, #goto-dialog) button.dialog-primary:hover:not(:disabled) {background:var(--accent-hover);border-color:var(--accent-hover);}
     :is(#folder-picker, #goto-dialog) button:focus-visible, .modal .btn:focus-visible {outline:2px solid var(--accent);outline-offset:2px;}
@@ -1075,14 +1159,28 @@ $workspaceThemeScript = <<<'JS'
     .modal input[type="file"]:hover:not(:disabled):not([readonly])::file-selector-button {background: var(--bg-hover);color: var(--text-primary);}
     .modal input[type="file"]:disabled::file-selector-button {background: var(--bg-elevated);color: var(--text-muted);}
     .modal .modal-title > i, .dialog-title > i {color: var(--accent);}
-    .modal .form-control:focus, .modal .form-select:focus {box-shadow: 0 0 0 2px var(--bg-selected);}
+    .modal .form-control:focus, .modal .form-select:focus {border-color: var(--accent);box-shadow: 0 0 0 2px var(--bg-selected);}
     .modal :is(.form-control, .form-select):disabled {background-color: var(--bg-deep);color: var(--text-secondary);border-color: var(--border-default);opacity: 1;}
-    .modal .btn-primary {--bs-btn-bg: var(--accent);--bs-btn-border-color: var(--accent);--bs-btn-hover-bg: var(--accent-hover);--bs-btn-hover-border-color: var(--accent-hover);--bs-btn-active-bg: var(--accent-hover);--bs-btn-active-border-color: var(--accent-hover);color: var(--accent-contrast) !important;}
+    .btn.btn-primary {
+        --bs-btn-color: var(--accent-contrast, #fff);
+        --bs-btn-bg: var(--accent);
+        --bs-btn-border-color: var(--accent);
+        --bs-btn-hover-color: var(--bs-btn-color);
+        --bs-btn-hover-bg: var(--accent-hover);
+        --bs-btn-hover-border-color: var(--accent-hover);
+        --bs-btn-active-color: var(--bs-btn-color);
+        --bs-btn-active-bg: var(--accent-hover);
+        --bs-btn-active-border-color: var(--accent-hover);
+        --bs-btn-disabled-color: var(--bs-btn-color);
+        --bs-btn-disabled-bg: var(--accent);
+        --bs-btn-disabled-border-color: var(--accent);
+        --bs-btn-focus-box-shadow: 0 0 0 2px var(--accent);
+    }
     .modal .btn-secondary, .modal .btn[data-bs-dismiss="modal"] {background: var(--bg-elevated) !important;border-color: var(--border-default) !important;color: var(--text-secondary) !important;}
     .modal .btn-secondary:hover, .modal .btn[data-bs-dismiss="modal"]:hover {background: var(--bg-hover) !important;color: var(--text-primary) !important;}
     .modal .btn-danger:not([data-bs-dismiss]) {background: var(--accent-danger);border-color: var(--accent-danger);color: var(--danger-contrast);}
-    .modal .btn-close {filter: invert(1) grayscale(1);opacity: 0.75;}
-    :root[data-workspace-light="true"] .modal .btn-close, :root[data-workspace-light="true"] .modal .btn-close, :root[data-workspace-light="true"] .modal .btn-close {filter: none;}
+    .modal .btn-close, .editor-dialog .btn-close {filter: invert(1) grayscale(1);opacity: 0.75;}
+    :root[data-workspace-light="true"] :is(.modal, .editor-dialog) .btn-close {filter: none;}
     .cool-alert-modal, .cool-alert-toast {background: var(--bg-main) !important;color: var(--text-primary) !important;border: 1px solid var(--border-default) !important;box-shadow: 0 8px 32px #00000040 !important;}
     /* The empty drag handle must not paint over the alert icon. */
     .cool-alert-modal-header, .cool-alert-modal-header:hover {height: 16px !important;background: transparent !important;border: 0 !important;box-shadow: none !important;}
@@ -1116,6 +1214,21 @@ $workspaceThemeScript = <<<'JS'
 
 JS;
 $workspaceThemeScript = str_replace('__FM_CSRF_TOKEN__', json_encode($fmCSRFToken), $workspaceThemeScript);
+
+// Optional trusted PHP modules are loaded only for an authenticated module page.
+$fmModules = [];
+foreach (glob(__DIR__ . '/modules/*.php') ?: [] as $modulePath) {
+    $id = basename($modulePath, '.php');
+    if (!is_link($modulePath) && preg_match('/^[a-z][a-z0-9-]{0,39}$/D', $id)) $fmModules[$id] = $modulePath;
+}
+if (isset($_GET['module'])) {
+    $id = $_GET['module'];
+    if (!is_string($id) || !isset($fmModules[$id])) { http_response_code(404); exit; }
+    $fmModulePage = $fmModules[$id];
+    $fmModuleEditor = __FILE__;
+    require $fmModulePage;
+    exit;
+}
 
 // Git process runner. Argument arrays avoid shell interpretation.
 function fmGitRun($directory, $arguments, $accepted = [0], $environment = [], $timeout = 8) {
@@ -1338,6 +1451,10 @@ if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff']
                 $baseline=fmGitRun($root,['cat-file','blob',$blob[1]]);
                 if (strlen($baseline)>8*1024*1024 || strpos($baseline,"\0")!==false || !preg_match('//u',$baseline)) throw new RuntimeException('The committed file is binary or too large.');
             }
+            if (($_POST['comparison'] ?? '') === 'inline') {
+                if (strlen($baseline) > 1048576) throw new RuntimeException('Inline comparison supports HEAD copies up to 1 MiB. Use the M badge for a larger diff.');
+                $result = ['status'=>'success', 'baseline_base64'=>base64_encode($baseline), 'untracked'=>$tracked===''];
+            } else {
             foreach ([$baseline,$content] as $text) {
                 $temp=tempnam(sys_get_temp_dir(),'fm-git-');
                 if (!$temp) throw new RuntimeException('Cannot prepare comparison.');
@@ -1353,6 +1470,7 @@ if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff']
                 elseif (strpos($line,'+++ ')===0) $line='+++ Current editor (including unsaved changes)';
             } unset($line);
             $result=['status'=>'success','diff'=>implode("\n",$lines),'untracked'=>$tracked===''];
+            }
         }
     } catch (Throwable $error) {
         if (($_POST['action'] ?? '') === 'git_status') {
@@ -1723,8 +1841,8 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             .mobile-code-keys button {flex: 1 0 38px;min-height: 36px;padding: 4px 7px;background: var(--bg-main);color: var(--text-primary);border: 1px solid var(--border-default);border-radius: 4px;font: 13px monospace;touch-action: manipulation;}
             #git-diff-dialog {width: 100vw;max-width: 100vw;max-height: 95%;}
             #git-diff-output {max-height: 75vh;}
-            #editor .ace_search {left: 0 !important;right: 0 !important;max-width: 100% !important;width: 100%;box-sizing: border-box;font-size: 16px;}
-            #editor .ace_search_field {font-size: 16px;max-width: 55vw;}
+            #editor .ace_search {left: 0 !important;right: 0 !important;max-width: 100% !important;width: 100%;box-sizing: border-box;}
+            #editor .ace_search_field {max-width: 55vw;}
             #editor .ace_searchbtn, #editor .ace_replacebtn {padding: 5px;}
         }
         /* Fit the editor inside narrow internal tabs. */
@@ -1741,6 +1859,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         /* The minimap handles vertical navigation; keep Ace's own bar as a fallback. */
         #editor .ace_scrollbar-v {visibility: hidden;pointer-events: none;}
         body.minimap-hidden #editor .ace_scrollbar-v {visibility: visible;pointer-events: auto;}
+        body:not(.minimap-hidden) #editor .ace_sb-v > div:first-child {visibility: hidden;pointer-events: none;}
         #editor .ace_scrollbar {scrollbar-width: thin;scrollbar-color: var(--scrollbar-gold) var(--bg-main);}
         #editor .ace_scrollbar::-webkit-scrollbar {width: 10px;height: 10px;}
         #editor .ace_scrollbar::-webkit-scrollbar-track {background: var(--bg-main);}
@@ -1753,7 +1872,8 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         #bookmark-rail[hidden] {display: none;}
         .bookmark-tick {position: absolute;left: 0;width: 100%;height: 8px;padding: 0;border: 0;border-radius: 2px;background: var(--accent);cursor: pointer;}
         .bookmark-tick:focus-visible {outline: 2px solid var(--text-primary);z-index: 1;}
-        .ace_gutter-cell.fm-bookmark {box-shadow: inset 3px 0 var(--accent);color: var(--accent) !important;font-weight: bold;}
+        :is(.ace_gutter-cell, .ace_gutter-cell_svg-icons).fm-bookmark {box-shadow: inset 3px 0 var(--accent);color: var(--accent) !important;font-weight: bold;}
+        .ace_mini-diff_gutter_other {pointer-events: none;}
         .ace_marker-layer .fm-bookmark-jump {position: absolute;background: var(--bg-selected);}
         #editor-wrap:has(#bookmark-rail:not([hidden])) #minimap {right: 22px;}
         #occurrence-rail {width: 12px;flex-shrink: 0;position: relative;background: var(--bg-main);border-left: 1px solid var(--border-subtle);cursor: pointer;touch-action: none;outline: none;}
@@ -1773,10 +1893,18 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         .status-action {background:transparent;border:0;padding:2px 4px;color:inherit;font:inherit;cursor:pointer;}
         .status-action:hover {background:var(--bg-hover);}
         #status-saved[data-state="unsaved"], #status-saved[data-state="saving"] {color:var(--accent-warning);}
-        #goto-dialog {background:var(--bg-main);color:var(--text-primary);border:1px solid var(--border-default);border-radius:6px;padding:18px;width:min(320px,90vw);font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+        #goto-dialog {background:var(--bg-main);color:var(--text-primary);border:1px solid var(--border-default);border-radius:6px;padding:12px;width:min(320px,90vw);font:var(--editor-font-size, 12px)/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
         #goto-dialog::backdrop {background:#0006;}
-        #goto-dialog input {width:100%;margin:10px 0;padding:8px;background:var(--bg-deep);color:var(--text-primary);border:1px solid var(--border-default);font-size:16px;}
-        #goto-dialog button {background:var(--bg-elevated);color:var(--text-primary);border:1px solid var(--border-default);border-radius:4px;padding:6px 12px;}
+        #goto-dialog input {box-sizing:border-box;width:100%;margin:6px 0 8px;padding:3px 6px;background:var(--bg-deep);color:var(--text-primary);border:1px solid var(--border-default);border-radius:4px;font:inherit;}
+        #goto-dialog input:focus {outline:0;border-color:var(--accent);box-shadow:0 0 0 1px var(--accent);}
+        #goto-dialog button {background:var(--bg-elevated);color:var(--text-primary);border:1px solid var(--border-default);border-radius:4px;padding:6px 12px;font:inherit;}
+        #file-history-dialog, #file-history-dialog .modal-title, #history-comparison {font-size:var(--editor-font-size, 12px);}
+        #editor :is(.ace_search, .ace_search_field, .ace_searchbtn, .ace_replacebtn) {font-size:var(--editor-font-size, 12px);}
+        @media (max-width:760px) {
+            #goto-dialog input, #editor .ace_search_field {font-size:max(16px, var(--editor-font-size, 12px));}
+        }
+        :is(.mobile-code-keys button, #mobile-keys-toggle, #mobile-status-toggle) {cursor:pointer;}
+        :is(.mobile-code-keys button, #mobile-keys-toggle, #mobile-status-toggle):is(:hover, :focus-visible) {background:var(--bg-selected);border-color:var(--accent);}
         .statusbar-right {min-width: 0;}
         .status-language {flex-shrink: 0;}
         #statusbar {position: static;flex-shrink: 0;overflow: hidden;white-space: nowrap;}
@@ -1791,7 +1919,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
 
 <body>
 
-    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong class="dialog-title"><i class="fas fa-code-branch" aria-hidden="true"></i> <span id="git-diff-heading">Git changes</span></strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
+    <dialog id="git-diff-dialog" class="editor-dialog"><div class="modal-header"><h5 class="modal-title dialog-title"><i class="fas fa-code-branch me-2" aria-hidden="true"></i><span id="git-diff-heading">Git changes</span></h5><button type="button" id="git-diff-close" class="btn-close" aria-label="Close comparison"></button></div><pre id="git-diff-output"></pre><div class="modal-footer"><button type="button" id="git-diff-inline" class="btn btn-primary" hidden><i class="fas fa-code-branch me-2" aria-hidden="true"></i>Git: View changes against HEAD</button></div></dialog>
     <!-- ── Spinner ───────────────────────────────────────────────── -->
     <div id="spinner-overlay">
         <span class="tree-loading-spinner" aria-hidden="true"></span>
@@ -1803,6 +1931,8 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         <i class="fas fa-check-circle"></i> File saved successfully
     </div>
 
+    <dialog id="file-history-dialog" class="editor-dialog" aria-labelledby="file-history-title"><div class="modal-header"><h5 class="modal-title dialog-title" id="file-history-title"><i class="fas fa-clock-rotate-left me-2" aria-hidden="true"></i>File history</h5><button type="button" id="file-history-close" aria-label="Close" class="btn-close"></button></div><div class="modal-body"><p>Copies contain the file before a save. Temporary storage may be cleared by your hosting provider.</p><div id="file-history-items" role="status"></div></div></dialog>
+    <div id="history-comparison" hidden><span id="history-comparison-label"></span><button type="button" id="history-restore">Restore into editor</button><button type="button" id="history-exit">Exit comparison</button></div>
     <!-- ── Editor ────────────────────────────────────────────────── -->
     <div id="editor-wrap">
         <div id="editor"></div>
@@ -1918,15 +2048,15 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             enableMultiselect: true,
             enableBasicAutocompletion: true,
             enableSnippets: true,
-            enableLiveAutocompletion: localStorage.getItem('ke_live_autocomplete') !== 'false',
-            fontSize: "12px",
+            enableLiveAutocompletion: window.readEditorPreference('ke_live_autocomplete', true),
+            fontSize: window.getEditorFontSize(),
             wrap: false,
             highlightActiveLine: true,
             highlightSelectedWord: true,
             enableAutoIndent: true,
             showPrintMargin: false,
-            showInvisibles: localStorage.getItem('ke_invisibles') === 'true',
-            displayIndentGuides: localStorage.getItem('ke_indent_guides') !== 'false',
+            showInvisibles: window.readEditorPreference('ke_invisibles', false),
+            displayIndentGuides: window.readEditorPreference('ke_indent_guides', true),
             scrollPastEnd: 0.5,
             tabSize: 4,
             useSoftTabs: true,
@@ -1971,11 +2101,12 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         function scheduleBookmarks() {
             if (!bookmarkFrame) bookmarkFrame = requestAnimationFrame(renderBookmarks);
         }
-        editor.on('guttermousedown', event => {
-            // Preserve folding, diagnostic markers, modified clicks and their normal Ace actions.
-            if (event.getButton() !== 0 || event.domEvent.shiftKey || event.domEvent.ctrlKey || event.domEvent.metaKey || event.domEvent.altKey) return;
-            if (!event.domEvent.target.classList.contains('ace_gutter-cell') || editor.renderer.$gutterLayer.getRegion(event)) return;
-            const row = event.getDocumentPosition().row;
+        editor.container.addEventListener('mousedown', event => {
+            if (event.button !== 0 || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
+            const target = event.target;
+            if (!target.closest('.ace_gutter-cell, .ace_gutter-cell_svg-icons') ||
+                target.closest('.ace_fold-widget, .ace_gutter_annotation, .ace_custom-widget, .ace_mini-diff_gutter_other')) return;
+            const row = editor.renderer.screenToTextCoordinates(event.clientX, event.clientY).row;
             const index = bookmarks.findIndex(anchor => anchor.row === row);
             if (index >= 0) bookmarks.splice(index, 1)[0].detach();
             else {
@@ -1985,8 +2116,9 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 bookmarks.push(anchor);
             }
             scheduleBookmarks();
-            event.stop();
-        });
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
         editor.session.on('change', () => { if (bookmarks.length || bookmarkRows.length) scheduleBookmarks(); });
         new ResizeObserver(scheduleBookmarks).observe(bookmarkRail);
 
@@ -1994,8 +2126,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         editor.container.style.lineHeight = '1.6';
 
         const mobileEditorQuery = matchMedia('(max-width: 760px)');
-        var wrapEnabled = mobileEditorQuery.matches;
-        editor.session.setUseWrapMode(wrapEnabled);
+
         function editorMobileViewport() {
             if (window.parent === window && window.visualViewport) document.documentElement.style.setProperty('--mobile-viewport-height', window.visualViewport.height + 'px');
             editor.resize();
@@ -2024,10 +2155,14 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             document.getElementById('mobile-keys-toggle').setAttribute('aria-pressed', String(!hidden));
             editor.resize();
         }
-        setMobileKeysHidden(localStorage.getItem('pcs_mobile_keys_hidden') === 'true');
+        const restoreMobileKeys = () => setMobileKeysHidden(window.readEditorPreference('pcs_mobile_keys_hidden', false));
+        restoreMobileKeys();
+        window.addEventListener('storage', event => {
+            if (event.key === 'pcs_mobile_keys_hidden') restoreMobileKeys();
+        });
         document.getElementById('mobile-keys-toggle').addEventListener('click', () => {
             const hidden = !document.body.classList.contains('mobile-keys-hidden');
-            localStorage.setItem('pcs_mobile_keys_hidden', String(hidden));
+            window.writeEditorPreference('pcs_mobile_keys_hidden', hidden);
             setMobileKeysHidden(hidden);
         });
         var isFullscreen = false;
@@ -2085,7 +2220,17 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             editor.session.setTabSize(Number(size));
             editor.session.setUseSoftTabs(kind === 'spaces');
         }
-        indentation.addEventListener('change', () => { applyIndentation(); editor.focus(); });
+        const filePreferenceKey = 'ke_file:' + location.pathname + ':' + new URLSearchParams(location.search).get('filename');
+        function restoreFileChoice(select, name) {
+            const saved = localStorage.getItem(filePreferenceKey + ':' + name);
+            if ([...select.options].some(option => option.value === saved)) select.value = saved;
+        }
+        restoreFileChoice(indentation, 'indentation');
+        indentation.addEventListener('change', () => {
+            localStorage.setItem(filePreferenceKey + ':indentation', indentation.value);
+            applyIndentation();
+            editor.focus();
+        });
         applyIndentation();
         let lastSavedAt = null;
         function updateSaveStatus() {
@@ -2109,10 +2254,11 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         function changeMode(mode) {
             editor.session.setMode("ace/mode/" + mode);
             document.getElementById('mode').value = mode;
-            localStorage.setItem('ke_mode', mode);
+            localStorage.setItem(filePreferenceKey + ':mode', mode);
         }
 
         function changeFontSize(size) {
+            document.documentElement.style.setProperty('--editor-font-size', size);
             editor.setOptions({
                 fontSize: size
             });
@@ -2122,11 +2268,13 @@ $lineCount = substr_count($fileContents, "\n") + 1;
 
         // ── Restore preferences ───────────────────────────────────────
         (function restorePrefs() {
-            const font = localStorage.getItem('ke_font');
-            if (font) {
-                document.getElementById('fontSize').value = font;
-                changeFontSize(font);
-            }
+            const modeSelect = document.getElementById('mode');
+            const initialMode = modeSelect.value;
+            restoreFileChoice(modeSelect, 'mode');
+            if (modeSelect.value !== initialMode) changeMode(modeSelect.value);
+            const font = window.getEditorFontSize();
+            document.getElementById('fontSize').value = font;
+            document.documentElement.style.setProperty('--editor-font-size', font);
         })();
 
         // Emmet expands abbreviations with Tab only in HTML mode; plain Tab remains available elsewhere.
@@ -2135,7 +2283,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         window.emmetAvailable = () => editor.session.getMode().$id === 'ace/mode/html';
         window.applyEmmetPreference = async function() {
             const request = ++emmetRequest;
-            const enabled = window.emmetAvailable() && localStorage.getItem('ke_emmet') !== 'false';
+            const enabled = window.emmetAvailable() && window.readEditorPreference('ke_emmet', true);
             window.emmetEnabled = enabled;
             try {
                 if (enabled) {
@@ -2173,7 +2321,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         };
         function toggleEmmet() {
             const host = window.parent !== window ? window.parent : window;
-            host.setEmmetPreference(localStorage.getItem('ke_emmet') === 'false');
+            host.setEmmetPreference(!window.readEditorPreference('ke_emmet', true));
         }
         editor.session.on('changeMode', () => queueMicrotask(() => window.applyEmmetPreference()));
         document.addEventListener('DOMContentLoaded', () => window.applyEmmetPreference());
@@ -2181,9 +2329,10 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         // Inline comparison uses the last verified save, never the Git index or HEAD.
         var inlineDiffView = null;
         let inlineDiffRequest = 0;
+        let historyBaseline = null, historyWasEnabled = false;
         window.inlineChangesEnabled = false;
         function refreshInlineChangesBaseline() {
-            try { if (inlineDiffView) inlineDiffView.sessionA.setValue(savedEditorValue); }
+            try { if (inlineDiffView && historyBaseline === null) inlineDiffView.sessionA.setValue(savedEditorValue); }
             catch (error) { console.error('Could not refresh inline comparison after save:', error); }
         }
         window.setInlineChanges = async function(enabled) {
@@ -2191,6 +2340,8 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             window.inlineChangesEnabled = !!enabled;
             try {
                 if (!enabled) {
+                    historyBaseline = null;
+                    document.getElementById('history-comparison').hidden = true;
                     if (inlineDiffView) {
                         const baseline = inlineDiffView.sessionA;
                         const selection = editor.selection.toJSON(), top = editor.session.getScrollTop(), left = editor.session.getScrollLeft();
@@ -2201,14 +2352,24 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                     return;
                 }
                 if (inlineDiffView) return;
-                if (Math.max(new TextEncoder().encode(editor.getValue()).byteLength, new TextEncoder().encode(savedEditorValue).byteLength) > 1024*1024 || editor.session.getLength() > 20000 || savedEditorValue.split(/\r\n|\r|\n/).length > 20000) throw new Error('Inline changes are available for files up to 1 MiB and 20,000 lines.');
+                const baselineValue = historyBaseline ?? savedEditorValue;
+                if (Math.max(new TextEncoder().encode(editor.getValue()).byteLength, new TextEncoder().encode(baselineValue).byteLength) > 1024*1024 || editor.session.getLength() > 20000 || baselineValue.split(/\r\n|\r|\n/).length > 20000) throw new Error('Inline changes are available for files up to 1 MiB and 20,000 lines.');
                 await window.loadInlineDiff();
                 if (request !== inlineDiffRequest || !window.inlineChangesEnabled) return;
                 const module = ace.require('ace/ext/diff');
                 if (!module) throw new Error('The inline comparison module could not be loaded.');
                 const options = editor.getOptions();
-                inlineDiffView = module.createDiffView({inline:'b',editorB:editor,valueA:savedEditorValue});
-                inlineDiffView.sessionA.setMode(editor.session.getMode());
+                inlineDiffView = module.createDiffView({inline:'b',editorB:editor,valueA:baselineValue});
+                // Ace renders both text layers inside the same scroller.
+                const oldText = inlineDiffView.textLayer;
+                const updateOldText = oldText.update.bind(oldText);
+                oldText.update = config => updateOldText({...config, firstRowScreen: editor.renderer.layerConfig.firstRowScreen});
+                const baseline = inlineDiffView.sessionA;
+                baseline.setMode(editor.session.getMode());
+                // Align both text layers using the same tab width and wrap column.
+                baseline.setTabSize(editor.session.getTabSize());
+                if (editor.session.getUseWrapMode()) baseline.adjustWrapLimit(editor.session.getWrapLimit());
+                inlineDiffView.onInput();
                 editor.setOptions({animatedScroll:options.animatedScroll,highlightActiveLine:options.highlightActiveLine,highlightGutterLine:options.highlightGutterLine,selectionStyle:options.selectionStyle});
             } catch (error) {
                 window.inlineChangesEnabled = false;
@@ -2224,9 +2385,85 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             host.setInlineChangesPreference(!window.inlineChangesEnabled);
         }
         document.addEventListener('DOMContentLoaded', () => {
-            if (localStorage.getItem('ke_inline_changes') === 'true') window.setInlineChanges(true);
+            if (window.readEditorPreference('ke_inline_changes', false)) window.setInlineChanges(true);
         });
         editor.session.on('changeMode', () => { if (inlineDiffView) inlineDiffView.sessionA.setMode(editor.session.getMode()); });
+
+        // File history uses a separate comparison baseline without changing the saved text.
+        let historyRequest = 0;
+        const historyDialog = document.getElementById('file-history-dialog');
+        async function historyRequestData(id = '') {
+            const body = new FormData();
+            body.set('action','file_history'); body.set('file', <?= json_encode($filename, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>); body.set('id',id);
+            const response = await fetch(location.pathname, {method:'POST',body});
+            const data = await response.json();
+            if (!response.ok || data.status !== 'success') throw new Error(data.message || 'History unavailable.');
+            return data;
+        }
+        window.compareHistoryCopy = async function(copy, isCurrent = () => true) {
+            const selected = ++historyRequest;
+            const fromModule = typeof copy.baseline === 'string';
+            let baseline = copy.baseline;
+            if (!fromModule) {
+                const data = await historyRequestData(copy.id);
+                const bytes = Uint8Array.from(atob(data.content_base64), char => char.charCodeAt(0));
+                baseline = new TextDecoder('utf-8', {fatal:true,ignoreBOM:true}).decode(bytes);
+            }
+            if (selected !== historyRequest || !isCurrent()) return;
+            const previous = historyBaseline === null ? window.inlineChangesEnabled : historyWasEnabled;
+            await window.setInlineChanges(false);
+            historyWasEnabled = previous; historyBaseline = baseline;
+            await window.setInlineChanges(true);
+            if (selected !== historyRequest || !isCurrent()) { await window.setInlineChanges(false); await window.setInlineChanges(previous); return; }
+            if (!window.inlineChangesEnabled) { historyBaseline = null; await window.setInlineChanges(previous); return; }
+            document.getElementById('history-restore').hidden = fromModule;
+            document.getElementById('history-comparison-label').textContent = 'Comparing with: ' + copy.date;
+            document.getElementById('history-comparison').hidden = false;
+            const firstChange = inlineDiffView?.chunks?.[0];
+            if (Array.isArray(inlineDiffView?.chunks) && !firstChange) document.getElementById('history-comparison-label').textContent += ' · No differences';
+            requestAnimationFrame(() => {
+                editor.resize(true);
+                if (firstChange) editor.scrollToLine(firstChange.new.start.row, true, false);
+            });
+            return window.inlineChangesEnabled;
+        };
+        window.showFileHistory = async function() {
+            const request = ++historyRequest, items = document.getElementById('file-history-items');
+            historyDialog.showModal(); window.workspaceLoading(items, 'Loading history…');
+            try {
+                const data = await historyRequestData();
+                if (request !== historyRequest || !historyDialog.open) return;
+                items.replaceChildren();
+                if (!data.items.length) items.textContent = 'No saved copies for this file.';
+                for (const copy of data.items) {
+                    const button = document.createElement('button'); button.type = 'button';
+                    button.textContent = copy.date + ' · ' + Math.ceil(copy.size / 1024) + ' KiB';
+                    button.disabled = copy.size > 1048576;
+                    button.addEventListener('click', async () => {
+                        window.workspaceLoading(items, 'Loading comparison…');
+                        try { if (await window.compareHistoryCopy(copy, () => historyDialog.open)) historyDialog.close(); }
+                        catch (error) { items.textContent = error.message; }
+                    });
+                    items.append(button);
+                }
+                if (data.total > data.items.length) { const note = document.createElement('p'); note.textContent = 'Showing the latest 500 copies.'; items.append(note); }
+            } catch (error) { if (request === historyRequest) items.textContent = error.message; }
+        };
+        document.getElementById('file-history-close').addEventListener('click', () => historyDialog.close());
+        historyDialog.addEventListener('close', () => historyRequest++);
+        async function exitHistoryComparison() {
+            historyRequest++;
+            const previous = historyWasEnabled;
+            await window.setInlineChanges(false);
+            await window.setInlineChanges(previous);
+        }
+        document.getElementById('history-exit').addEventListener('click', exitHistoryComparison);
+        document.getElementById('history-restore').addEventListener('click', async () => {
+            if (historyBaseline === null) return;
+            if (editor.getValue() !== savedEditorValue && !await window.workspaceConfirm('Replace unsaved edits with the selected comparison version?')) return;
+            editor.setValue(historyBaseline);
+            await exitHistoryComparison(); editor.focus();
+        });
 
         // ── Verified save; successful HTTP alone is not proof of a successful write ──
         async function saveFile() {
@@ -2250,6 +2487,9 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                 if (!response.ok || result.status !== 'success' || !/^[a-f0-9]{64}$/.test(result.hash || '') || result.byte_length !== bytes.length) {
                     throw new Error(result.message || 'Save verification failed. Your edits remain in the tab.');
                 }
+                if (result.hash !== fileRevision) window.parent.document.dispatchEvent(new CustomEvent('workspace-file-saved', {
+                    detail: {path: <?= json_encode($filename, JSON_HEX_TAG) ?>, hash: result.hash}
+                }));
                 fileRevision = result.hash;
                 savedEditorValue = editorValue;
                 refreshInlineChangesBaseline();
@@ -2305,6 +2545,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
                     case 'php':
                         formatted = prettier.format(code, {
                             parser: "php",
+                            braceStyle: "1tbs",
                             plugins: prettierPlugins
                         });
                         break;
@@ -2327,8 +2568,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
 
         // ── Word wrap toggle ──────────────────────────────────────────
         function toggleWrap() {
-            wrapEnabled = !wrapEnabled;
-            editor.session.setUseWrapMode(wrapEnabled);
+            saveEditorViewPreference('wrap', !editor.session.getUseWrapMode());
         }
 
         function toggleEditorPreference(option) {
@@ -2381,29 +2621,34 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             return value === savedEditorValue ? lastSavedContent : value.replace(/\r\n|\r|\n/g, originalNewline);
         };
         async function showGitDiff() {
-            const dialog = document.getElementById('git-diff-dialog');
-            const output = document.getElementById('git-diff-output');
-            const heading = document.getElementById('git-diff-heading');
-            window.workspaceLoading(output, 'Loading Git comparison…');
-            heading.textContent = 'Changes compared with HEAD';
-            if (!dialog.open) dialog.showModal();
+            const request = ++historyRequest;
             try {
                 const body = new FormData();
-                body.append('action','git_diff');
-                body.append('file', <?= json_encode($filename, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>);
-                const content = window.getGitComparisonContent();
-                const bytes = new TextEncoder().encode(content);
-                let binary = '';
-                for (let i=0;i<bytes.length;i+=8192) binary += String.fromCharCode(...bytes.subarray(i,i+8192));
-                body.append('content_base64',btoa(binary));
-                const response = await fetch(window.location.pathname,{method:'POST',body});
+                body.set('action', 'git_diff'); body.set('source', 'disk'); body.set('comparison', 'inline');
+                body.set('file', <?= json_encode($filename, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>);
+                const response = await fetch(location.pathname, {method:'POST', body});
                 const data = await response.json();
+                if (request !== historyRequest) return;
                 if (!response.ok || data.status !== 'success') throw new Error(data.message || 'Git comparison failed.');
-                heading.textContent = data.untracked ? 'New file — compared with an empty document' : 'HEAD → current editor (including unsaved changes)';
-                output.replaceChildren();
-                if (!data.diff.trim()) output.textContent = 'No changes compared with HEAD.';
-                else output.append(renderGitDiff(data.diff));
-            } catch (error) { output.textContent = error.message; }
+                const bytes = Uint8Array.from(atob(data.baseline_base64), char => char.charCodeAt(0));
+                const baseline = new TextDecoder('utf-8', {fatal:true,ignoreBOM:true}).decode(bytes);
+                const previous = historyBaseline === null ? window.inlineChangesEnabled : historyWasEnabled;
+                await window.setInlineChanges(false);
+                historyWasEnabled = previous; historyBaseline = baseline;
+                await window.setInlineChanges(true);
+                if (request !== historyRequest) { await window.setInlineChanges(false); await window.setInlineChanges(previous); return; }
+                if (!window.inlineChangesEnabled) { historyBaseline = null; await window.setInlineChanges(previous); return; }
+                document.getElementById('history-restore').hidden = false;
+                const label = document.getElementById('history-comparison-label');
+                label.textContent = data.untracked ? 'Comparing new file with an empty document' : 'Comparing with Git HEAD (including unsaved changes)';
+                document.getElementById('history-comparison').hidden = false;
+                const firstChange = inlineDiffView?.chunks?.[0];
+                if (Array.isArray(inlineDiffView?.chunks) && !firstChange) label.textContent += ' · No differences';
+                requestAnimationFrame(() => {
+                    editor.resize(true);
+                    if (firstChange) editor.scrollToLine(firstChange.new.start.row, true, false);
+                });
+            } catch (error) { if (request === historyRequest) window.workspaceAlert(error.message || 'Cannot compare with HEAD.', 'Git comparison', 'warning'); }
         }
         document.getElementById('git-diff-close').addEventListener('click', () => document.getElementById('git-diff-dialog').close());
 
@@ -2482,12 +2727,7 @@ $lineCount = substr_count($fileContents, "\n") + 1;
             if (mapFrame === null) mapFrame = requestAnimationFrame(drawMinimap);
         }
         function toggleMinimap() {
-            minimap.hidden = !minimap.hidden;
-            document.body.classList.toggle('minimap-hidden', minimap.hidden);
-            localStorage.setItem(mobileEditorQuery.matches ? 'ke_minimap_mobile' : 'ke_minimap', String(!minimap.hidden));
-
-            editor.resize();
-            scheduleMinimap();
+            saveEditorViewPreference('minimap', minimap.hidden);
         }
         function navigateMinimap(event) {
             const rect = minimap.getBoundingClientRect();
@@ -2522,16 +2762,30 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         editor.renderer.on('afterRender', scheduleMinimap);
         editor.renderer.on('themeLoaded', () => { mapColors.clear(); scheduleMinimap(); });
         new ResizeObserver(scheduleMinimap).observe(document.getElementById('editor-wrap'));
+        const editorViewHost = window.parent !== window && window.parent.document.getElementById('workspace-tabs') ? window.parent : window;
+        const editorViewport = editorViewHost.matchMedia('(max-width: 760px)');
+        function editorViewKey(name) {
+            return 'ke_' + name + (editorViewport.matches ? '_mobile' : '');
+        }
+        function saveEditorViewPreference(name, enabled) {
+            window.writeEditorPreference(editorViewKey(name), enabled);
+            applyResponsiveEditor();
+        }
         function applyResponsiveEditor() {
-            const mobile = mobileEditorQuery.matches;
-            const saved = localStorage.getItem(mobile ? 'ke_minimap_mobile' : 'ke_minimap');
-            minimap.hidden = saved === 'false' || (mobile && saved !== 'true');
+            minimap.hidden = !window.readEditorPreference(editorViewKey('minimap'), !editorViewport.matches);
             document.body.classList.toggle('minimap-hidden', minimap.hidden);
-            wrapEnabled = mobile;
-            editor.session.setUseWrapMode(wrapEnabled);
-            editor.resize();
+            editor.session.setUseWrapMode(window.readEditorPreference(editorViewKey('wrap'), mobileEditorQuery.matches));
+            if (mobileEditorQuery.matches) {
+                editor.setOptions({showGutter: true, showLineNumbers: true});
+                editor.renderer.updateFull();
+            }
+            editor.resize(true);
             scheduleMinimap();
         }
+        editorViewport.addEventListener('change', applyResponsiveEditor);
+        window.addEventListener('storage', event => {
+            if (event.key === editorViewKey('minimap') || event.key === editorViewKey('wrap')) applyResponsiveEditor();
+        });
         mobileEditorQuery.addEventListener('change', applyResponsiveEditor);
         applyResponsiveEditor();
         scheduleMinimap();
@@ -3326,6 +3580,7 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
                 $response = updateSettings($tmz, $dt, $font);
                 break;
             case "list":
+                if (!is_dir($currentPath) || !is_readable($currentPath)) fmAuthReply(404, 'Folder is unavailable.');
                 if ($isPostRequest && !is_link($config['root_path'].'/.trash') && realpath($currentPath) === realpath($config['root_path'].'/.trash') && fmCleanupTrashMetadata($config)) fmAuthReply(500, 'Cannot remove orphaned trash metadata. Check trash folder permissions.');
                 $sort = isset($_POST["sort"]) ? $_POST["sort"] : (isset($_GET["sort"]) ? $_GET["sort"] : "name");
                 $order = isset($_POST["order"]) ? $_POST["order"] : (isset($_GET["order"]) ? $_GET["order"] : "asc");
@@ -3566,23 +3821,55 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
                 }
                 break;
             case "search":
-                $query = isset($_POST["query"]) ? $_POST["query"] : "";
+                $query = is_string($_POST["query"] ?? null) ? trim($_POST["query"]) : "";
                 $path = isset($_POST["path"]) ? $config["root_path"] . $_POST["path"] : $config["root_path"];
                 if (!securityCheck($path)) {
                     $response = ["status" => "error", "message" => "Security violation"];
                     break;
                 }
+                if (!is_dir($path) || !is_readable($path)) fmAuthReply(404, 'Search folder is unavailable.');
+                $contents = ($_POST['mode'] ?? '') === 'contents';
+                $preview = !$contents && ($_POST['preview'] ?? '') === '1';
                 $results = [];
-                if (!empty($query)) {
-                    $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+                $limited = false;
+                if ($query !== '') {
+                    $pattern = strpbrk($query, '*?') === false ? null :
+                        '~^' . str_replace(['\\*', '\\?'], ['.*', '.'], preg_quote($query, '~')) . '$~isuD';
+                    $directory = new RecursiveDirectoryIterator($path, RecursiveDirectoryIterator::SKIP_DOTS);
+                    if ($contents) {
+                        $directory = new RecursiveCallbackFilterIterator($directory, static function ($entry) {
+                            return !$entry->isLink() && (!$entry->isDir() ||
+                                !in_array($entry->getFilename(), ['.git', '.trash', 'vendor', 'node_modules'], true));
+                        });
+                    }
+                    $iterator = new RecursiveIteratorIterator($directory, RecursiveIteratorIterator::SELF_FIRST, RecursiveIteratorIterator::CATCH_GET_CHILD);
+                    $deadline = microtime(true) + 2;
                     foreach ($iterator as $file) {
-                        if (stripos($file->getFilename(), $query) !== false) {
-                            $relativePath = str_replace($config["root_path"], "", $file->getPathname());
-                            $results[] = ["name" => $file->getFilename(), "path" => $relativePath, "type" => $file->isDir() ? "dir" : "file", "size" => $file->isDir() ? "" : formatSize($file->getSize()), "last_modified" => fmModifiedDate($file->getMTime(), $config["date_format"]), "icon" => getFileIcon($file->getPathname())];
+                        if (($contents || $preview) && microtime(true) >= $deadline) { $limited = true; break; }
+                        $name = $file->getFilename();
+                        $relativePath = substr($file->getPathname(), strlen(rtrim($config["root_path"], '/')));
+                        if ($contents) {
+                            if (!$file->isFile() || $file->getSize() > 1048576) continue;
+                            $text = @file_get_contents($file->getPathname(), false, null, 0, 1048577);
+                            if ($text === false || strlen($text) > 1048576 || strpos($text, "\0") !== false || !preg_match('//u', $text)) continue;
+                            foreach (preg_split('/\r\n|\r|\n/', $text) as $index => $line) {
+                                $offset = stripos($line, $query);
+                                if ($offset === false) continue;
+                                $snippet = substr($line, max(0, $offset - 50), 240);
+                                $results[] = ['name' => $name, 'path' => $relativePath, 'type' => 'file', 'line' => $index + 1, 'snippet' => trim($snippet)];
+                                if (count($results) >= 200) { $limited = true; break 2; }
+                            }
+                        } elseif ($pattern === null ? stripos($name, $query) !== false : preg_match($pattern, $name) === 1) {
+                            if ($preview && count($results) >= 12) { $limited = true; break; }
+                            $isDir = $file->isDir();
+                            $result = ['name' => $name, 'path' => $relativePath, 'type' => $isDir ? 'dir' : 'file'];
+                            if (!$preview) $result += ['size' => $isDir ? '' : formatSize($file->getSize()),
+                                'last_modified' => fmModifiedDate($file->getMTime(), $config['date_format'])];
+                            $results[] = $result;
                         }
                     }
                 }
-                $response = ["status" => "success", "data" => $results];
+                $response = ["status" => "success", "data" => $results, "limited" => $limited];
                 break;
             case "extract":
                 $file = isset($_POST["file"]) ? $_POST["file"] : "";
@@ -3629,7 +3916,7 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
 
     if ($action != "download") {
         header("Content-Type: application/json");
-        echo json_encode($response);
+        echo json_encode($response, $action === "search" ? JSON_INVALID_UTF8_SUBSTITUTE : 0);
         exit();
     }
 }
@@ -3691,6 +3978,7 @@ function fmInstallUpload($uploadedFile, $target, $expectedHash)
         clearstatcache(true, $target);
         if (!is_readable($target) || @filesize($target) !== $size || @hash_file('sha256', $target) !== $hash || (fileperms($target) & 07777) !== $mode) throw new RuntimeException('Upload completed but final verification failed. Check the file before continuing.');
         if (function_exists('opcache_invalidate')) @opcache_invalidate($target, true);
+        return $hash;
     } finally {
         if ($temporary && is_file($temporary)) @unlink($temporary);
         flock($lock, LOCK_UN); fclose($lock);
@@ -3727,6 +4015,7 @@ if (isset($_FILES["files"])) {
     $failed = 0;
     $failedFiles = [];
     $uploadedNames = [];
+    $uploadHashes = [];
     $received = [];
     for ($i = 0; $i < count($files["name"]); $i++) {
         $fileName = $files["name"][$i];
@@ -3781,7 +4070,7 @@ if (isset($_FILES["files"])) {
             }
         }
         try {
-            fmInstallUpload($files['tmp_name'][$i], $filePath, $manifest[$fileName]);
+            $uploadHashes[$fileName] = fmInstallUpload($files['tmp_name'][$i], $filePath, $manifest[$fileName]);
             $uploaded++; $uploadedNames[] = $fileName;
         } catch (Throwable $error) {
             $failed++; $failedFiles[] = $fileName . ': ' . $error->getMessage();
@@ -3791,7 +4080,7 @@ if (isset($_FILES["files"])) {
         if (!isset($received[$name])) { $failed++; $failedFiles[] = $name . ': not received by the server. Check upload limits.'; }
     }
     $response = ['status' => $failed === 0 ? 'success' : ($uploaded > 0 ? 'partial' : 'error'),
-        'message' => "Uploaded and verified $uploaded file(s)" . ($failed ? "; failed $failed file(s)." : '.'), 'uploaded' => $uploadedNames];
+        'message' => "Uploaded and verified $uploaded file(s)" . ($failed ? "; failed $failed file(s)." : '.'), 'uploaded' => $uploadedNames, 'hashes' => (object) $uploadHashes];
     if ($failed && !$uploaded) http_response_code(400);
     if (!empty($failedFiles)) {
         $response["failedFiles"] = $failedFiles;
@@ -3800,8 +4089,8 @@ if (isset($_FILES["files"])) {
     exit();
 }
 
-$versionInfo = 'Pocket Code Studio v1.3.1';
-$version = '1.3.1';
+$versionInfo = 'Pocket Code Studio v1.4.0';
+$version = '1.4.0';
 
 if ($username == null) {
     $username = "";
@@ -3818,6 +4107,7 @@ if ($username == null) {
         .file-type-icon img {width: 20px;height: 20px;object-fit: contain;display: block;}
         .file-type-icon.folder-type-icon {color: var(--text-secondary);}
         .folder-type-icon svg {width: 16px;height: 16px;}
+        #menu-show-tree {display:none;}
         .workspace-tab button[role="tab"], #mobile-files-btn {display: inline-flex;align-items: center;gap: 6px;}
     </style>
 
@@ -3923,6 +4213,8 @@ if ($username == null) {
         .workspace-tab button {border: 0;background: transparent;color: var(--text-secondary);cursor: pointer;padding: 9px 12px;font-size: 0.8rem;white-space: nowrap;}
         .workspace-tab.active button {color: var(--text-primary);}
         .workspace-tab .tab-close {padding: 5px 8px;margin-right: 4px;border-radius: 4px;}
+        .workspace-tab:is(:hover, :focus-within) {background:var(--bg-hover);}
+        .workspace-tab:is(:hover, :focus-within) button {color:var(--text-primary);}
         .workspace-tab .tab-close:hover {background: var(--bg-elevated);}
         .tab-dirty {color: var(--accent);margin-left: 6px;}
         .workspace-panels {position: relative;flex: 1;min-height: 0;display: flex;background: var(--bg-deep);}
@@ -3938,12 +4230,33 @@ if ($username == null) {
         .nav-links i {font-size: 0.72rem;}
         .nav-links:hover {color: var(--text-link);background: var(--bg-selected);}
         .nav-links.disabled {color: var(--text-muted) !important;pointer-events: none;opacity: 0.45;}
+        [data-git-tone="pending"] {--git-decoration: var(--text-link);}
+        [data-git-tone="added"] {--git-decoration: var(--accent-success, #6cc78a);}
+        [data-git-tone="changed"] {--git-decoration: var(--accent-warning, #e5b878);}
+        .file-name-label[data-git-tone], .tree-name[data-git-tone], .git-status-badge[data-git-tone] {color: var(--git-decoration);}
+        .git-folder-dot {display: inline-block;width: 7px;height: 7px;margin-left: 8px;border-radius: 50%;background: var(--git-decoration);flex: 0 0 7px;}
+        .folder-item > .git-folder-dot {margin-left: auto;}
+        .file-name .git-status-badge {margin-left: 4px;}
+        .file-name .git-status-badge + .git-status-badge {margin-left: 2px;}
+        .folder-item > .git-status-badge {margin-left: 0;}
+        .folder-item > .git-status-badge + .git-status-badge {margin-left: -2px;}
         .git-status-action {cursor: pointer;border-radius: 3px;padding: 2px 3px;}
         .git-status-action:hover, .git-status-action:focus-visible {background: var(--bg-selected);outline: 1px solid var(--accent);}
-        .git-status-badge {margin-left: 8px;font-size: 0.7rem;font-weight: 600;color: var(--text-link);}
         /* Keep search central and sign-out independent from the application menus. */
         .toolbar-utilities {grid-column: 2;grid-row: 1;width: 100%;min-width: 0;margin: 0;padding: 0;flex-shrink: 0;}
-        .toolbar-utilities .search-container {width: 100%;min-width: 0;}
+        .toolbar-utilities .search-container {position: relative;width: 100%;min-width: 0;}
+        #search-options {position: absolute;top: calc(100% + 4px);inset-inline: 0;z-index: 110;padding: 4px;background: var(--bg-main);border: 1px solid var(--border-default);border-radius: var(--radius-sm);box-shadow: var(--shadow-md);}
+        #search-suggestions {max-height: 45vh;overflow: auto;}
+        #search-suggestions[aria-busy="true"] {opacity: .55;}
+        #search-preview-status {margin-inline-start: auto;white-space: nowrap;color: var(--text-muted);font-size: 0.75rem;}
+        #search-suggestions .header-btns {appearance: none;background: transparent;border-color: transparent;}
+        #search-suggestions .header-btns:hover, #search-suggestions .header-btns:focus-visible {background: var(--bg-hover);color: var(--text-primary);}
+        #search-options .header-btns {display: flex;width: 100%;overflow-wrap: anywhere;text-align: left;white-space: normal;}
+        .search-options-bar {display: flex;align-items: center;justify-content: space-between;gap: 6px;padding: 2px 4px;}
+        #search-scope {min-width: 0;overflow: hidden;text-overflow: ellipsis;white-space: nowrap;color: var(--text-muted);font-size: 0.75rem;}
+        #search-options #search-contents {width: auto;flex-shrink: 0;margin: 0;white-space: nowrap;}
+        #search-contents[aria-pressed="true"] {background: var(--bg-selected);color: var(--text-link);}
+        #search-suggestions:not(:empty) {border-top: 1px solid var(--border-subtle);padding: 4px;color: var(--text-secondary);font-size: 0.78rem;}
         #logout-form {grid-column: 3;grid-row: 1;justify-self: end;margin: 0;}
         #logout-form .menu-heading {white-space: nowrap;}
         .main-toolbar > #upload-progress {grid-row: 2;grid-column: 1 / -1;width: 100% !important;margin: 0 !important;}
@@ -3961,9 +4274,13 @@ if ($username == null) {
             .workspace-theme-choice select {min-height: 38px;font-size: 16px;}
             .mobile-workspace-controls {display: flex;align-items: center;gap: 5px;width: 100%;min-width: 0;padding-right: 76px;}
             .mobile-workspace-controls button, #mobile-tabs-select {min-height: 38px;border: 1px solid var(--border-default);border-radius: 4px;background: var(--bg-main);color: var(--text-primary);padding: 5px 9px;font: inherit;}
+            #mobile-close-file {min-width: 38px;}
+            #mobile-close-file:disabled {opacity: .45;}
             #mobile-tabs-select {flex: 1;min-width: 0;max-width: 100%;font-size: 16px;}
-            .toolbar-actions {display: none;flex: 1 0 100%;max-height: 40vh;overflow-y: auto;flex-direction: column;align-items: stretch;}
+            .toolbar-actions {display: none;flex: 1 0 100%;flex-direction: column;align-items: stretch;}
             .toolbar-utilities {display: none !important;}
+            body.mobile-menu-open {overflow-y: auto;}
+            body.mobile-menu-open .main-toolbar {z-index: 2;flex-shrink: 0;padding-bottom: 10px;border-bottom: 2px solid var(--border-default);box-shadow: 0 6px 10px -3px #0009, 0 16px 28px -8px #000a;}
             body.mobile-menu-open .toolbar-actions {display: flex;}
             body.mobile-menu-open .toolbar-utilities {display: flex !important;width: 100%;margin: 0;padding: 0;flex-wrap: wrap;}
             .toolbar-utilities .search-container {flex: 1;min-width: 150px;}
@@ -3972,6 +4289,7 @@ if ($username == null) {
             .toolbar-actions .menu-heading {width: 100%;text-align: left;min-height: 38px;}
             .toolbar-actions .dropdown-menu {position: static !important;transform: none !important;width: 100%;border: 0;box-shadow: none;}
             .toolbar-actions .header-btns {min-height: 40px;font-size: 14px;}
+            #menu-show-tree {display:inline-flex;}
             .sidebar {width: 100% !important;min-width: 0 !important;max-width: none;}
             .sidebar-resizer, .workspace {display: none;}
             body.mobile-editor .sidebar, body.mobile-file-list .sidebar {display: none;}
@@ -3980,9 +4298,7 @@ if ($username == null) {
             .file-path-control .form-control, .modal input, .modal select {font-size: 16px;}
             .file-path-control {flex-basis: 100%;max-width: none;order: 1;margin: 3px 0 0;}
             .file-path-control .btn-icon, .file-path-control .form-control {min-height: 38px;}
-            .workspace-tabs {min-width: 0;width: 100%;}
-            .workspace-tab button {min-height: 38px;}
-            .workspace-tab .tab-close {min-width: 36px;}
+            .workspace-tabs {display: none;}
             .navigation-bar {flex-wrap: wrap;padding: 4px;gap: 3px;}
             .navigation-bar a {min-height: 36px;}
             .file-table th:nth-child(n+5), .file-table td:nth-child(n+5) {display: none;}
@@ -4037,8 +4353,16 @@ if ($username == null) {
         .search-result-name {display: flex;align-items: center;gap: 6px;min-width: 0;}
         .search-result-label {overflow-wrap: anywhere;}
         .search-result-path {color: var(--text-muted) !important;}
+        #search-results-table[data-mode="contents"] {width: 100%;table-layout: fixed;white-space: normal;}
+        #search-results-table[data-mode="contents"] th:nth-child(1) {width: 25%;}
+        #search-results-table[data-mode="contents"] th:nth-child(2) {width: 25%;}
+        #search-results-table[data-mode="contents"] th:nth-child(3) {width: 4rem;}
+        #search-results-table[data-mode="contents"] td {white-space: normal;overflow-wrap: anywhere;}
+        #search-results-table[data-mode="contents"] .search-result-label {overflow: hidden;text-overflow: ellipsis;white-space: nowrap;}
         /* ── Context Menu ────────────────────────────────────────── */
         .context-menu {position: fixed;z-index: 9999;background: var(--bg-elevated);border: 1px solid var(--border-default);border-radius: var(--radius-md);box-shadow: var(--shadow-lg);min-width: 170px;display: none;padding: 4px 0;backdrop-filter: blur(8px);}
+        .context-menu-item[aria-disabled="true"] {opacity:0.45;cursor:default;}
+        .context-menu-item[aria-disabled="true"]:hover {background:transparent;}
         .context-menu-item {padding: 6px 14px;cursor: pointer;font-size: 0.8rem;color: var(--text-secondary);display: flex;align-items: center;gap: 8px;transition: all 0.12s;}
         .context-menu-item i {font-size: 0.72rem;color: var(--text-muted);width: 14px;}
         .context-menu-item:hover {background: var(--bg-selected);color: var(--text-primary);}
@@ -4062,8 +4386,6 @@ if ($username == null) {
         .form-text, small {color: var(--text-muted);font-size: 0.72rem;}
         /* Buttons */
         .btn {border-radius: var(--radius-sm);font-size: 0.8rem;padding: 5px 12px;font-weight: 500;transition: all 0.15s;}
-        .btn-primary {background: var(--accent);border-color: var(--accent);color: #fff;}
-        .btn-primary:hover, .btn-primary:focus {background: var(--accent-hover);border-color: var(--accent-hover);color: #fff;box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);}
         .btn-danger {background: var(--accent-danger);border-color: var(--accent-danger);color: #fff;}
         .btn-danger:hover {background: #dc2626;border-color: #dc2626;color: #fff;}
         .btn-outline-secondary, .btn-outline-light {border-color: var(--border-default);color: var(--text-secondary);background: transparent;}
@@ -4109,15 +4431,23 @@ if ($username == null) {
         <div class="mobile-workspace-controls">
             <button type="button" id="mobile-menu-toggle" aria-controls="mobile-app-menus" aria-expanded="false" aria-label="Application menu">☰</button>
             <button type="button" id="mobile-files-btn">Files</button>
-            <button type="button" id="mobile-list-btn">List</button>
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
+            <button type="button" id="mobile-close-file" aria-label="Close active file" title="Close active file" disabled><i class="fas fa-xmark" aria-hidden="true"></i></button>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file-circle-plus"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file-circle-plus"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns" id="menu-show-tree"><i class="fas fa-folder-tree" aria-hidden="true"></i> File tree</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="history" disabled><i class="fas fa-clock-rotate-left" aria-hidden="true"></i> File history…</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a><?php if ($fmModules): ?><div class="dropdown-divider"></div><?php foreach ($fmModules as $id => $modulePath): ?><a class="header-btns" href="?module=<?= $id ?>" data-module="<?= $id ?>"><i class="fas fa-puzzle-piece" aria-hidden="true"></i> <?= ucfirst($id) ?></a><?php endforeach; endif; ?></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
-                    <input type="text" class="form-control" id="search-input" placeholder="Search files…">
-                    <button class="btn-search" id="search-btn"><i class="fas fa-search"></i></button>
+                    <input type="text" class="form-control" id="search-input" placeholder="Search files…" title="Search by name, use *.php, or start with % to search text">
+                    <button class="btn-search" id="search-btn" type="button" aria-label="Run search"><i class="fas fa-search"></i></button>
+                </div>
+                <div id="search-options" hidden>
+                    <div class="search-options-bar">
+                        <small id="search-scope"></small>
+                        <small id="search-preview-status" role="status" hidden></small>
+                        <button type="button" class="header-btns" id="search-contents" aria-pressed="false"><i class="fas fa-align-left" aria-hidden="true"></i> Search text <kbd>%</kbd></button>
+                    </div>
+                    <div id="search-suggestions" aria-live="polite"></div>
                 </div>
             </div>
         </div>
@@ -4240,6 +4570,7 @@ if ($username == null) {
         <div class="context-menu-item" id="ctx-rename"><i class="fas fa-tag"></i> Rename</div>
         <div class="context-menu-item" id="ctx-permissions"><i class="fas fa-shield-alt"></i> Permissions</div>
         <div class="context-menu-item" id="ctx-compress"><i class="fas fa-file-archive"></i> Compress</div>
+        <div class="context-menu-item" id="ctx-history" role="menuitem" aria-disabled="true"><i class="fas fa-clock-rotate-left"></i> File history…</div>
         <div class="context-menu-item" id="ctx-extract"><i class="fas fa-box-open"></i> Extract</div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" id="ctx-restore"><i class="fas fa-undo"></i> Restore</div>
@@ -4578,7 +4909,7 @@ if ($username == null) {
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Are you sure you want to delete the
                             selected item(s)?</p>
-                        <ul id="delete-item-names" aria-label="Items to delete" style="max-height:180px;overflow:auto;padding-left:20px;overflow-wrap:anywhere;color:var(--text-primary)"></ul>
+                        <ul id="delete-item-names" class="list-unstyled" aria-label="Items to delete" style="max-height:180px;overflow:auto;overflow-wrap:anywhere;color:var(--text-primary)"></ul>
                         <input type="hidden" name="items" id="deleteItems">
                         <input type="hidden" name="path" id="deletePath">
                         <input type="hidden" name="action" id="deleteAction" value="trash">
@@ -4643,7 +4974,7 @@ if ($username == null) {
     <div class="modal fade" id="uploadReplaceModal" tabindex="-1" aria-labelledby="uploadReplaceTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
             <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle"><i class="fas fa-copy me-2" aria-hidden="true"></i>Replace existing files?</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-            <div class="modal-body"><p>These files already exist in the destination folder. Replace them with the uploaded versions?</p><ul id="upload-replace-names" style="max-height:40vh;overflow:auto;overflow-wrap:anywhere"></ul></div>
+            <div class="modal-body"><p>These files already exist in the destination folder. Replace them with the uploaded versions?</p><ul id="upload-replace-names" class="list-unstyled" style="max-height:40vh;overflow:auto;overflow-wrap:anywhere"></ul></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" class="btn btn-primary" id="upload-replace-confirm"><i class="fas fa-right-left me-2" aria-hidden="true"></i>Replace</button></div>
         </div></div>
     </div>
@@ -4710,13 +5041,16 @@ if ($username == null) {
                 <li><i class="fas fa-lock fa-fw me-2" aria-hidden="true"></i>Keep your filename, password and settings.</li>
                 <li><i class="fas fa-box-archive fa-fw me-2" aria-hidden="true"></i>Create a private backup before replacing the editor.</li>
             </ul>
+            <p><a id="update-editor-download" hidden href="https://raw.githubusercontent.com/renat2985/pocket-code-studio/refs/heads/main/filemanager.php"><i class="fas fa-download me-2" aria-hidden="true"></i>Download filemanager.php from GitHub</a></p>
+            <p id="update-editor-download-status" role="status" class="mb-2" hidden></p>
             <label for="update-editor-file" class="form-label">PHP release (maximum 4 MiB)</label><input id="update-editor-file" class="form-control" type="file" accept=".php">
             <p id="update-editor-feedback" class="mt-3 mb-0" role="status" aria-live="polite"></p>
             <section id="update-editor-notes" class="mt-3 overflow-auto" style="max-height: 30vh" aria-label="What's new" aria-live="polite" hidden></section>
         </div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" class="btn btn-primary" id="update-editor-check"><i class="fas fa-upload me-2" aria-hidden="true"></i>Upload and check</button><button type="button" class="btn btn-primary" id="update-editor-install" hidden><i class="fas fa-sync-alt me-2" aria-hidden="true"></i>Update and reload</button></div>
     </div></div></div>
 
-    <dialog id="git-diff-dialog"><div class="git-diff-title"><strong class="dialog-title"><i class="fas fa-code-branch" aria-hidden="true"></i> <span id="git-diff-heading">Git changes</span></strong><button type="button" id="git-diff-close" aria-label="Close comparison">×</button></div><pre id="git-diff-output"></pre></dialog>
+    <dialog id="git-diff-dialog" class="editor-dialog"><div class="modal-header"><h5 class="modal-title dialog-title"><i class="fas fa-code-branch me-2" aria-hidden="true"></i><span id="git-diff-heading">Git changes</span></h5><button type="button" id="git-diff-close" class="btn-close" aria-label="Close comparison"></button></div><pre id="git-diff-output"></pre><div class="modal-footer"><button type="button" id="git-diff-inline" class="btn btn-primary" hidden><i class="fas fa-code-branch me-2" aria-hidden="true"></i>Git: View changes against HEAD</button></div></dialog>
+    <dialog id="file-history-dialog" class="editor-dialog" aria-labelledby="file-history-title"><div class="modal-header"><h5 class="modal-title dialog-title" id="file-history-title"><i class="fas fa-clock-rotate-left me-2" aria-hidden="true"></i>File history</h5><button type="button" id="file-history-close" aria-label="Close" class="btn-close"></button></div><div class="modal-body"><p>Choose a copy to open the file and compare. Temporary copies may be cleared by your hosting provider.</p><p id="history-file-name"></p><div id="file-history-items" role="status"></div></div><div class="modal-footer"><button type="button" id="history-list-cancel" class="btn btn-secondary"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button><button type="button" id="history-list-open" class="btn btn-primary"><i class="fas fa-code me-2" aria-hidden="true"></i>Open file</button></div></dialog>
     <!-- Search Results -->
     <div class="modal fade" id="searchModal" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false">
         <div class="modal-dialog modal-lg">
@@ -4821,6 +5155,11 @@ if ($username == null) {
 
     <!-- ── Scripts ───────────────────────────────────────────────── -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
+    <?php foreach ($fmModules as $id => $modulePath): ?>
+        <?php if (strpos((string) file_get_contents($modulePath, false, null, 0, 256), '@workspace-launcher') !== false): ?>
+            <script defer src="?module=<?= $id ?>&amp;launcher=1"></script>
+        <?php endif; ?>
+    <?php endforeach; ?>
     <script>
         var SERVER_ROOT_PATH = <?= json_encode($config['root_path'], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
         const PUBLIC_WORKSPACE_BASE = <?= json_encode($publicWorkspaceBase, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
@@ -5030,7 +5369,7 @@ if ($username == null) {
             let clickedBtn = null;
             let hasResponseError = false;
 
-            function createGitStatusBadge(status, path = null) {
+            function createGitStatusBadge(status, path = null, open = showGitBadgeDiff) {
                 if (status.length > 1) status = status === '??' ? 'U' : status.includes('D') ? 'D' : status.includes('A') ? 'A' : 'M';
                 const badge = document.createElement('span');
                 badge.className = 'git-status-badge'; badge.textContent = status;
@@ -5038,10 +5377,10 @@ if ($username == null) {
                 if (status === 'M' && path !== null) {
                     badge.classList.add('git-status-action'); badge.tabIndex = 0; badge.setAttribute('role', 'button');
                     badge.title = 'View changes against HEAD'; badge.setAttribute('aria-label', 'View Git changes: ' + path);
-                    badge.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); showGitBadgeDiff(path); });
+                    badge.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); open(path); });
                     badge.addEventListener('dblclick', event => { event.preventDefault(); event.stopPropagation(); });
                     badge.addEventListener('keydown', event => {
-                        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); showGitBadgeDiff(path); }
+                        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); open(path); }
                     });
                 }
                 return badge;
@@ -5145,11 +5484,10 @@ if ($username == null) {
                 for (const [label, value] of [['First recorded',loginDate(row.first)],['Last attempt',loginDate(row.last)],['Last success',loginDate(row.last_success)],['Browser',row.agent || 'Not recorded']]) {
                     const line = document.createElement('p'); line.className = 'mb-1'; line.textContent = label + ': ' + value; panel.append(line);
                 }
-                const events = document.createElement('ul'); events.className = 'mt-2 mb-0';
+                const events = document.createElement('ul'); events.className = 'list-unstyled mt-2 mb-0';
                 row.events.forEach(event => {
-                    const item = document.createElement('li');
-                    item.textContent = loginDate(event.last) + ' · ' + (loginResultLabels[event.result] || event.result) + (event.count > 1 ? ' × ' + event.count : '') + (event.actor ? ' · by ' + event.actor : '');
-                    events.append(item);
+                    const text = loginDate(event.last) + ' · ' + (loginResultLabels[event.result] || event.result) + (event.count > 1 ? ' × ' + event.count : '') + (event.actor ? ' · by ' + event.actor : '');
+                    events.append(createIconLine('li', 'fa-clock', text));
                 });
                 panel.append(events);
             }
@@ -5247,13 +5585,19 @@ if ($username == null) {
                     pickerUp.disabled = !pickerFolder || pickerParent === null;
                 }
             }
-            function openFolderPicker(input, scope) {
+            function openFolderPicker(input, scope, host = input.closest('.modal') || document.body, title) {
                 pickerScope = scope; pickerTarget = input; pickerFolder = null; pickerParent = null;
-                (input.closest('.modal') || document.body).append(folderPicker);
-                document.getElementById('folder-picker-title').textContent = scope === 'server' ? 'Choose workspace folder' : 'Choose destination folder';
+                host.append(folderPicker);
+                document.getElementById('folder-picker-title').textContent = title || (scope === 'server' ? 'Choose workspace folder' : 'Choose destination folder');
                 folderPicker.showModal();
                 loadPickerFolder(input.value || (scope === 'server' ? SERVER_ROOT_PATH : '/'));
             }
+            window.browseModuleFolder = (input, title) => {
+                const modal = document.querySelector('.modal.show[data-workspace-module]');
+                if (modal?.classList.contains('show') && input.ownerDocument === modal.querySelector('iframe').contentDocument) {
+                    openFolderPicker(input, 'server', modal, title);
+                }
+            };
             document.getElementById('browse-workspace').addEventListener('click', () => openFolderPicker(document.getElementById('settings-root'), 'server'));
             document.getElementById('browse-destination').addEventListener('click', () => openFolderPicker(document.getElementById('destinationPath'), 'workspace'));
             document.getElementById('folder-picker-home').addEventListener('click', () => loadPickerFolder(pickerScope === 'server' ? SERVER_ROOT_PATH : '/'));
@@ -5288,7 +5632,7 @@ if ($username == null) {
 
             let fileListController = null;
             let fileListRequest = 0;
-            async function loadFileList() {
+            async function loadFileList(restoring = false) {
                 const request = ++fileListRequest;
                 fileListController?.abort();
                 fileListController = new AbortController();
@@ -5304,10 +5648,18 @@ if ($username == null) {
                     if (request !== fileListRequest) return;
                     fileList = data.data;
                     if (data.current_path !== undefined) currentPath = data.current_path;
+                    const value = encodeURIComponent(currentPath);
+                    document.cookie = folderCookieName + '=' + (value.length <= 3700 ? value : '') +
+                        '; Max-Age=31536000; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
                     updateBreadcrumb(currentPath);
                     showFiles(fileList);
+                    renderGitStatus();
                 } catch (error) {
                     if (request !== fileListRequest || error.name === 'AbortError') return;
+                    if (restoring && currentPath) {
+                        currentPath = '';
+                        return loadFileList();
+                    }
                     const row = document.createElement('tr');
                     const cell = document.createElement('td');
                     cell.colSpan = 8; cell.style.padding = '20px';
@@ -5368,31 +5720,93 @@ if ($username == null) {
             let gitStatusRequest = 0;
             let gitStatusTimer = null;
             let gitStatusUnavailable = false;
+            let gitFiles = {}, gitFolders = new Map(), decorationSource = null, decorationDetails = {};
+            document.addEventListener('workspace-decoration-source', event => {
+                decorationSource = event.detail;
+                refreshGitStatus();
+            });
+            function renderGitStatus() {
+                document.querySelectorAll('#files-list .git-status-badge, #directory-tree .git-status-badge, .git-folder-dot').forEach(element => element.remove());
+                const decorate = (label, path, isFolder) => {
+                    const key = path.replace(/^\/+/, '');
+                    const status = isFolder ? gitFolders.get(key) : (Object.hasOwn(gitFiles, key) ? gitFiles[key] : null);
+                    delete label.dataset.gitTone;
+                    if (!status) return;
+                    const tone = status === 'A' || status === 'U' ? 'added' : 'changed';
+                    label.dataset.gitTone = tone;
+                    const details = isFolder ? null : decorationDetails[key];
+                    const badge = isFolder ? document.createElement('span') : createGitStatusBadge(status, path, decorationSource?.open);
+                    if (!isFolder && status === 'P') badge.hidden = true;
+                    if (!isFolder && status === 'M' && decorationSource?.title) badge.title = decorationSource.title;
+                    badge.dataset.gitTone = status === 'P' ? 'pending' : tone;
+                    if (isFolder) {
+                        badge.className = 'git-folder-dot';
+                        badge.title = status === 'P' ? 'Contains files pending sync with Codex' : decorationSource?.folderTitles?.[tone] || (tone === 'added' ? 'Contains added or untracked files' : 'Contains Git changes');
+                        badge.setAttribute('role', 'img');
+                        badge.setAttribute('aria-label', badge.title);
+                    }
+                    label.parentElement.append(badge);
+                    if (details?.pending) {
+                        const pending = document.createElement('span');
+                        pending.className = 'git-status-badge';
+                        pending.dataset.gitTone = 'pending';
+                        pending.innerHTML = '<i class="fas fa-arrows-rotate" aria-hidden="true"></i>';
+                        pending.title = 'Pending sync with Codex';
+                        pending.setAttribute('role', 'img');
+                        pending.setAttribute('aria-label', pending.title);
+                        label.parentElement.append(pending);
+                    }
+                    if (details?.changed && decorationSource?.openCurrent) {
+                        const pencil = createGitStatusBadge('M', path, decorationSource.openCurrent);
+                        pencil.innerHTML = '<i class="fas fa-pencil" aria-hidden="true"></i>';
+                        pencil.title = 'Compare uploaded version with current file';
+                        pencil.setAttribute('aria-label', pencil.title + ': ' + path);
+                        label.parentElement.append(pencil);
+                    }
+                };
+                document.querySelectorAll('#files-list .file-item').forEach(row => {
+                    decorate(row.querySelector('.file-name-label'), currentPath + '/' + row.dataset.name, row.dataset.type === 'dir');
+                });
+                document.querySelectorAll('[data-git-path]').forEach(label => decorate(label, label.dataset.gitPath, label.dataset.gitFolder === 'true'));
+            }
             function refreshGitStatus() {
-                if (gitStatusUnavailable) return;
+                if (gitStatusUnavailable && !decorationSource) {
+                    gitFiles = {}; gitFolders.clear(); decorationDetails = {}; renderGitStatus(); return;
+                }
                 clearTimeout(gitStatusTimer);
                 gitStatusTimer = setTimeout(loadGitStatus, 200);
             }
             async function loadGitStatus() {
-                if (gitStatusUnavailable) return;
+                if (gitStatusUnavailable && !decorationSource) return;
                 const request = ++gitStatusRequest;
                 try {
-                    const body = new FormData(); body.append('action','git_status');
-                    const response = await fetch(window.location.pathname,{method:'POST',body});
-                    const data = await response.json();
-                    if (request !== gitStatusRequest) return;
-                    document.querySelectorAll('.git-status-badge').forEach(element => element.remove());
-                    if (!response.ok || data.status !== 'success') return;
-                    if (data.available === false) { gitStatusUnavailable = true; return; }
-                    const appendBadge = (element, path) => {
-                        const status = data.files[path.replace(/^\/+/, '')];
-                        if (!status) return;
-                        element.append(createGitStatusBadge(status, path));
-                    };
-                    document.querySelectorAll('#files-list .file-item').forEach(row => {
-                        if (row.dataset.type !== 'dir') appendBadge(row.querySelector('.file-name'), currentPath + '/' + row.dataset.name);
-                    });
-                    document.querySelectorAll('[data-git-path]').forEach(element => appendBadge(element,element.dataset.gitPath));
+                    const source = decorationSource;
+                    let data, ok;
+                    if (source) {
+                        data = await source.load();
+                        ok = true;
+                    } else {
+                        const body = new FormData(); body.append('action','git_status');
+                        const response = await fetch(window.location.pathname,{method:'POST',body});
+                        data = await response.json();
+                        ok = response.ok;
+                    }
+                    if (request !== gitStatusRequest || source !== decorationSource) return;
+                    if (!source) gitStatusUnavailable = ok && data.available === false;
+                    gitFiles = ok && data.status === 'success' ? data.files : {};
+                    decorationDetails = source ? (data.details || {}) : {};
+                    gitFolders = new Map();
+                    for (const [path, status] of Object.entries(gitFiles)) {
+                        let slash = path.lastIndexOf('/');
+                        while (slash > 0) {
+                            const folder = path.slice(0, slash);
+                            const previous = gitFolders.get(folder);
+                            if (decorationDetails[path]?.pending) gitFolders.set(folder, 'P');
+                            else if (previous !== 'P' && previous !== 'M') gitFolders.set(folder, status === 'A' || status === 'U' ? 'A' : 'M');
+                            slash = path.lastIndexOf('/', slash - 1);
+                        }
+                    }
+                    renderGitStatus();
                 } catch (_) { /* Ordinary file browsing remains available without Git. */ }
             }
             function shortFileName(name, isDirectory) {
@@ -5488,6 +5902,63 @@ if ($username == null) {
                 });
             }
 
+            let contextHistoryRequest = 0, contextHistoryTarget = null;
+            const contextHistoryDialog = document.getElementById('file-history-dialog');
+            async function openHistoryFile(target, copy = null) {
+                contextHistoryDialog.close();
+                await openFileEditor(target.name, target.directory);
+                const path = editorFilePath(target.name, target.directory), tab = editorTabs.get(path);
+                if (!copy || !tab) return;
+                const compare = async () => {
+                    if (editorTabs.get(path) !== tab || activeEditorPath !== path) return;
+                    try { await tab.frame.contentWindow.compareHistoryCopy?.(copy, () => editorTabs.get(path) === tab && activeEditorPath === path); }
+                    catch (error) { window.workspaceAlert(error.message, 'File history', 'warning'); }
+                };
+                if (tab.loaded) await compare(); else tab.frame.addEventListener('load', compare, {once:true});
+            }
+            async function showContextFileHistory(target) {
+                const request = ++contextHistoryRequest;
+                contextHistoryTarget = target;
+                document.getElementById('history-file-name').textContent = target.name;
+                const items = document.getElementById('file-history-items');
+                contextHistoryDialog.showModal(); window.workspaceLoading(items, 'Loading history…');
+                try {
+                    const data = await requestWorkspace('file_history', {file:editorFilePath(target.name,target.directory)});
+                    if (request !== contextHistoryRequest || !contextHistoryDialog.open) return;
+                    items.replaceChildren();
+                    if (!data.items.length) items.textContent = 'No saved copies for this file.';
+                    for (const copy of data.items) {
+                        const button = document.createElement('button'); button.type = 'button';
+                        button.textContent = copy.date + ' · ' + Math.ceil(copy.size / 1024) + ' KiB';
+                        button.title = 'Open file and compare with this copy'; button.disabled = copy.size > 1048576;
+                        button.addEventListener('click', () => openHistoryFile(target, copy)); items.append(button);
+                    }
+                    if (data.total > data.items.length) { const note = document.createElement('p'); note.textContent = 'Showing the latest 500 copies.'; items.append(note); }
+                } catch (error) { if (request === contextHistoryRequest) items.textContent = error.message; }
+            }
+            ['file-history-close','history-list-cancel'].forEach(id => document.getElementById(id).addEventListener('click', () => contextHistoryDialog.close()));
+            contextHistoryDialog.addEventListener('close', () => contextHistoryRequest++);
+            document.getElementById('history-list-open').addEventListener('click', () => { if (contextHistoryTarget) void openHistoryFile(contextHistoryTarget); });
+
+            async function updateHistoryContextItem(target, type) {
+                const item = document.getElementById('ctx-history');
+                item.style.display = 'flex';
+                item.setAttribute('aria-disabled', 'true');
+                if (type !== 'file' || /\.(?:png|jpe?g|gif|webp|bmp|ico|avif|svg|zip|tar|gz|gzip|bz2|bzip2|rar|7z|pdf|woff2?|ttf|otf|mp[34]|webm|exe|dll|so)$/i.test(target.name)) return;
+                try {
+                    const path = editorFilePath(target.name, target.directory);
+                    const openEditor = editorTabs.get(path)?.frame.contentWindow.editor;
+                    let editable = Boolean(openEditor);
+                    if (!editable) {
+                        const response = await fetch(window.location.pathname + '?editor=1&check=1&filename=' + encodeURIComponent(path));
+                        const data = await response.json();
+                        editable = response.ok && data.status === 'success' && data.kind === 'text';
+                    }
+                    const menu = document.getElementById('context-menu');
+                    if (contextTarget !== target) return;
+                    item.setAttribute('aria-disabled', String(!editable));
+                } catch (_) { /* History stays disabled when text support cannot be confirmed. */ }
+            }
             function showContextMenu(x, y, type) {
                 const menu = document.getElementById('context-menu');
                 const inTrash = contextTarget.directory === '/.trash';
@@ -5500,6 +5971,7 @@ if ($username == null) {
                 document.getElementById('ctx-extract').style.display = type === 'file' && /\.(zip|tar|gz|gzip|bz2|bzip2|rar|7z)$/i.test(contextTarget.name) ? 'flex' : 'none';
                 document.getElementById('ctx-edit').style.display = type === 'file' ? 'flex' : 'none';
                 document.getElementById('ctx-open').style.display = type === 'dir' ? 'flex' : 'none';
+                void updateHistoryContextItem(contextTarget, type);
                 menu.style.visibility = 'hidden';
                 menu.style.display = 'block';
                 const mw = menu.offsetWidth,
@@ -5623,7 +6095,8 @@ if ($username == null) {
                         const label = document.createElement('span');
                         label.className = 'tree-name';
                         label.textContent = item.name;
-                        if (item.type !== 'dir') label.dataset.gitPath = item.path;
+                        label.dataset.gitPath = item.path;
+                        label.dataset.gitFolder = String(item.type === 'dir');
                         if (item.type === 'dir') {
                             const caret = document.createElement('i');
                             caret.className = 'fas fa-caret-right caret';
@@ -5634,20 +6107,30 @@ if ($username == null) {
                             nested.className = 'file-tree nested';
                             let loaded = false;
                             let loading = false;
-                            button.addEventListener('click', async () => {
-                                if (loading) return;
-                                const expand = button.getAttribute('aria-expanded') !== 'true';
+                            const setExpanded = expand => {
                                 button.setAttribute('aria-expanded', String(expand));
                                 caret.classList.toggle('expanded', expand);
                                 nested.classList.toggle('active', expand);
                                 updateFolderIcon(icon, item.name);
-                                if (expand && !loaded) {
+                            };
+                            button.addEventListener('click', async () => {
+                                const expand = button.getAttribute('aria-expanded') !== 'true';
+                                setExpanded(expand);
+                                if (expand) expandedTreePaths.add(item.path);
+                                else expandedTreePaths.delete(item.path);
+                                saveWorkspaceTree();
+                                if (expand && !loaded && !loading) {
                                     loading = true;
                                     loaded = await loadTreeLevel(nested, item.path);
                                     loading = false;
                                 }
                             });
                             li.append(button, nested);
+                            if (expandedTreePaths.has(item.path)) {
+                                setExpanded(true);
+                                loading = true;
+                                loadTreeLevel(nested, item.path).then(success => { loaded = success; loading = false; });
+                            }
                         } else {
                             button.classList.add('tree-file');
                             button.append(icon, label);
@@ -5660,6 +6143,7 @@ if ($username == null) {
                         }
                         container.append(li);
                     });
+                    renderGitStatus();
                     refreshGitStatus();
                     return true;
                 } catch (error) {
@@ -5743,8 +6227,15 @@ if ($username == null) {
             function init() {
                 initPermissionsModal();
                 initDragAndDrop();
+                try {
+                    const cookie = document.cookie.split('; ').find(item => item.startsWith(folderCookieName + '='));
+                    if (cookie) {
+                        const path = decodeURIComponent(cookie.slice(folderCookieName.length + 1));
+                        if (path.startsWith('/')) currentPath = path;
+                    }
+                } catch (_) { /* Ignore malformed folder state. */ }
                 loadDirectoryTree();
-                loadFileList();
+                loadFileList(true);
             }
 
             // ── Navigation ────────────────────────────────────────────
@@ -5935,11 +6426,7 @@ if ($username == null) {
                 document.getElementById('deletePath').value = selection.directory;
                 document.getElementById('deleteItems').value = selection.names.join(',');
                 const names = document.getElementById('delete-item-names');
-                names.replaceChildren(...selection.names.map(name => {
-                    const item = document.createElement('li');
-                    item.textContent = name;
-                    return item;
-                }));
+                names.replaceChildren(...selection.names.map(name => createIconLine('li', 'fa-file-code', name)));
                 const inTrash = selection.directory === '/.trash';
                 document.getElementById('deleteAction').value = inTrash ? 'delete' : 'trash';
                 document.getElementById('deleteButtonText').textContent = inTrash ? 'Delete Permanently' : 'Move to Trash';
@@ -6018,7 +6505,7 @@ if ($username == null) {
             function confirmUploadReplacement(names) {
                 const element = document.getElementById('uploadReplaceModal');
                 const list = document.getElementById('upload-replace-names');
-                list.replaceChildren(...names.map(name => { const item = document.createElement('li'); item.textContent = name; return item; }));
+                list.replaceChildren(...names.map(name => createIconLine('li', 'fa-file-code', name)));
                 return new Promise(resolve => {
                     let confirmed = false;
                     const modal = bootstrap.Modal.getOrCreateInstance(element);
@@ -6073,6 +6560,8 @@ if ($username == null) {
                         loadFileList(); loadDirectoryTree();
                         for (const name of response.uploaded || []) {
                             const path = editorFilePath(name, directory), tab = editorTabs.get(path);
+                            const hash = response.hashes?.[name];
+                            if (hash) document.dispatchEvent(new CustomEvent('workspace-file-saved', {detail: {path, hash}}));
                             // Do not discard edits made while the transfer was in progress.
                             if (!tab) continue;
                             if (tabHasChanges(tab)) { keptEdits.push(name); continue; }
@@ -6097,9 +6586,11 @@ if ($username == null) {
                 }
             });
 
-            let gitBadgeRequest = 0;
+            let gitBadgeRequest = 0, gitBadgePath = null;
             async function showGitBadgeDiff(path) {
                 const request = ++gitBadgeRequest;
+                gitBadgePath = null;
+                document.getElementById('git-diff-inline').hidden = true;
                 const dialog = document.getElementById('git-diff-dialog');
                 const output = document.getElementById('git-diff-output');
                 const heading = document.getElementById('git-diff-heading');
@@ -6118,6 +6609,8 @@ if ($username == null) {
                     }
                     const data = await requestWorkspace('git_diff', fields);
                     if (request !== gitBadgeRequest) return;
+                    gitBadgePath = path;
+                    document.getElementById('git-diff-inline').hidden = false;
                     heading.textContent = path + (typeof content === 'string' ? ' — HEAD → current editor (including unsaved changes)' : ' — HEAD → saved file');
                     output.replaceChildren();
                     if (!data.diff.trim()) output.textContent = 'No changes compared with HEAD.';
@@ -6125,17 +6618,81 @@ if ($username == null) {
                 } catch (error) { if (request === gitBadgeRequest) output.textContent = error.message; }
             }
             document.getElementById('git-diff-close').addEventListener('click', () => { gitBadgeRequest++; document.getElementById('git-diff-dialog').close(); });
+            document.getElementById('git-diff-inline').addEventListener('click', async () => {
+                const path = gitBadgePath;
+                if (!path) return;
+                gitBadgeRequest++;
+                document.getElementById('git-diff-dialog').close();
+                bootstrap.Modal.getInstance(document.getElementById('githubModal'))?.hide();
+                const relative = '/' + path.replace(/^\/+/, '');
+                const split = relative.lastIndexOf('/'), name = relative.slice(split + 1), directory = relative.slice(0, split);
+                await openFileEditor(name, directory);
+                const full = editorFilePath(name, directory), tab = editorTabs.get(full);
+                if (!tab) return;
+                const compare = () => {
+                    if (editorTabs.get(full) === tab) tab.frame.contentWindow.showGitDiff?.();
+                };
+                if (tab.loaded) compare(); else tab.frame.addEventListener('load', compare, {once:true});
+            });
+
 
             // Manual self-update: preview first, then explicitly install the checked bytes.
             const updateModal = document.getElementById('updateEditorModal');
             const updateFile = document.getElementById('update-editor-file');
             const updateFeedback = document.getElementById('update-editor-feedback');
+            const updateDownload = document.getElementById('update-editor-download');
+            const downloadStatus = document.getElementById('update-editor-download-status');
+            let checkedEditor = null;
+            let updateVersionRequest = 0;
+            async function checkEditorVersion() {
+                const request = ++updateVersionRequest;
+                checkedEditor = null;
+                updateDownload.hidden = true;
+                downloadStatus.hidden = false;
+                window.workspaceLoading(downloadStatus, 'Checking for updates…');
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 8000);
+                try {
+                    const response = await fetch(updateDownload.href, {credentials:'omit', cache:'no-cache', signal:controller.signal});
+                    if (!response.ok) throw new Error('Version check failed');
+                    const file = await response.blob();
+                    const header = await file.slice(0, 2048).text();
+                    const version = header.match(/^ *\* Pocket Code Studio v(\d+\.\d+\.\d+)\s*$/m)?.[1];
+                    if (!header.startsWith('<' + '?php') || !version) throw new Error('Version not found');
+                    if (request !== updateVersionRequest) return;
+                    const available = compareEditorVersions(version, installedVersion) > 0;
+                    downloadStatus.textContent = available ? 'New version available: ' + version + ' (installed: ' + installedVersion + ').' : 'No newer version on GitHub.';
+                    if (available) {
+                        checkedEditor = file;
+                        updateDownload.hidden = false;
+                    }
+                } catch (_) {
+                    if (request === updateVersionRequest) downloadStatus.textContent = 'Could not check GitHub. You can still upload a PHP file manually.';
+                } finally { clearTimeout(timer); }
+            }
+            updateModal.addEventListener('shown.bs.modal', checkEditorVersion);
+            updateDownload.addEventListener('click', event => {
+                event.preventDefault();
+                if (!checkedEditor) return;
+                const url = URL.createObjectURL(checkedEditor);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'filemanager.php';
+                document.body.append(link);
+                link.click();
+                link.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 30000);
+            });
             const updateCheck = document.getElementById('update-editor-check');
             const updateInstall = document.getElementById('update-editor-install');
             let updateToken = null, updateBusy = false;
             const updateNotes = document.getElementById('update-editor-notes');
             const installedVersion = <?= json_encode($version) ?>;
             let updateNotesRequest = 0;
+            function compareEditorVersions(a, b) {
+                const left = a.split('.').map(Number), right = b.split('.').map(Number);
+                return left[0]-right[0] || left[1]-right[1] || left[2]-right[2];
+            }
             function releaseNotesBetween(markdown, installed, uploaded) {
                 const parts = value => /^\d+\.\d+\.\d+$/.test(value) ? value.split('.').map(Number) : null;
                 const compare = (a,b) => a[0]-b[0] || a[1]-b[1] || a[2]-b[2];
@@ -6149,7 +6706,7 @@ if ($username == null) {
                     return items.length ? [{version, number, items}] : [];
                 }).sort((a,b) => compare(b.number,a.number));
             }
-            function updateIconLine(tag, icon, text) {
+            function createIconLine(tag, icon, text) {
                 const line = document.createElement(tag);
                 const symbol = document.createElement('i');
                 symbol.className = 'fas fa-fw me-2 ' + icon;
@@ -6161,7 +6718,7 @@ if ($username == null) {
                 const request = ++updateNotesRequest;
                 updateNotes.hidden = false;
                 if (version === installedVersion) {
-                    updateNotes.replaceChildren(updateIconLine('p', 'fa-circle-info', 'Same version. There are no newer release notes to compare.'));
+                    updateNotes.replaceChildren(createIconLine('p', 'fa-circle-info', 'Same version. There are no newer release notes to compare.'));
                     return;
                 }
                 window.workspaceLoading(updateNotes, 'Loading release notes…');
@@ -6172,7 +6729,7 @@ if ($username == null) {
                     if (!response.ok) throw new Error('Release notes unavailable');
                     const notes = releaseNotesBetween(await response.text(), installedVersion, version);
                     if (request !== updateNotesRequest) return;
-                    const heading = updateIconLine('h6', 'fa-list', "What's new");
+                    const heading = createIconLine('h6', 'fa-list', "What's new");
                     updateNotes.replaceChildren(heading);
                     if (!notes.some(note => note.version === version)) {
                         const hint = document.createElement('p');
@@ -6182,9 +6739,8 @@ if ($username == null) {
                     for (const note of notes) {
                         const title = document.createElement('strong'), list = document.createElement('ul');
                         title.textContent = note.version;
-                        for (const item of note.items) {
-                            const row = document.createElement('li'); row.textContent = item; list.append(row);
-                        }
+                        list.className = 'list-unstyled';
+                        for (const item of note.items) list.append(createIconLine('li', 'fa-code-branch', item));
                         updateNotes.append(title,list);
                     }
                 } catch (_) {
@@ -6211,9 +6767,9 @@ if ($username == null) {
                     if (install) { updateFeedback.textContent = data.message; location.reload(); return; }
                     updateToken = data.token; updateInstall.hidden = false;
                     updateFeedback.replaceChildren(
-                        updateIconLine('span', 'fa-circle-check', 'Syntax and PHP compatibility checked.'),
+                        createIconLine('span', 'fa-circle-check', 'Syntax and PHP compatibility checked.'),
                         document.createElement('br'),
-                        updateIconLine('span', 'fa-code-branch', installedVersion + ' → ' + data.version + ' · ' + data.filename + ' · PHP ' + data.php)
+                        createIconLine('span', 'fa-code-branch', installedVersion + ' → ' + data.version + ' · ' + data.filename + ' · PHP ' + data.php)
                     );
                     void showUpdateNotes(data.version);
                 } catch (error) { updateToken = null; updateInstall.hidden = true; updateFeedback.textContent = error.message; }
@@ -6223,85 +6779,199 @@ if ($username == null) {
             updateInstall.addEventListener('click', () => runEditorUpdate(true));
 
             // ── Search ────────────────────────────────────────────────
+            const searchInput = document.getElementById('search-input');
+            const searchOptions = document.getElementById('search-options');
+            const suggestions = document.getElementById('search-suggestions');
+            const searchScope = document.getElementById('search-scope');
+            const searchContents = document.getElementById('search-contents');
+            const previewStatus = document.getElementById('search-preview-status');
+            let previewTimer, previewController, previewPath, previewQuery;
+            function setPreviewPending(pending) {
+                suggestions.inert = pending;
+                suggestions.setAttribute('aria-busy', String(pending));
+                if (!pending) previewStatus.hidden = true;
+            }
+            function closeSearchOptions() {
+                searchOptions.hidden = true;
+                previewQuery = null;
+                clearTimeout(previewTimer);
+                previewController?.abort();
+                setPreviewPending(false);
+            }
+            function showSearchOptions() {
+                searchOptions.hidden = false;
+                const path = currentPath;
+                const value = searchInput.value.trim();
+                if (path === previewPath && value === previewQuery) return;
+                previewQuery = value;
+                const contents = value.startsWith('%');
+                searchScope.textContent = 'In ' + (path || '/');
+                searchScope.title = path || '/';
+                searchContents.setAttribute('aria-pressed', String(contents));
+                if (path !== previewPath || contents || !value) suggestions.replaceChildren();
+                previewPath = path;
+                clearTimeout(previewTimer);
+                previewController?.abort();
+                setPreviewPending(!contents && !!value);
+                if (contents || !value) return;
+                const controller = previewController = new AbortController();
+                previewTimer = setTimeout(async () => {
+                    previewStatus.hidden = false;
+                    window.workspaceLoading(previewStatus, 'Searching…');
+                    try {
+                        const data = await requestWorkspace('search', {path, query: value, preview: 1}, {signal: controller.signal});
+                        if (controller.signal.aborted) return;
+                        suggestions.replaceChildren();
+                        if (path !== currentPath) return;
+                        for (const result of data.data) {
+                            const button = document.createElement('button');
+                            button.type = 'button';
+                            button.className = 'header-btns';
+                            button.append(createFileIcon(result.name, result.type === 'dir'), result.path);
+                            button.addEventListener('click', () => { closeSearchOptions(); openSearchResult(result); });
+                            suggestions.append(button);
+                        }
+                        if (!data.data.length) suggestions.textContent = 'No results found';
+                        else if (data.limited) suggestions.append('Press Enter to show all results.');
+                    } catch (error) {
+                        if (!controller.signal.aborted) {
+                            previewQuery = null;
+                            suggestions.textContent = error.message;
+                        }
+                    } finally {
+                        if (!controller.signal.aborted) setPreviewPending(false);
+                    }
+                }, 250);
+            }
+            searchInput.addEventListener('focus', showSearchOptions);
+            searchInput.addEventListener('click', showSearchOptions);
+            searchInput.addEventListener('input', showSearchOptions);
+            searchContents.addEventListener('click', () => {
+                const value = searchInput.value.trimStart();
+                searchInput.value = value.startsWith('%') ? value.slice(1).trimStart() : '% ' + value;
+                searchInput.focus();
+                showSearchOptions();
+            });
+            document.addEventListener('click', event => {
+                if (!event.target.closest('.search-container')) closeSearchOptions();
+            });
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape' && !searchOptions.hidden) {
+                    closeSearchOptions();
+                    if (searchOptions.contains(document.activeElement)) searchInput.focus(), closeSearchOptions();
+                }
+                if (event.key === 'ArrowDown' && event.target === searchInput && !searchOptions.hidden && !suggestions.inert) {
+                    const first = suggestions.querySelector('button');
+                    if (first) { event.preventDefault(); first.focus(); }
+                }
+            });
+            suggestions.addEventListener('keydown', event => {
+                const next = event.key === 'ArrowDown' ? event.target.nextElementSibling :
+                    event.key === 'ArrowUp' ? (event.target.previousElementSibling || searchInput) : null;
+                if (next) { event.preventDefault(); next.focus(); }
+            });
             let searchRequest = 0;
             let searchController = null;
+            function openSearchResult(result) {
+                if (result.type === 'dir') {
+                    navigateToPath(result.path);
+                } else {
+                    const directory = result.path.substring(0, result.path.lastIndexOf('/'));
+                    void openFileEditor(result.name, directory).then(() => {
+                        if (!result.line) return;
+                        const path = editorFilePath(result.name, directory);
+                        const tab = editorTabs.get(path);
+                        if (!tab) return;
+                        const jump = () => {
+                            if (activeEditorPath === path) tab.frame.contentWindow.editor?.gotoLine(result.line, 0, true);
+                        };
+                        if (tab.loaded) jump();
+                        else tab.frame.addEventListener('load', jump, {once:true});
+                    });
+                }
+            }
             function searchFiles() {
-                const q = document.getElementById('search-input').value.trim();
+                const value = searchInput.value.trim();
+                const mode = value.startsWith('%') ? 'contents' : 'name';
+                const q = mode === 'contents' ? value.slice(1).trim() : value;
                 if (!q) {
                     showAlert('Error', 'Please enter a search query');
                     return;
                 }
 
+                closeSearchOptions();
+                const table = document.getElementById('search-results-table');
+                table.dataset.mode = mode;
+                const columns = table.querySelectorAll('th');
+                ['Name', 'Path', ...(mode === 'contents' ? ['Line', 'Match', ''] : ['Type', 'Size', 'Modified'])]
+                    .forEach((title, index) => { columns[index].textContent = title; columns[index].hidden = !title; });
+                const columnCount = mode === 'contents' ? 4 : 5;
                 const tbody = document.getElementById('search-results');
-                tbody.innerHTML =
-                    `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)"><span class="tree-loading-spinner" aria-hidden="true"></span>Searching…</td></tr>`;
+                const message = (text = '', color = 'var(--text-muted)') => {
+                    tbody.replaceChildren();
+                    const cell = tbody.insertRow().insertCell();
+                    cell.colSpan = columnCount;
+                    cell.style.cssText = 'padding:24px;text-align:center;color:' + color;
+                    cell.setAttribute('role', 'status');
+                    cell.textContent = text;
+                    return cell;
+                };
+                window.workspaceLoading(message(), 'Searching…');
 
                 const request = ++searchRequest;
                 searchController?.abort();
                 searchController = new AbortController();
-                requestWorkspace('search', {path: currentPath, query: q}, {signal: searchController.signal})
+                requestWorkspace('search', {path: currentPath, query: q, mode}, {signal: searchController.signal})
                     .then(data => {
                         if (request !== searchRequest) return;
-                        if (data.status === 'success') {
-                            if (!data.data.length) {
-                                tbody.innerHTML =
-                                    `<tr><td colspan="5" style="padding:24px;text-align:center;color:var(--text-muted)">No results found</td></tr>`;
-                            } else {
-                                tbody.replaceChildren();
-                                data.data.forEach(result => {
-                                    const row = document.createElement('tr');
-                                    row.className = 'search-result-item';
-                                    row.tabIndex = 0;
-                                    row.title = 'Open ' + result.name;
-                                    const nameCell = document.createElement('td');
-                                    const name = document.createElement('span');
-                                    name.className = 'search-result-name';
-                                    const label = document.createElement('span');
-                                    label.className = 'search-result-label';
-                                    label.textContent = result.name;
-                                    name.append(createFileIcon(result.name, result.type === 'dir'), label);
-                                    nameCell.append(name);
-                                    row.append(nameCell);
-                                    [result.path, result.type === 'dir' ? 'Folder' : 'File', result.size || '', result.last_modified].forEach((value, index) => {
-                                        const cell = document.createElement('td');
-                                        cell.textContent = value;
-                                        if (index === 0) cell.className = 'search-result-path';
-                                        row.append(cell);
-                                    });
-                                    const openResult = () => {
-                                        if (result.type === 'dir') {
-                                            navigateToPath(result.path);
-                                            if (matchMedia('(max-width: 760px)').matches) document.body.classList.add('mobile-file-list');
-                                        } else {
-                                            const directory = result.path.substring(0, result.path.lastIndexOf('/'));
-                                            openFileEditor(result.name, directory);
-                                        }
-                                    };
-                                    const activateResult = () => {
-                                        const modal = document.getElementById('searchModal');
-                                        if (modal.classList.contains('show')) {
-                                            modal.addEventListener('hidden.bs.modal', openResult, {once: true});
-                                            bootstrap.Modal.getOrCreateInstance(modal).hide();
-                                        } else openResult();
-                                    };
-                                    row.addEventListener('click', activateResult);
-                                    row.addEventListener('keydown', event => {
-                                        if (event.key === 'Enter' || event.key === ' ') {
-                                            event.preventDefault();
-                                            activateResult();
-                                        }
-                                    });
-                                    tbody.append(row);
-                                });
-                            }
+                        if (!data.data.length) message('No results found');
+                        else tbody.replaceChildren();
+                        data.data.forEach(result => {
+                            const row = document.createElement('tr');
+                            row.className = 'search-result-item';
+                            row.tabIndex = 0;
+                            row.title = 'Open ' + result.name;
+                            const nameCell = document.createElement('td');
+                            const name = document.createElement('span');
+                            name.className = 'search-result-name';
+                            const label = document.createElement('span');
+                            label.className = 'search-result-label';
+                            label.textContent = result.name;
+                            name.append(createFileIcon(result.name, result.type === 'dir'), label);
+                            nameCell.append(name);
+                            row.append(nameCell);
+                            [result.path, ...(result.line ? [result.line, result.snippet] :
+                                [result.type === 'dir' ? 'Folder' : 'File', result.size || '', result.last_modified])].forEach((value, index) => {
+                                const cell = document.createElement('td');
+                                cell.textContent = value;
+                                if (index === 0) cell.className = 'search-result-path';
+                                row.append(cell);
+                            });
+                            const openResult = () => openSearchResult(result);
+                            const activateResult = () => {
+                                const modal = document.getElementById('searchModal');
+                                if (modal.classList.contains('show')) {
+                                    modal.addEventListener('hidden.bs.modal', openResult, {once: true});
+                                    bootstrap.Modal.getOrCreateInstance(modal).hide();
+                                } else openResult();
+                            };
+                            row.addEventListener('click', activateResult);
+                            row.addEventListener('keydown', event => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                    event.preventDefault();
+                                    activateResult();
+                                }
+                            });
+                            tbody.append(row);
+                        });
+                        if (data.limited) {
+                            const cell = tbody.insertRow().insertCell();
+                            cell.colSpan = columnCount;
+                            cell.textContent = 'Search limit reached. Choose a narrower folder or query.';
                         }
                     }).catch(error => {
                         if (request !== searchRequest || error.name === 'AbortError') return;
-                        const row = document.createElement('tr');
-                        const cell = document.createElement('td');
-                        cell.colSpan = 5; cell.style.padding = '24px'; cell.style.color = 'var(--accent-danger)';
-                        cell.textContent = error.message || 'Search failed';
-                        row.append(cell); tbody.replaceChildren(row);
+                        message(error.message || 'Search failed', 'var(--accent-danger)');
                     });
 
                 bootstrap.Modal.getOrCreateInstance(document.getElementById('searchModal')).show();
@@ -6311,8 +6981,8 @@ if ($username == null) {
                 e.preventDefault();
                 searchFiles();
             });
-            document.getElementById('search-input').addEventListener('keypress', e => {
-                if (e.key === 'Enter') searchFiles();
+            searchInput.addEventListener('keydown', e => {
+                if (e.key === 'Enter') { e.preventDefault(); searchFiles(); }
             });
 
             ['files-tab', 'mobile-files-btn'].forEach(id => document.getElementById(id).prepend(createFileIcon('', true)));
@@ -6332,6 +7002,25 @@ if ($username == null) {
             let workspaceHash = 2166136261;
             for (const char of window.location.pathname + '|' + workspaceRoot) workspaceHash = Math.imul(workspaceHash ^ char.charCodeAt(0), 16777619);
             const tabsCookieName = 'fm_tabs_' + (workspaceHash >>> 0).toString(36);
+            const folderCookieName = 'fm_folder_' + (workspaceHash >>> 0).toString(36);
+            const treeCookieName = 'fm_tree_' + (workspaceHash >>> 0).toString(36);
+            const expandedTreePaths = new Set();
+            try {
+                const cookie = document.cookie.split('; ').find(item => item.startsWith(treeCookieName + '='));
+                const paths = cookie ? JSON.parse(decodeURIComponent(cookie.substring(treeCookieName.length + 1))) : [];
+                if (Array.isArray(paths)) paths.slice(0, 100).forEach(path => {
+                    if (typeof path === 'string' && path && !path.includes('\0') && !path.split('/').some(part => part === '.' || part === '..')) expandedTreePaths.add(path);
+                });
+            } catch (_) { /* Ignore malformed tree state. */ }
+            function saveWorkspaceTree() {
+                const paths = [...expandedTreePaths].slice(0, 100);
+                let value = encodeURIComponent(JSON.stringify(paths));
+                while (value.length + treeCookieName.length > 3800 && paths.length) {
+                    paths.pop();
+                    value = encodeURIComponent(JSON.stringify(paths));
+                }
+                document.cookie = treeCookieName + '=' + value + '; Max-Age=31536000; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+            }
             let restoringTabs = false;
             let saveTabsTimer = null;
             function tabLocation(tab) {
@@ -6394,6 +7083,8 @@ if ($username == null) {
 
 
             const mobileTabsSelect = document.getElementById('mobile-tabs-select');
+            const mobileCloseFile = document.getElementById('mobile-close-file');
+            mobileCloseFile.addEventListener('click', () => editorTabs.get(activeEditorPath)?.close.click());
             function refreshMobileTabs() {
                 const placeholder = document.createElement('option');
                 placeholder.value = ''; placeholder.textContent = 'Open files (' + editorTabs.size + ')';
@@ -6405,6 +7096,7 @@ if ($username == null) {
                     mobileTabsSelect.append(option);
                 });
                 mobileTabsSelect.value = activeEditorPath || '';
+                mobileCloseFile.disabled = !editorTabs.has(activeEditorPath);
             }
             function closeMobileMenu() {
                 document.body.classList.remove('mobile-menu-open');
@@ -6416,10 +7108,6 @@ if ($username == null) {
             }
             mobileTabsSelect.addEventListener('change', () => activateTab(mobileTabsSelect.value || null));
             document.getElementById('mobile-files-btn').addEventListener('click', () => activateTab(null));
-            document.getElementById('mobile-list-btn').addEventListener('click', () => {
-                activateTab(null);
-                document.body.classList.add('mobile-file-list');
-            });
             document.getElementById('mobile-menu-toggle').addEventListener('click', event => {
                 const expanded = document.body.classList.toggle('mobile-menu-open');
                 event.currentTarget.setAttribute('aria-expanded',String(expanded));
@@ -6448,7 +7136,7 @@ if ($username == null) {
                 }
                 openRequestSerial++;
                 document.body.classList.toggle('mobile-editor', path !== null);
-                document.body.classList.remove('mobile-file-list');
+                document.body.classList.toggle('mobile-file-list', path === null);
                 closeMobileMenu();
                 activeEditorPath = path;
                 updateWorkspaceTitle();
@@ -6542,6 +7230,7 @@ if ($username == null) {
                 copyall: {run: target => target.copyAll()},
                 find: {run: target => target.editor.execCommand('replace')},
                 map: {run: target => target.toggleMinimap(), pressed: target => !target.document.getElementById('minimap').hidden, keepFocus: true},
+                history: {run: target => target.showFileHistory()},
                 gitdiff: {run: target => target.showGitDiff()},
                 inlinechanges: {run: target => target.toggleInlineChanges(), pressed: target => target.inlineChangesEnabled, keepFocus: true},
                 wrap: {run: target => target.toggleWrap(), pressed: target => target.editor.session.getUseWrapMode(), keepFocus: true},
@@ -6575,6 +7264,10 @@ if ($username == null) {
             document.addEventListener('show.bs.dropdown', updateEditorMenu);
             document.addEventListener('fullscreenchange', updateEditorMenu);
             document.getElementById('menu-show-files').addEventListener('click', () => activateTab(null));
+            document.getElementById('menu-show-tree').addEventListener('click', () => {
+                activateTab(null);
+                document.body.classList.remove('mobile-file-list');
+            });
             document.querySelectorAll('.editor-menu-action').forEach(button => {
                 button.addEventListener('click', () => runEditorCommand(button.dataset.editorCommand));
             });
@@ -6689,6 +7382,13 @@ if ($username == null) {
                 const tab = {element, button, close, frame, dot, dirty: false, loaded: false, savedLocation};
                 editorTabs.set(path, tab);
                 button.addEventListener('click', () => activateTab(path));
+                element.addEventListener('contextmenu', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    hideContextMenu();
+                    contextTarget = {name, type: 'file', directory};
+                    showContextMenu(event.clientX, event.clientY, 'file');
+                });
                 close.addEventListener('click', async () => {
                     if (tabHasChanges(tab) && !await window.workspaceConfirm('Discard unsaved changes in ' + name + '?')) return;
                     removeEditorTab(path, tab, true);
@@ -6749,7 +7449,9 @@ if ($username == null) {
 
             // ── Collapse tree ─────────────────────────────────────────
             document.getElementById('collapse-all-btn').addEventListener('click', () => {
+                expandedTreePaths.clear();
                 document.querySelectorAll('#directory-tree button[aria-expanded="true"]').forEach(button => button.click());
+                saveWorkspaceTree();
             });
 
             function browserFileURL(name, directory) {
@@ -6869,9 +7571,11 @@ if ($username == null) {
                 const id = event.target.closest('.context-menu-item')?.id;
                 const target = contextTarget;
                 if (!id || !target || contextActionBusy) return;
+                if (id === 'ctx-history' && document.getElementById(id).getAttribute('aria-disabled') === 'true') return;
                 hideContextMenu();
                 const path = (target.directory + '/' + target.name).replace(/\/+/g, '/');
                 if (id === 'ctx-open') { activateTab(null); navigateTo(path); return; }
+                if (id === 'ctx-history') { void showContextFileHistory(target); return; }
                 if (id === 'ctx-edit') { openFileEditor(target.name, target.directory); return; }
                 if (id === 'ctx-browser') { openFileInBrowser(target.name, target.directory); return; }
                 if (id === 'ctx-phone') { showPhoneQR(target.name, target.directory); return; }
@@ -6966,6 +7670,16 @@ if ($username == null) {
                 } catch {
                     window.workspaceToast('Request failed', 'Error', 'error');
                 }
+            });
+
+            document.body.classList.add('mobile-file-list');
+            document.addEventListener('workspace-open-file', event => {
+                const {path, comparison} = typeof event.detail === 'string' ? {path: event.detail} : event.detail || {};
+                if (typeof path !== 'string' || !path.startsWith('/') || path.split('/').slice(1).some(part => !part || part === '.' || part === '..')) return;
+                const split = path.lastIndexOf('/');
+                const modal = document.querySelector('.modal.show[data-workspace-module]');
+                if (modal) bootstrap.Modal.getInstance(modal)?.hide();
+                openHistoryFile({name:path.slice(split + 1), directory:path.slice(0, split)}, comparison);
             });
 
             init();
