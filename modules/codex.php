@@ -16,7 +16,7 @@ function cdxJSON($code, $data) {
     exit;
 }
 
-function cdxAtomic($path, $bytes, $mode = 0600, $owner = null, $group = null, $beforeReplace = null) {
+function cdxAtomic($path, $bytes, $mode = 0600, $owner = null, $group = null, $beforeReplace = null, $exclusive = false) {
     $temp = @tempnam(dirname($path), '.pcs-');
     if ($temp === false) throw new RuntimeException('Cannot create a temporary file.');
     try {
@@ -28,7 +28,9 @@ function cdxAtomic($path, $bytes, $mode = 0600, $owner = null, $group = null, $b
             throw new RuntimeException('Cannot replace the file while preserving its permissions.');
         }
         if ($beforeReplace) $beforeReplace();
-        if (!@rename($temp, $path)) throw new RuntimeException('Cannot replace the file.');
+        if ($exclusive ? !@link($temp, $path) : !@rename($temp, $path)) {
+            throw new RuntimeException($exclusive ? 'Cannot create the destination without overwriting it.' : 'Cannot replace the file.');
+        }
     } finally {
         if (is_file($temp)) @unlink($temp);
     }
@@ -63,7 +65,7 @@ function cdxProjectHistory($project, $history, $create = false) {
     return $folder;
 }
 
-function cdxTarget($project, $relative, $directory = false) {
+function cdxTarget($project, $relative, $directory = false, $plannedFolders = []) {
     if (!is_string($relative) || strlen($relative) > 1000 || preg_match('~[\\\\\x00-\x1f\x7f]~', $relative)) {
         throw new RuntimeException('Invalid project path.');
     }
@@ -73,8 +75,10 @@ function cdxTarget($project, $relative, $directory = false) {
     $path = $project . '/' . $relative;
     clearstatcache(true);
     $resolved = realpath($path);
-    if (is_link($path) || realpath(dirname($path)) !== dirname($path) ||
-        ($directory ? $resolved !== $path || !is_dir($path) : $resolved !== false && ($resolved !== $path || !is_file($path))) ||
+    $parent = dirname($path);
+    if (is_link($path) || (!isset($plannedFolders[$parent]) && realpath($parent) !== $parent) ||
+        ($directory === true ? $resolved !== $path || !is_dir($path) :
+            $resolved !== false && ($resolved !== $path || (!is_file($path) && !($directory === null && is_dir($path))))) ||
         cdxInside($path, __DIR__) || $path === ($GLOBALS['cdxConfig']['editor'] ?? null)) {
         throw new RuntimeException('This path is unavailable. Parent folders must already exist.');
     }
@@ -134,6 +138,22 @@ function cdxHistory($folder) {
     }));
 }
 
+function cdxLatestUpdate($history) {
+    foreach (cdxHistory($history) as $record) {
+        $entry = json_decode(file_get_contents($record, false, null, 0, CDX_JSON_LIMIT), true, 32, JSON_THROW_ON_ERROR);
+        if (!empty($entry['files'])) return [basename($record), $entry['files']];
+    }
+    return [null, []];
+}
+
+function cdxUploadedHash($file) {
+    return !empty($file['binary']) ? ($file['after_hash'] ?? null) : cdxHash($file['after']);
+}
+
+function cdxSyncedPath($history, $relative) {
+    return $history . '/synced-' . hash('sha256', $relative);
+}
+
 function cdxSync($project, $history, $relative, $hash, $acknowledge = false) {
     if (!is_string($hash) || !preg_match('/^[a-f0-9]{64}$/D', $hash)) throw new RuntimeException('Provide a SHA-256 hash.');
     $path = cdxTarget($project, $relative);
@@ -149,54 +169,175 @@ function cdxSync($project, $history, $relative, $hash, $acknowledge = false) {
             throw new DomainException('File changed on the server: ' . $relative);
         }
         if (!$acknowledge) cdxAtomic($marker, json_encode($relative, JSON_THROW_ON_ERROR));
-        elseif (is_file($marker) && !unlink($marker)) throw new RuntimeException('Cannot clear pending sync.');
+        else {
+            cdxAtomic(cdxSyncedPath($history, $relative), $hash);
+            if (is_file($marker) && !unlink($marker)) throw new RuntimeException('Cannot clear pending sync.');
+        }
     } finally {
         fclose($lock);
     }
 }
 
-function cdxPending($project, $history) {
+function cdxPending($project, $history, $uploaded) {
     $files = [];
     foreach (glob($history . '/pending-*.json') ?: [] as $marker) {
         if (is_link($marker)) continue;
         $relative = json_decode((string) @file_get_contents($marker, false, null, 0, 8192), true);
         try {
-            if (is_file(cdxTarget($project, $relative))) $files[] = $relative;
+            if (is_file(cdxTarget($project, $relative))) $files[$relative] = true;
         } catch (RuntimeException $error) { /* File no longer available. */ }
     }
-    return $files;
+    foreach ($uploaded as $file) {
+        if (!empty($file['directory']) || isset($file['mode_after'])) continue;
+        $relative = $file['path'];
+        if (isset($files[$relative]) || ($expected = cdxUploadedHash($file)) === null) continue;
+        try {
+            $path = cdxTarget($project, $relative);
+            clearstatcache(true, $path);
+            if (!is_file($path)) continue;
+            $hash = @hash_file('sha256', $path);
+            $synced = cdxSyncedPath($history, $relative);
+            if ($hash !== false && $hash !== $expected &&
+                (is_link($synced) || !is_file($synced) || @file_get_contents($synced, false, null, 0, 65) !== $hash)) {
+                $files[$relative] = true;
+            }
+        } catch (RuntimeException $error) { /* File no longer available. */ }
+    }
+    return array_map('strval', array_keys($files));
 }
 
 function cdxOutcome($entry) {
     if (isset($entry['failure'])) return 'Upload rejected';
     $count = count($entry['files']);
     $planned = $entry['planned'] ?? $count;
-    return $count . ' of ' . $planned . ' uploaded' . (empty($entry['errors']) ? '' : ' · Error');
+    return $count . ' of ' . $planned . (empty($entry['file_operations']) ? ' uploaded' : ' applied') . (empty($entry['errors']) ? '' : ' · Error');
+}
+
+const CDX_FILE_OPERATIONS = ['write', 'rename', 'delete', 'mkdir', 'copy', 'rename_dir', 'rmdir', 'chmod'];
+
+function cdxPathInfo($path) {
+    clearstatcache(true, $path);
+    $stat = @stat($path);
+    if (!$stat) throw new RuntimeException('Cannot read path metadata.');
+    $directory = is_dir($path);
+    $info = ['type' => $directory ? 'directory' : 'file', 'mode' => sprintf('%04o', $stat['mode'] & 07777)];
+    if ($directory) $info['revision'] = hash('sha256', implode(':', [$stat['dev'], $stat['ino'], $stat['ctime'], $stat['mtime'], $stat['mode']]));
+    else $info['size'] = $stat['size'];
+    return $info;
+}
+
+function cdxList($project, $relative) {
+    $folder = $relative === '' ? $project : cdxTarget($project, $relative, true);
+    $entries = [];
+    foreach (new FilesystemIterator($folder, FilesystemIterator::SKIP_DOTS) as $entry) {
+        $path = ($relative === '' ? '' : $relative . '/') . $entry->getFilename();
+        if (preg_match('//u', $path) !== 1) continue;
+        try {
+            $target = cdxTarget($project, $path, null);
+        } catch (RuntimeException $error) {
+            continue;
+        }
+        if (count($entries) >= 2000) throw new RuntimeException('Folder has more than 2,000 accessible entries.');
+        $entries[$path] = ['path' => $path] + cdxPathInfo($target);
+    }
+    ksort($entries, SORT_STRING);
+    return ['path' => $relative, 'folder' => cdxPathInfo($folder), 'entries' => array_values($entries)];
+}
+
+function cdxMetadataOperation($path, $file, $op) {
+    $info = cdxPathInfo($path);
+    $editor = $GLOBALS['cdxConfig']['editor'] ?? '';
+    if ($info['type'] === 'directory' && (cdxInside(__DIR__, $path) || ($editor !== '' && cdxInside($editor, $path)))) {
+        throw new RuntimeException('This folder contains protected editor files.');
+    }
+    if ($op === 'chmod') {
+        if (!is_string($file['mode'] ?? null) || !preg_match('/^0?[0-7]{3}$/D', $file['mode'])) {
+            throw new RuntimeException('Provide an octal mode such as "0644".');
+        }
+        if ($file['expected'] !== $info['mode']) throw new DomainException('Permissions changed: ' . $file['path']);
+        return ['mode_before' => $info['mode'], 'mode_after' => sprintf('%04o', octdec($file['mode']))];
+    }
+    if ($file['expected'] !== $info['revision']) throw new DomainException('Folder changed: ' . $file['path']);
+    if ($op === 'rmdir' && (new FilesystemIterator($path, FilesystemIterator::SKIP_DOTS))->valid()) {
+        throw new DomainException('Folder is not empty: ' . $file['path']);
+    }
+    if (!is_writable(dirname($path))) throw new RuntimeException('Cannot change the folder: ' . $file['path']);
+    return ['directory' => true];
 }
 
 function cdxPlan($project, $files) {
-    if (!is_array($files) || !$files || count($files) > 50) throw new RuntimeException('Submit between 1 and 50 files.');
+    if (!is_array($files) || !$files || count($files) > 50) throw new RuntimeException('Submit between 1 and 50 operations.');
     $plan = [];
+    $used = [];
+    $plannedFolders = [];
     $total = 0;
     foreach ($files as $file) {
         if (!is_array($file) || !array_key_exists('expected', $file)) throw new RuntimeException('Each file requires an expected hash or null.');
         $relative = $file['path'] ?? null;
-        $path = cdxTarget($project, $relative);
-        if (isset($plan[$path])) throw new RuntimeException('Duplicate path in update.');
+        $op = array_key_exists('op', $file) ? $file['op'] : 'write';
+        if (!in_array($op, CDX_FILE_OPERATIONS, true)) throw new RuntimeException('Unknown operation inside files.');
+        $folderOp = in_array($op, ['rename_dir', 'rmdir'], true);
+        $path = cdxTarget($project, $relative, $folderOp ? true : ($op === 'chmod' ? null : false), $plannedFolders);
+        $to = in_array($op, ['rename', 'copy', 'rename_dir'], true) ? cdxTarget($project, $file['to'] ?? null, false, $plannedFolders) : null;
+        if (isset($used[$path]) || ($to !== null && ($to === $path || isset($used[$to])))) {
+            throw new RuntimeException('Duplicate path in update.');
+        }
+        $used[$path] = true;
+        if ($to !== null) $used[$to] = true;
+        if ($folderOp || $op === 'chmod') {
+            $metadata = cdxMetadataOperation($path, $file, $op);
+            if ($to !== null && (file_exists($to) || cdxInside($to, $path) || !is_writable(dirname($to)) ||
+                stat($path)['dev'] !== stat(dirname($to))['dev'])) {
+                throw new DomainException('Folder destination must be absent and on the same filesystem, outside the source.');
+            }
+            if ($op === 'chmod' && $metadata['mode_before'] === $metadata['mode_after']) continue;
+            $plan[$path] = ['path' => $relative, 'op' => $op, 'expected' => $file['expected'], 'before' => null, 'after' => null] + $metadata;
+            if ($to !== null) $plan[$path]['to'] = $file['to'];
+            continue;
+        }
         $before = cdxRead($path);
         if ($file['expected'] !== cdxHash($before)) throw new DomainException('File changed on the server: ' . $relative);
-        $content = $file['content'] ?? null;
-        $encoding = $file['encoding'] ?? 'utf8';
-        if (!is_string($content) || !in_array($encoding, ['utf8', 'base64'], true)) {
-            throw new RuntimeException('Provide UTF-8 text or base64 content.');
+        $after = null;
+        if ($op === 'mkdir') {
+            if ($file['expected'] !== null) throw new RuntimeException('Use expected: null for a new folder.');
+        } elseif ($op !== 'write') {
+            if ($before === null) throw new DomainException('Source file is missing: ' . $relative);
+            if ($to !== null) {
+                if (file_exists($to)) throw new DomainException('Destination already exists: ' . $file['to']);
+                if (!isset($plannedFolders[dirname($to)]) && !is_writable(dirname($to))) throw new RuntimeException('Cannot write to the folder for ' . $file['to']);
+                $after = $before;
+            }
+        } else {
+            $content = $file['content'] ?? null;
+            $encoding = $file['encoding'] ?? 'utf8';
+            if (!is_string($content) || !in_array($encoding, ['utf8', 'base64'], true)) {
+                throw new RuntimeException('Provide UTF-8 text or base64 content.');
+            }
+            $after = cdxBytes($encoding === 'base64' ? base64_decode($content, true) : $content);
+            if ($encoding === 'utf8' && !cdxIsText($after)) throw new RuntimeException('Use base64 for binary content.');
+            if ($before === $after) continue;
         }
-        $after = cdxBytes($encoding === 'base64' ? base64_decode($content, true) : $content);
-        if ($encoding === 'utf8' && !cdxIsText($after)) throw new RuntimeException('Use base64 for binary content.');
-        if ($before === $after) continue;
-        $total += strlen($before ?? '') + strlen($after);
+        $total += strlen($before ?? '') + strlen($after ?? '');
         if ($total > CDX_BATCH_LIMIT) throw new RuntimeException('The update exceeds the 50 MiB history limit.');
-        if (($before !== null && !is_writable($path)) || !is_writable(dirname($path))) throw new RuntimeException('Cannot write to the folder for ' . $relative);
+        if ($op !== 'copy' && (($before !== null && !is_writable($path)) ||
+            (!isset($plannedFolders[dirname($path)]) && !is_writable(dirname($path))))) throw new RuntimeException('Cannot write to the folder for ' . $relative);
         $plan[$path] = ['path' => $relative, 'before' => $before, 'after' => $after];
+        if ($op === 'mkdir') {
+            $plannedFolders[$path] = true;
+            $plan[$path]['directory'] = true;
+        }
+        if ($to !== null) $plan[$path]['to'] = $file['to'];
+        if ($op === 'copy') $plan[$path]['op'] = $op;
+    }
+    foreach ($plan as $path => $file) {
+        if (!in_array($file['op'] ?? '', ['rename_dir', 'rmdir', 'chmod'], true) || !is_dir($path)) continue;
+        $destination = isset($file['to']) ? $project . '/' . $file['to'] : null;
+        foreach ($used as $other => $_) {
+            if (($other !== $path && cdxInside($other, $path)) ||
+                ($destination !== null && $other !== $destination && cdxInside($other, $destination))) {
+                throw new RuntimeException('Submit operations inside a moved, removed or permission-changed folder separately.');
+            }
+        }
     }
     return $plan;
 }
@@ -225,25 +366,73 @@ function cdxDeploy($project, $history, $request) {
         foreach ($plan as $path => $file) {
             $written = false;
             try {
-                cdxTarget($project, $file['path']);
-                if (cdxRead($path) !== $file['before']) throw new RuntimeException('The file changed during the update.');
+                $op = $file['op'] ?? '';
+                $metadataOp = in_array($op, ['rename_dir', 'rmdir', 'chmod'], true);
+                $verifySource = function () use ($project, $path, $file, $op, $metadataOp) {
+                    cdxTarget($project, $file['path'], $op === 'chmod' ? null : $metadataOp);
+                    if ($metadataOp) {
+                        cdxMetadataOperation($path, $file + ['mode' => $file['mode_after'] ?? null], $op);
+                    } elseif (cdxRead($path) !== $file['before']) {
+                        throw new RuntimeException('The file changed during the update.');
+                    }
+                };
+                $verifySource();
                 $exists = $file['before'] !== null;
                 $mode = $exists ? fileperms($path) & 0777 : 0644;
                 $owner = $exists ? fileowner($path) : null;
                 $group = $exists ? filegroup($path) : null;
                 $next = $entry;
-                $binary = ($file['before'] !== null && !cdxIsText($file['before'])) || !cdxIsText($file['after']);
-                $next['files'][] = $binary ? [
+                $binary = ($exists && !cdxIsText($file['before'])) || ($file['after'] !== null && !cdxIsText($file['after']));
+                $stored = $binary ? [
                     'path' => $file['path'], 'binary' => true,
                     'before' => $file['before'] === null ? null : strlen($file['before']),
-                    'after' => strlen($file['after']), 'after_hash' => cdxHash($file['after'])
+                    'after' => $file['after'] === null ? null : strlen($file['after']), 'after_hash' => cdxHash($file['after'])
                 ] : $file;
+                unset($stored['expected']);
+                if (isset($file['to'])) {
+                    $stored[$op === 'copy' ? 'copied_from' : 'from'] = $file['path'];
+                    $stored['path'] = $file['to'];
+                    unset($stored['to']);
+                }
+                if ($op === 'copy') $stored['before'] = null;
+                $next['files'][] = $stored;
+                if ($op !== '' || isset($stored['from']) || $stored['after'] === null) $next['file_operations'] = true;
                 // Stage the history first so storage failures leave the site untouched.
                 cdxAtomic($record . '.pending', json_encode($next, JSON_THROW_ON_ERROR));
-                cdxAtomic($path, $file['after'], $mode, $owner, $group, function () use ($project, $path, $file) {
-                    cdxTarget($project, $file['path']);
-                    if (cdxRead($path) !== $file['before']) throw new RuntimeException('The file changed during the update.');
-                });
+                if ($op === 'chmod') {
+                    $verifySource();
+                    if (!@chmod($path, octdec($file['mode_after']))) throw new RuntimeException('Cannot change permissions.');
+                } elseif ($op === 'rmdir') {
+                    $verifySource();
+                    if (!@rmdir($path)) throw new RuntimeException('Cannot remove the empty folder.');
+                } elseif ($op === 'rename_dir') {
+                    $destination = cdxTarget($project, $file['to']);
+                    $verifySource();
+                    if (file_exists($destination) || !@rename($path, $destination)) throw new RuntimeException('Cannot move the folder.');
+                } elseif (!empty($file['directory'])) {
+                    $verifySource();
+                    if (!@mkdir($path, 0755)) throw new RuntimeException('Cannot create the folder.');
+                } elseif ($op === 'copy') {
+                    $destination = cdxTarget($project, $file['to']);
+                    cdxAtomic($destination, $file['after'], $mode, null, null, function () use ($project, $file, $verifySource) {
+                        cdxTarget($project, $file['to']);
+                        $verifySource();
+                    }, true);
+                } elseif (isset($file['to'])) {
+                    $destination = cdxTarget($project, $file['to']);
+                    $verifySource();
+                    if (!@link($path, $destination)) throw new RuntimeException('Cannot create the destination without overwriting it: ' . $file['to']);
+                    $written = true;
+                    if (!@unlink($path)) {
+                        $written = !@unlink($destination);
+                        throw new RuntimeException($written ? 'Both paths may now exist. Review the files before retrying.' : 'Cannot remove the original file.');
+                    }
+                } elseif ($file['after'] === null) {
+                    $verifySource();
+                    if (!@unlink($path)) throw new RuntimeException('Cannot delete the file.');
+                } else {
+                    cdxAtomic($path, $file['after'], $mode, $owner, $group, $verifySource);
+                }
                 $written = true;
                 if (!@rename($record . '.pending', $record)) {
                     throw new RuntimeException('File was written, but history could not be published. A pending record remains.');
@@ -309,8 +498,12 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
     host.innerHTML = `<div class="modal fade" id="workspace-module-modal" data-workspace-module tabindex="-1" aria-labelledby="workspace-module-title" aria-hidden="true">
         <div class="modal-dialog modal-xl modal-dialog-centered">
             <div class="modal-content">
-                <div class="modal-header"><h5 class="modal-title" id="workspace-module-title"><i class="fas fa-puzzle-piece me-2" aria-hidden="true"></i>Codex</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
-                <div class="modal-body p-0"><iframe title="Codex" style="display:block;width:100%;height:72dvh;border:0;background:var(--bg-main)"></iframe></div>
+                <div class="modal-header"><h5 class="modal-title" id="workspace-module-title"><i class="fas fa-puzzle-piece me-2" aria-hidden="true"></i>AI Integration</h5><div class="module-window-controls">
+                    <button type="button" data-minimize-module aria-label="Minimize" title="Minimize"><i class="fas fa-minus" aria-hidden="true"></i></button>
+                    <button type="button" data-maximize-module aria-label="Maximize" title="Maximize" aria-pressed="false"><i class="fas fa-expand" aria-hidden="true"></i></button>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div></div>
+                <div class="modal-body p-0"><iframe title="AI Integration" style="display:block;width:100%;height:72dvh;border:0;background:var(--bg-main)"></iframe></div>
                 <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
             </div>
         </div>
@@ -320,12 +513,16 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
     const dialog = bootstrap.Modal.getOrCreateInstance(modal);
     const open = url => {
         url.searchParams.set('embedded', '1');
-        frame.src = url.href;
+        if (url.href !== frame.src || !modal.dataset.moduleMinimized) {
+            if (window.workspaceLoadModuleFrame) window.workspaceLoadModuleFrame(frame, url.href);
+            else frame.src = url.href;
+        }
         dialog.show(link);
     };
     link.addEventListener('click', event => {
         event.preventDefault();
-        open(new URL(link.href));
+        if (modal.dataset.moduleMinimized && frame.hasAttribute('src')) dialog.show(link);
+        else open(new URL(link.href));
     });
     document.addEventListener('workspace-file-saved', async ({detail}) => {
         const url = new URL(link.href);
@@ -333,9 +530,9 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
         try {
             const response = await fetch(url.href, {method:'POST', body:new URLSearchParams(detail)});
             if (response.ok) updateDecorations();
-            else window.workspaceToast?.('Could not record the file for Codex sync.', 'Codex', 'warning');
+            else window.workspaceToast?.('Could not record the file for AI agent sync.', 'AI Integration', 'warning');
         } catch (_) {
-            window.workspaceToast?.('Could not record the file for Codex sync.', 'Codex', 'warning');
+            window.workspaceToast?.('Could not record the file for AI agent sync.', 'AI Integration', 'warning');
         }
     });
     let details = {};
@@ -347,6 +544,18 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
         if (current) url.searchParams.set('compare', 'current');
         open(url);
     };
+    const timelineRequest = async (path, fields) => {
+        const url = new URL(link.href);
+        url.search = new URLSearchParams({module:'codex',path,...fields});
+        const response = await fetch(url);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'AI history unavailable.');
+        return data;
+    };
+    document.addEventListener('DOMContentLoaded', () => document.dispatchEvent(new CustomEvent('workspace-timeline-provider', {detail:{
+        list:path => timelineRequest(path, {timeline:'list'}),
+        read:async (path, entry) => (await timelineRequest(path, {timeline:'read',site:entry.site,update:entry.update,file:entry.file})).baseline
+    }})));
     const updateDecorations = () => {
         document.dispatchEvent(new CustomEvent('workspace-decoration-source', {detail: enabled ? {
             async load() {
@@ -363,8 +572,8 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
                     return {status:'error'};
                 }
             },
-            title: 'View changes from the last Codex upload',
-            folderTitles: {added: 'Contains files added by the last Codex upload', changed: 'Contains changes from the last Codex upload'},
+            title: 'View changes from the last AI agent upload',
+            folderTitles: {added: 'Contains files added by the last AI agent upload', changed: 'Contains changes from the last AI agent upload'},
             open: openEntry,
             openCurrent: path => openEntry(path, true)
         } : null}));
@@ -374,7 +583,7 @@ if ($cdxUI && ($_GET['launcher'] ?? '') === '1') {
         updateDecorations();
     });
     document.addEventListener('DOMContentLoaded', updateDecorations);
-    modal.addEventListener('hidden.bs.modal', () => { frame.removeAttribute('src'); });
+    modal.addEventListener('hidden.bs.modal', () => { if (!modal.dataset.moduleMinimized) frame.removeAttribute('src'); });
     frame.addEventListener('load', () => {
         frame.contentDocument?.addEventListener('keydown', event => {
             if (event.key === 'Escape') dialog.hide();
@@ -438,14 +647,18 @@ if (!$cdxUI) {
         if (!is_array($request)) throw new RuntimeException('Send a JSON object.');
         switch ($request['action'] ?? '') {
             case 'pending':
-                cdxJSON(200, ['files' => cdxPending($project, $history)]);
+                [, $uploaded] = cdxLatestUpdate($history);
+                cdxJSON(200, ['files' => cdxPending($project, $history, $uploaded)]);
                 break;
             case 'ack_sync':
                 cdxSync($project, $history, $request['path'] ?? null, $request['hash'] ?? null, true);
                 cdxJSON(200, ['status' => 'success']);
                 break;
             case 'status':
-                cdxJSON(200, ['status' => 'connected', 'checked_at' => time()]);
+                cdxJSON(200, ['status' => 'connected', 'checked_at' => time(), 'file_operations' => CDX_FILE_OPERATIONS, 'directory_listing' => true]);
+                break;
+            case 'list':
+                cdxJSON(200, cdxList($project, $request['path'] ?? ''));
                 break;
             case 'read':
                 $bytes = cdxRead(cdxTarget($project, $request['path'] ?? null));
@@ -507,6 +720,34 @@ if (($_GET['pending-sync'] ?? '') === '1') {
     }
 }
 
+if ($cdxUI && isset($_GET['timeline'])) {
+    try {
+        $workspace = realpath($config['root_path']);
+        $path = is_string($_GET['path'] ?? null) ? realpath($_GET['path']) : false;
+        if (!$path || !$workspace || !cdxInside($path, $workspace) || !is_file($path)) throw new RuntimeException('Invalid timeline file.');
+        $items = [];
+        foreach ($cdxSites as $siteId => $site) {
+            [$project, $history] = cdxFolders($site['project'], $site['history']);
+            if (!cdxInside($path, $project)) continue;
+            foreach (cdxHistory(cdxProjectHistory($project, $history)) as $record) {
+                $entry = json_decode(file_get_contents($record, false, null, 0, CDX_JSON_LIMIT), true, 32, JSON_THROW_ON_ERROR);
+                foreach ($entry['files'] ?? [] as $index => $file) {
+                    if ($file['path'] !== substr($path, strlen($project) + 1) || !empty($file['binary']) || !is_string($file['after'] ?? null) || !empty($file['directory']) || isset($file['mode_after'])) continue;
+                    $id = basename($record);
+                    if (($_GET['timeline'] ?? '') === 'read') {
+                        if (($_GET['site'] ?? '') === $siteId && ($_GET['update'] ?? '') === $id && ($_GET['file'] ?? '') === (string) $index) cdxJSON(200, ['baseline'=>$file['after']]);
+                    } else {
+                        $items[] = ['site'=>$siteId,'update'=>$id,'file'=>$index,'time'=>$entry['time'],
+                            'date'=>fmModifiedDate($entry['time'], $config['date_format']), 'label'=>'AI · ' . $entry['description']];
+                    }
+                }
+            }
+        }
+        if ($_GET['timeline'] === 'read') throw new RuntimeException('History version is unavailable.');
+        cdxJSON(200, ['items'=>$items]);
+    } catch (Throwable $error) { cdxJSON(400, ['error'=>$error->getMessage()]); }
+}
+
 if (($_GET['decorations'] ?? '') === '1') {
     $files = $details = $dates = $pending = [];
     $workspace = realpath($config['root_path']);
@@ -515,29 +756,26 @@ if (($_GET['decorations'] ?? '') === '1') {
             [$project, $history] = cdxFolders($site['project'], $site['history']);
             $history = cdxProjectHistory($project, $history);
             $cdxConfig = $site;
-            foreach (cdxPending($project, $history) as $relative) {
+            [$id, $uploaded] = cdxLatestUpdate($history);
+            $pendingFiles = array_fill_keys(cdxPending($project, $history, $uploaded), true);
+            foreach ($pendingFiles as $relative => $_) {
                 $path = $project . '/' . $relative;
                 if ($workspace && cdxInside($path, $workspace)) $pending[substr($path, strlen(rtrim($workspace, '/')) + 1)] = true;
             }
-            foreach (cdxHistory($history) as $record) {
-                $entry = json_decode(file_get_contents($record, false, null, 0, CDX_JSON_LIMIT), true, 32, JSON_THROW_ON_ERROR);
-                if (empty($entry['files'])) continue;
-                $id = basename($record);
-                foreach ($entry['files'] as $index => $file) {
-                    $path = $project . '/' . $file['path'];
-                    $resolved = realpath($path);
-                    if (!$workspace || !cdxInside($path, $workspace) || ($resolved && (!cdxInside($resolved, $workspace) || !cdxInside($resolved, $project)))) continue;
-                    $key = substr($path, strlen(rtrim($workspace, '/')) + 1);
-                    if (($dates[$key] ?? '') >= $id) continue;
-                    $dates[$key] = $id;
-                    $files[$key] = $file['before'] === null ? 'A' : 'M';
-                    $expected = !empty($file['binary']) ? ($file['after_hash'] ?? null) : cdxHash($file['after']);
-                    $size = !empty($file['binary']) ? $file['after'] : strlen($file['after']);
-                    $changed = $expected !== null && (!$resolved || !is_file($resolved) ||
-                        @filesize($resolved) !== $size || @hash_file('sha256', $resolved) !== $expected);
-                    $details[$key] = ['site' => $siteId, 'update' => $id, 'file' => $index, 'changed' => $changed];
-                }
-                break;
+            foreach ($uploaded as $index => $file) {
+                if (!empty($file['directory']) || isset($file['mode_after'])) continue;
+                $path = $project . '/' . $file['path'];
+                $resolved = realpath($path);
+                if (!$workspace || !cdxInside($path, $workspace) || ($resolved && (!cdxInside($resolved, $workspace) || !cdxInside($resolved, $project)))) continue;
+                $key = substr($path, strlen(rtrim($workspace, '/')) + 1);
+                if (($dates[$key] ?? '') >= $id) continue;
+                $dates[$key] = $id;
+                $files[$key] = $file['after'] === null ? 'D' : ($file['before'] === null ? 'A' : 'M');
+                $expected = cdxUploadedHash($file);
+                $size = !empty($file['binary']) ? $file['after'] : strlen($file['after'] ?? '');
+                $changed = $expected !== null && (!$resolved || !is_file($resolved) ||
+                    @filesize($resolved) !== $size || @hash_file('sha256', $resolved) !== $expected);
+                $details[$key] = ['site' => $siteId, 'update' => $id, 'file' => $index, 'changed' => $changed && isset($pendingFiles[$file['path']])];
             }
         } catch (Throwable $error) {
             continue;
@@ -553,9 +791,11 @@ if (($_GET['decorations'] ?? '') === '1') {
 $cdxEscape = static function ($value) { return htmlspecialchars((string) $value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); };
 $cdxEmbedded = ($_GET['embedded'] ?? '') === '1';
 $cdxBaseURL = '?module=codex' . ($cdxEmbedded ? '&embedded=1' : '');
-$cdxSiteId = $_GET['site'] ?? (array_key_first($cdxSites) ?? 'new');
+$cdxDefaultSite = array_key_first($cdxSites) ?? 'new';
+$cdxSavedSite = $_COOKIE['pcs_codex_site'] ?? null;
+$cdxSiteId = $_GET['site'] ?? (!$isPostRequest && is_string($cdxSavedSite) && isset($cdxSites[$cdxSavedSite]) ? $cdxSavedSite : $cdxDefaultSite);
 if (!is_string($cdxSiteId) || ($cdxSiteId !== 'new' && !isset($cdxSites[$cdxSiteId]))) {
-    $cdxSiteId = array_key_first($cdxSites) ?? 'new';
+    $cdxSiteId = $cdxDefaultSite;
 }
 $cdxConfig = $cdxSites[$cdxSiteId] ?? [];
 $cdxToken = '';
@@ -625,6 +865,15 @@ if ($isPostRequest) {
         if (is_resource($lock)) fclose($lock);
     }
 }
+if ($cdxSiteId !== $cdxSavedSite && $cdxSiteId !== 'new' && !$cdxFailed && !isset($_GET['update'])) {
+    setcookie('pcs_codex_site', $cdxSiteId, [
+        'expires' => time() + 365 * 86400,
+        'path' => $_SERVER['SCRIPT_NAME'],
+        'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
+}
 $cdxURL = $cdxBaseURL . '&site=' . rawurlencode($cdxSiteId);
 $cdxUpdates = [];
 $cdxEntry = null;
@@ -666,7 +915,7 @@ $cdxEndpoint = rtrim(dirname($_SERVER['SCRIPT_NAME']), '/') . '/modules/codex.ph
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex updates</title>
+<title>AI Integration</title>
 <link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/css/bootstrap.min.css" rel="stylesheet">
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
 <?= $workspaceThemeScript ?>
@@ -718,7 +967,7 @@ article {min-width:0;}
 <body class="modal">
 <?php if (!$cdxEmbedded): ?><header><a href="<?= $cdxEscape($_SERVER['SCRIPT_NAME']) ?>"><i class="fas fa-arrow-left" aria-hidden="true"></i> Pocket Code Studio</a></header><?php endif; ?>
 <section class="pb-1">
-<h1><i class="fas fa-code-branch" aria-hidden="true"></i> Codex updates</h1>
+<h1><i class="fas fa-code-branch" aria-hidden="true"></i> Deployment history</h1>
 <?php if ($cdxSites): ?>
 <form method="get" class="<?= $cdxConfig && !$cdxMessage ? 'mb-0' : 'mb-2' ?>">
 <input type="hidden" name="module" value="codex">
@@ -767,11 +1016,11 @@ document.getElementById('cdx-decorations').addEventListener('change', async ({ta
         const response = await fetch('?module=codex&decoration-setting=1', {
             method:'POST', body:new URLSearchParams({enabled: enabled ? '1' : '0'})
         });
-        if (!response.ok) throw new Error('Could not save Codex display settings.');
+        if (!response.ok) throw new Error('Could not save AI integration display settings.');
         window.parent.document.dispatchEvent(new CustomEvent('codex-decoration-setting', {detail: enabled}));
     } catch (_) {
         target.checked = !enabled;
-        window.parent.workspaceToast?.('Could not save Codex display settings.', 'Codex', 'warning');
+        window.parent.workspaceToast?.('Could not save AI integration display settings.', 'AI Integration', 'warning');
     } finally {
         target.disabled = false;
     }
@@ -790,7 +1039,7 @@ document.getElementById('cdx-decorations').addEventListener('change', async ({ta
 <div>
 <label class="form-label" for="cdx-project"><i class="fas fa-folder" aria-hidden="true"></i> Project folder</label>
 <div class="input-group"><input class="form-control" id="cdx-project" name="project" required value="<?= $cdxEscape($projectInput) ?>"><?php if ($cdxEmbedded): ?><button type="button" class="btn btn-secondary" data-browse="cdx-project" aria-label="Browse project folder"><i class="fas fa-folder-open" aria-hidden="true"></i> Browse…</button><?php endif; ?></div>
-<p class="form-text setup-note">The site folder Codex can read and update.</p>
+<p class="form-text setup-note">The site folder the connected agent can read and update.</p>
 </div>
 <div>
 <label class="form-label" for="cdx-history"><i class="fas fa-box-archive" aria-hidden="true"></i> Private history folder</label>
@@ -800,7 +1049,7 @@ document.getElementById('cdx-decorations').addEventListener('change', async ({ta
 </div>
 <div class="form-check mt-2 mb-3">
 <input class="form-check-input" type="checkbox" id="cdx-decorations"<?= $showDecorations ? ' checked' : '' ?>>
-<label class="form-check-label" for="cdx-decorations">Show last Codex upload in Files</label>
+<label class="form-check-label" for="cdx-decorations">Show the last AI agent upload in Files</label>
 <p class="form-text mb-0">Replaces Git marks in the file list and tree for all sites visible in this workspace.</p>
 </div>
 <div class="connection-actions d-flex flex-wrap gap-2">
@@ -842,26 +1091,31 @@ document.getElementById('cdx-remove-site').addEventListener('submit', async even
 <?php if ($cdxToken): ?>
 <dialog id="cdx-connection-dialog" class="modal-content" aria-labelledby="cdx-connection-title">
 <div class="modal-header">
-<h2 class="modal-title mb-0" id="cdx-connection-title"><i class="fas fa-key me-2" aria-hidden="true"></i>Codex desktop or CLI</h2>
+<h2 class="modal-title mb-0" id="cdx-connection-title"><i class="fas fa-key me-2" aria-hidden="true"></i>Connect an AI agent</h2>
 <button type="submit" form="cdx-connection-actions" class="btn-close" aria-label="Close"></button>
 </div>
 <div class="modal-body">
-<p>Click <strong>Copy instructions</strong> and paste the text into your private Codex chat. Codex will save the connection on your computer.</p>
-<label class="form-label" for="cdx-instructions">Instructions for the Codex chat</label>
+<p>Click <strong>Copy setup instructions</strong> and paste the text into a private chat with your AI coding agent. The agent can save the connection on your computer.</p>
+<label class="form-label" for="cdx-instructions">Setup instructions for your AI agent</label>
 <textarea class="form-control connection-value" id="cdx-instructions" data-endpoint="<?= $cdxEscape($cdxEndpoint) ?>" readonly rows="8">Use Pocket Code Studio at __ENDPOINT__ to work with <?= $cdxEscape($cdxConfig['name'] ?? basename($cdxConfig['project'])) ?>.
 API token: <?= $cdxEscape($cdxToken) ?>
 
 Choose a site-specific private file outside the repository. Create it yourself with permissions restricted to my account and store the endpoint and token there as PCS_CODEX_URL and PCS_CODEX_TOKEN. Use the saved file for API calls and tell me its location without repeating the token. Start by calling {"action":"status"} to verify the connection without a test file.
 Send JSON via POST with X-PCS-Token: &lt;token&gt; and Content-Type: application/json. Send the raw token, without the Bearer prefix. Use paths relative to the configured project. For binary files, send base64 in content and set encoding to "base64". Decode read results with encoding "base64" before comparing or saving locally.
 Between tasks, call {"action":"modified","since":LAST_CHECKED_AT} with the previous server timestamp in seconds. An optional project-relative "folder" limits the scan. Read the candidates and compare hashes. Record checked_at locally after reviewing them. If there is no previous scan timestamp, call {"action":"modified"} to scan the last 24 hours. If the scan exceeds its limits, report that and continue with the files relevant to the task.
-Add a short project-local AGENTS.md rule (preserve existing rules, never include the token): when I write “sync”, pull changes from Pocket Code Studio using the saved connection. Call {"action":"pending"}, read each listed file, and integrate the server changes locally. If local edits conflict, show me the conflict and leave that file pending. Once saved locally, call {"action":"ack_sync","path":"relative/file.php","hash":"SHA-256 from read"}. On HTTP 409, reread and reconcile before acknowledging. Summarize the updated files. Never upload as part of “sync”.
+Add a short project-local AGENTS.md rule (preserve existing rules, never include the token): when I write “sync”, pull changes from Pocket Code Studio using the saved connection. Call {"action":"pending"}, read each listed file, and integrate the server changes locally. This also includes current files that differ from the latest deployment and have not yet been acknowledged. If local edits conflict, show me the conflict and leave that file pending. Once saved locally, call {"action":"ack_sync","path":"relative/file.php","hash":"SHA-256 from read"}. On HTTP 409, reread and reconcile before acknowledging. Summarize the updated files. Never upload as part of “sync”.
 Before editing, call {"action":"read","path":"relative/file.php"}. Integrate newer server content locally and retain the returned hash. A missing file returns null for content and hash.
 Before uploading, call {"action":"check","files":[{"path":"relative/file.php","expected":"original SHA-256","content":"full new text"}]}. Use null for expected only for a new file.
+For deletion use {"op":"delete","path":"old.php","expected":"original SHA-256"}. For renaming use {"op":"rename","path":"old.php","to":"new.php","expected":"original SHA-256"}. Read the source first. The destination must be absent and its parent must exist. Include these operations in the same check and apply workflow and show the exact deletions and old → new paths before asking for deployment approval. For missing files detected via changes, report them before removing any local copies.
+To create a folder, use {"op":"mkdir","path":"assets/icons","expected":null}. Put new parent folders before their children and file writes in the same batch.
+Use {"action":"list","path":""} to list the project root, or set path to a relative folder. To copy a file, use {"op":"copy","path":"old.php","to":"copy.php","expected":"source SHA-256 from read"}.
+Use {"op":"rename_dir","path":"old","to":"new","expected":"folder revision from list"} to rename or move a folder. Use {"op":"rmdir","path":"old","expected":"folder revision from list"} for an empty folder. To remove a nonempty folder, list its contents, show the full deletion plan, and remove the approved contents before re-listing and removing the empty folder.
+To change permissions, use {"op":"chmod","path":"script.php","mode":"0755","expected":"0644"}, using the current mode from list as expected. Include these operations in check and apply and show each affected path before asking for deployment approval.
 Show me the planned changes. When I explicitly ask you to deploy, send the same files with action "apply" and a one-line description of up to 100 characters. On conflict or partial write, reread the affected files before retrying.</textarea>
 <p id="cdx-copy-status" class="form-text mb-0" role="status"></p>
 </div>
 <form id="cdx-connection-actions" class="modal-footer" method="dialog">
-<button type="button" class="btn btn-primary" data-copy="cdx-instructions" autofocus><i class="fas fa-copy" aria-hidden="true"></i> Copy instructions</button>
+<button type="button" class="btn btn-primary" data-copy="cdx-instructions" autofocus><i class="fas fa-copy" aria-hidden="true"></i> Copy setup instructions</button>
 <button type="submit" class="btn btn-secondary">Close</button>
 </form>
 </dialog>
@@ -899,9 +1153,9 @@ document.querySelectorAll('[data-browse]').forEach(button => {
 <?php endif; ?>
 
 </section>
-<section>
+<section id="codex-deployments">
 <?php if ($cdxEntry): ?>
-<p><a href="<?= $cdxEscape($cdxURL) ?>"><i class="fas fa-arrow-left" aria-hidden="true"></i> All updates</a></p>
+<p><a href="<?= $cdxEscape($cdxURL) ?>"><i class="fas fa-arrow-left" aria-hidden="true"></i> Deployment history</a></p>
 <h2><?= $cdxEscape($cdxEntry['description']) ?></h2>
 <p><i class="fas fa-clock" aria-hidden="true"></i> <?= $cdxEscape(date('d M Y, H:i:s', $cdxEntry['time'])) ?> · <?= $cdxEscape(cdxOutcome($cdxEntry)) ?></p>
 <?php if (isset($cdxEntry['failure'])): ?><p role="alert"><?= $cdxEscape($cdxEntry['failure']) ?></p><?php endif; ?>
@@ -918,13 +1172,20 @@ document.querySelectorAll('[data-browse]').forEach(button => {
 <?php
 $cdxWorkspace = realpath($config['root_path']);
 foreach ($cdxEntry['files'] as $index => $file):
-    $status = $file['before'] === null ? 'A' : 'M';
-    $target = realpath($cdxProject . '/' . $file['path']);
+    $folder = !empty($file['directory']);
+    [$status, $statusLabel] = [
+        'rename_dir' => ['R', 'Folder moved'], 'rmdir' => ['D', 'Folder removed'],
+        'chmod' => ['M', 'Permissions changed'],
+    ][$file['op'] ?? ''] ?? ($folder ? ['A', 'Folder created'] :
+        (isset($file['copied_from']) ? ['A', 'Copied'] : ($file['after'] === null ? ['D', 'Deleted'] :
+        (isset($file['from']) ? ['R', 'Renamed'] : ($file['before'] === null ? ['A', 'Added'] : ['M', 'Modified'])))));
+    $source = $file['from'] ?? $file['copied_from'] ?? null;
+    $target = $status === 'D' ? false : realpath($cdxProject . '/' . $file['path']);
     $openPath = $cdxEmbedded && $target && $cdxWorkspace && is_file($target) &&
         cdxInside($target, $cdxProject) && cdxInside($target, $cdxWorkspace)
         ? substr($target, strlen(rtrim($cdxWorkspace, '/'))) : '';
 ?>
-<button type="button" class="codex-file-choice" data-index="<?= $index ?>" data-open-path="<?= $cdxEscape($openPath) ?>" aria-pressed="false"><i class="fas fa-file-code" aria-hidden="true"></i><span><?= $cdxEscape($file['path']) ?></span><span class="git-status-badge" title="<?= $status === 'A' ? 'Added' : 'Modified' ?>"><?= $status ?></span></button>
+<button type="button" class="codex-file-choice" data-index="<?= $index ?>" data-open-path="<?= $cdxEscape($openPath) ?>" aria-pressed="false"><i class="fas <?= $folder ? 'fa-folder' : 'fa-file-code' ?>" aria-hidden="true"></i><span><?= $cdxEscape($source !== null ? $source . ' → ' . $file['path'] : $file['path']) ?></span><span class="git-status-badge" title="<?= $statusLabel ?>"><?= $status ?></span></button>
 <?php endforeach; ?>
 </aside>
 <article><div class="diff-heading"><h2 id="codex-file"></h2><?php if ($cdxEmbedded): ?><div class="diff-actions"><button type="button" class="btn btn-secondary" id="codex-open" disabled><i class="fas fa-file-code" aria-hidden="true"></i> Open file</button><button type="button" class="btn btn-secondary" id="codex-open-changes" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Open changes</button></div><?php endif; ?></div><div id="codex-diff" tabindex="0">Loading comparison…</div></article>
@@ -946,7 +1207,7 @@ function openInWorkspace(comparison) {
 openFile?.addEventListener('click', () => openInWorkspace(null));
 openChanges?.addEventListener('click', () => openInWorkspace({
     baseline:comparingCurrent ? selectedFile.after : (selectedFile.before ?? ''),
-    date:(comparingCurrent ? 'Uploaded' : 'Before Codex update') + ' · <?= $cdxEscape(date('d M Y, H:i:s', $cdxEntry['time'])) ?>'
+    date:(comparingCurrent ? 'Uploaded' : 'Before AI agent update') + ' · <?= $cdxEscape(date('d M Y, H:i:s', $cdxEntry['time'])) ?>'
 }));
 function showFile(button, compareCurrent = false) {
     comparingCurrent = compareCurrent;
@@ -954,26 +1215,36 @@ function showFile(button, compareCurrent = false) {
     if (openFile) {
         openFile.dataset.path = button.dataset.openPath;
         openFile.disabled = !openFile.dataset.path;
-        openChanges.disabled = openFile.disabled || !!selectedFile.binary;
+        openChanges.disabled = openFile.disabled || !!selectedFile.binary || !!selectedFile.mode_after;
         openFile.title = openFile.disabled ? 'The current file is unavailable in this workspace.' : 'Open the current file in the editor.';
         openChanges.title = selectedFile.binary ? 'Text comparison is unavailable for binary files.' : openFile.disabled ? openFile.title : compareCurrent ? 'Compare the current editor text with the uploaded version.' : 'Compare the current editor text with the file before this update.';
     }
     const file = files[button.dataset.index], output = document.getElementById('codex-diff');
-    document.getElementById('codex-file').textContent = file.path;
+    const source = file.from ?? file.copied_from;
+    document.getElementById('codex-file').textContent = source ? source + ' → ' + file.path : file.path;
     buttons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
     const current = compareCurrent ? JSON.parse(document.getElementById('codex-current').textContent) : null;
     if (compareCurrent && current === null) {
         output.textContent = 'Uploaded → Current is unavailable. The current file must be readable UTF-8 text up to 1 MiB.';
         return;
     }
+    if (file.directory || file.mode_after) {
+        output.textContent = file.mode_after ? 'Permissions: ' + file.mode_before + ' → ' + file.mode_after :
+            ({rename_dir: 'Folder moved.', rmdir: 'Empty folder removed.'}[file.op] ?? 'Folder created.');
+        return;
+    }
     if (file.binary) {
         const before = file.before === null ? 'New file' : file.before + ' bytes before';
-        output.textContent = 'Binary file · ' + before + ' · ' + file.after + ' bytes after';
+        output.textContent = 'Binary file · ' + before + ' · ' + (file.after === null ? 'Deleted' : file.after + ' bytes after');
         output.scrollTo(0, 0);
         return;
     }
+    if (file.from && !compareCurrent) {
+        output.textContent = 'Renamed without content changes.';
+        return;
+    }
     try {
-        const patch = Diff.createTwoFilesPatch(file.path, file.path, compareCurrent ? file.after : (file.before ?? ''), compareCurrent ? current : file.after);
+        const patch = Diff.createTwoFilesPatch(file.from ?? file.path, file.path, compareCurrent ? file.after : (file.before ?? ''), compareCurrent ? current : (file.after ?? ''));
         const view = window.renderGitDiff(patch.split('\n').slice(4).join('\n'));
         const labels = view.querySelectorAll('.git-diff-column-head .git-diff-number');
         labels[0].textContent = compareCurrent ? 'Uploaded' : 'Before';
@@ -999,8 +1270,20 @@ if (buttons.length) showFile(requested || buttons[0], !!requested && parameters.
 </a>
 <?php endforeach; ?>
 <?php elseif ($selection ?? ''): ?>
-<p>This update is unavailable. <a href="<?= $cdxEscape($cdxURL) ?>">All updates</a></p>
+<p>This update is unavailable. <a href="<?= $cdxEscape($cdxURL) ?>">Deployment history</a></p>
 <?php else: ?><p><i class="fas fa-clock-rotate-left" aria-hidden="true"></i> No updates recorded.</p><?php endif; ?>
 </section>
+<?php if ($cdxEmbedded): ?>
+<script>
+document.getElementById('codex-deployments').addEventListener('click', event => {
+    const link = event.target.closest('a[href]');
+    if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const load = window.parent.workspaceLoadModuleFrame;
+    if (!load || !window.frameElement) return;
+    event.preventDefault();
+    load(window.frameElement, link.href);
+});
+</script>
+<?php endif; ?>
 </body>
 </html>

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pocket Code Studio v1.4.0
+ * Pocket Code Studio v1.4.1
  * Minimum PHP: 7.4
  * A single-file PHP file manager and browser-based code editor.
  * Maintained by Renat2985 — https://github.com/Renat2985/pocket-code-studio
@@ -369,11 +369,26 @@ $fmCSRFToken = $_SESSION['csrf'];
 $authFingerprint = hash('sha256', $authPasswordHash);
 $authNow = time();
 $authenticated = isset($_SESSION['auth'], $_SESSION['auth_started'], $_SESSION['auth_seen']) && hash_equals($authFingerprint, $_SESSION['auth']) && $authNow - $_SESSION['auth_seen'] < 1800 && $authNow - $_SESSION['auth_started'] < 43200;
-$authAction = $_POST['fm_auth_action'] ?? '';
+$authAction = $_POST['auth_action'] ?? $_POST['fm_auth_action'] ?? '';
 $isPostRequest = ($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST';
+$reauth = ($_GET['reauth'] ?? '') === '1';
+if ($reauth && $authenticated && !$isPostRequest) {
+    $_SESSION['auth_seen'] = $authNow;
+    session_write_close();
+    if (($_SERVER['REQUEST_METHOD'] ?? '') === 'HEAD') {
+        http_response_code(204);
+        exit;
+    }
+    header('Content-Type: text/html; charset=UTF-8');
+    echo '<!DOCTYPE html><script>parent.workspaceSignedIn?.(window,' . json_encode($fmCSRFToken) . ')</script>';
+    exit;
+}
 if ($isPostRequest) {
-    $submittedCSRF = $_SERVER['HTTP_X_FM_CSRF'] ?? $_POST['fm_csrf'] ?? '';
-    if (!is_string($submittedCSRF) || !hash_equals($fmCSRFToken, $submittedCSRF)) fmAuthReply(403, 'Invalid request token. Reload the page and try again.');
+    $submittedCSRF = $_SERVER['HTTP_X_FM_CSRF'] ?? $_POST['csrf'] ?? $_POST['fm_csrf'] ?? '';
+    if (!is_string($submittedCSRF) || !hash_equals($fmCSRFToken, $submittedCSRF)) {
+        if ($authAction !== 'login' && (!$authenticated || isset($_SERVER['HTTP_X_FM_CSRF']))) header('X-Reauth: 1');
+        fmAuthReply(403, 'Invalid request token. Reload the page and try again.');
+    }
 }
 $loginError = '';
 if (!$authenticated && $authAction === 'login' && $isPostRequest) {
@@ -383,10 +398,10 @@ if (!$authenticated && $authAction === 'login' && $isPostRequest) {
         $_SESSION['auth'] = $authFingerprint;
         $_SESSION['auth_started'] = $_SESSION['auth_seen'] = $authNow;
 
-        $_SESSION['login_notice_pending'] = true;
+        if (!$reauth) $_SESSION['login_notice_pending'] = true;
         $_SESSION['csrf'] = bin2hex(random_bytes(32));
         session_write_close();
-        header('Location: ' . $_SERVER['SCRIPT_NAME'], true, 303);
+        header('Location: ' . $_SERVER['SCRIPT_NAME'] . ($reauth ? '?reauth=1' : ''), true, 303);
         exit;
     }
     $loginError = $blocked ? 'Too many attempts. Try again later.' : 'Incorrect password.';
@@ -395,13 +410,25 @@ if (!$authenticated && $authAction === 'login' && $isPostRequest) {
 if (!$authenticated) {
     unset($_SESSION['auth'], $_SESSION['auth_started'], $_SESSION['auth_seen']);
     $isDataRequest = isset($_GET['editor'], $_GET['filename']) || isset($_GET['action']) || ($isPostRequest && $authAction !== 'login');
-    if ($isDataRequest) fmAuthReply(401, 'Authentication required.');
+    if ($isDataRequest || ($reauth && ($_SERVER['REQUEST_METHOD'] ?? '') === 'HEAD')) {
+        header('X-Reauth: 1');
+        fmAuthReply(401, 'Authentication required.');
+    }
     if (!$loginError) http_response_code(401);
     ?>
 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in</title>
-<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#21252b;color:#abb2bf;font:14px system-ui}form{width:min(340px,80vw);padding:28px;background:#282c34;border:1px solid #3b4048;border-radius:8px}h1{font-size:20px;margin:0 0 24px}label{display:block;margin-bottom:8px}input,button{box-sizing:border-box;width:100%;padding:10px;border-radius:4px;font:inherit}input{background:#21252b;color:#abb2bf;border:1px solid #495162}button{margin-top:16px;background:#528bff;color:white;border:0;cursor:pointer}.error{color:#ef596f}small{display:block;margin-top:18px;color:#7f848e}</style></head><body>
-<form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME'], ENT_QUOTES, 'UTF-8') ?>">
-<h1>Sign in</h1><input type="hidden" name="fm_auth_action" value="login"><input type="hidden" name="fm_csrf" value="<?= htmlspecialchars($fmCSRFToken, ENT_QUOTES, 'UTF-8') ?>">
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#21252b;color:#abb2bf;font:14px system-ui}form{width:min(340px,80vw);padding:28px;background:#282c34;border:1px solid #3b4048;border-radius:8px}h1{font-size:20px;margin:0 0 24px}label{display:block;margin-bottom:8px}input,button{box-sizing:border-box;width:100%;padding:10px;border-radius:4px;font:inherit}input{background:#21252b;color:#abb2bf;border:1px solid #495162}button{margin-top:16px;background:#528bff;color:white;border:0;cursor:pointer}.error{color:#ef596f}small{display:block;margin-top:18px;color:#7f848e}</style><?php if ($reauth): ?>
+<style>body{background:var(--bg-main,#21252b);color:var(--text-primary,#abb2bf)}form{border:0;background:none}input{background:var(--bg-deep,#21252b);color:inherit;border-color:var(--border-default,#495162)}button{background:var(--accent,#528bff);color:var(--accent-contrast,#fff)}</style>
+<script>
+if (parent !== window) {
+    const palette = getComputedStyle(parent.document.documentElement);
+    for (const name of ['bg-main','bg-deep','text-primary','border-default','accent','accent-contrast']) {
+        document.documentElement.style.setProperty('--' + name, palette.getPropertyValue('--' + name));
+    }
+}
+</script><?php endif; ?></head><body>
+<form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME'], ENT_QUOTES, 'UTF-8') ?><?= $reauth ? '?reauth=1' : '' ?>">
+<h1>Sign in</h1><input type="hidden" name="auth_action" value="login"><input type="hidden" name="csrf" value="<?= htmlspecialchars($fmCSRFToken, ENT_QUOTES, 'UTF-8') ?>">
 <label for="login-password">Password</label><input type="password" id="login-password" name="password" autocomplete="current-password" maxlength="72" required autofocus>
 <?php if ($loginError): ?><p class="error" role="alert"><?= htmlspecialchars($loginError, ENT_QUOTES, 'UTF-8') ?></p><?php endif; ?>
 <button type="submit">Sign in</button></form></body></html>
@@ -612,7 +639,7 @@ if ($isPostRequest && ($_POST['action'] ?? '') === 'file_history') {
             if (!$valid(basename($path)) || is_link($path) || !is_file($path)) continue;
             $stamp = DateTimeImmutable::createFromFormat('!Ymd-His', substr(basename($path), 65, 15), new DateTimeZone('UTC'));
             if (!$stamp) continue;
-            $items[] = ['id'=>basename($path), 'date'=>fmModifiedDate($stamp->getTimestamp(), $config['date_format']), 'size'=>filesize($path)];
+            $items[] = ['time'=>$stamp->getTimestamp(), 'id'=>basename($path), 'date'=>fmModifiedDate($stamp->getTimestamp(), $config['date_format']), 'size'=>filesize($path)];
         }
         usort($items, function ($a,$b) { return strcmp($b['id'],$a['id']); });
         fmAuthReply(200, 'History loaded.', ['items'=>array_slice($items,0,500), 'total'=>count($items)]);
@@ -759,26 +786,36 @@ $workspaceThemeScript = <<<'JS'
         }).catch(() => {});
     });
     const fmCSRF = __FM_CSRF_TOKEN__;
+    const authHost = window.parent.location.origin === location.origin && window.parent.location.pathname === location.pathname ? window.parent : window;
+    const currentCSRF = () => authHost.fmCSRFToken || fmCSRF;
+    const requireSignIn = value => { if (value === '1') authHost.workspaceRequireSignIn?.(); };
     const nativeFetch = window.fetch.bind(window);
     window.fetch = function(input, options = {}) {
-        const target = new URL(typeof input === 'string' ? input : input.url, location.href);
+        const target = new URL(input instanceof Request ? input.url : input, location.href);
+        const workspace = target.origin === location.origin && target.pathname === location.pathname;
         const method = (options.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
-        if (target.origin === location.origin && target.pathname === location.pathname && !['GET','HEAD'].includes(method)) {
+        if (workspace && !['GET','HEAD'].includes(method)) {
             const headers = new Headers(options.headers || (input instanceof Request ? input.headers : undefined));
-            headers.set('X-FM-CSRF', fmCSRF);
+            headers.set('X-FM-CSRF', currentCSRF());
             options = {...options, headers};
         }
-        return nativeFetch(input, options);
+        const request = nativeFetch(input, options);
+        return workspace ? request.then(response => {
+            requireSignIn(response.headers.get('X-Reauth'));
+            return response;
+        }) : request;
     };
     const nativeOpen = XMLHttpRequest.prototype.open;
     const nativeSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
         const target = new URL(url, location.href);
-        this.fmNeedsCSRF = target.origin === location.origin && target.pathname === location.pathname && !['GET','HEAD'].includes(method.toUpperCase());
+        this.fmWorkspace = target.origin === location.origin && target.pathname === location.pathname;
+        this.fmNeedsCSRF = this.fmWorkspace && !['GET','HEAD'].includes(method.toUpperCase());
         return nativeOpen.call(this, method, url, ...args);
     };
     XMLHttpRequest.prototype.send = function(body) {
-        if (this.fmNeedsCSRF) this.setRequestHeader('X-FM-CSRF', fmCSRF);
+        if (this.fmNeedsCSRF) this.setRequestHeader('X-FM-CSRF', currentCSRF());
+        if (this.fmWorkspace) this.addEventListener('loadend', () => requireSignIn(this.getResponseHeader('X-Reauth')), {once:true});
         return nativeSend.call(this, body);
     };
     window.fmCSRFToken = fmCSRF;
@@ -938,6 +975,26 @@ $workspaceThemeScript = <<<'JS'
         spinner.className = 'tree-loading-spinner';
         spinner.setAttribute('aria-hidden', 'true');
         element.replaceChildren(spinner, document.createTextNode(message));
+    };
+    window.workspaceLoadModuleFrame = function(frame, url) {
+        let loading = frame.nextElementSibling;
+        if (!loading) {
+            loading = document.createElement('div');
+            loading.className = 'position-absolute top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center gap-2';
+            loading.style.background = 'var(--bg-main)';
+            loading.setAttribute('role', 'status');
+            frame.parentElement.classList.add('position-relative');
+            frame.after(loading);
+        }
+        window.workspaceLoading(loading, 'Loading…');
+        frame.style.visibility = 'hidden';
+        frame.onload = () => {
+            if (frame.contentDocument?.URL === 'about:blank') return;
+            frame.style.visibility = '';
+            loading.remove();
+            frame.onload = null;
+        };
+        frame.src = url;
     };
     window.workspaceAlert = function(message, title = 'Editor', icon = /error|failed/i.test(title) ? 'error' : 'info') {
         if (window.parent !== window && typeof window.parent.workspaceAlert === 'function') return window.parent.workspaceAlert(message, title, icon);
@@ -1210,6 +1267,8 @@ $workspaceThemeScript = <<<'JS'
     .ace_search_options .ace_button.checked {background: var(--bg-selected) !important;color: var(--text-link) !important;border-color: var(--accent) !important;}
     .ace_editor.ace_autocomplete {background: var(--bg-main) !important;color: var(--text-primary) !important;border-color: var(--border-default) !important;}
     .ace_autocomplete .ace_marker-layer .ace_active-line {background: var(--bg-selected) !important;}
+    :is(.history-dot, .git-status-action, .git-folder-dot, .codex-file-choice, #file-history-items button):is(:hover, :focus-visible) {outline:2px solid var(--border-default);outline-offset:3px;}
+
 </style>
 
 JS;
@@ -1217,13 +1276,69 @@ $workspaceThemeScript = str_replace('__FM_CSRF_TOKEN__', json_encode($fmCSRFToke
 
 // Optional trusted PHP modules are loaded only for an authenticated module page.
 $fmModules = [];
-foreach (glob(__DIR__ . '/modules/*.php') ?: [] as $modulePath) {
+$fmModulesDirectory = __DIR__ . '/modules';
+$fmModuleCatalog = [
+    'codex' => ['name' => 'AI Integration', 'icon' => 'fa-puzzle-piece',
+        'description' => 'Connect an AI coding agent to review and publish project file changes.',
+        'url' => 'https://raw.githubusercontent.com/renat2985/pocket-code-studio/main/modules/codex.php',
+        'file' => 'codex.php from GitHub', 'page' => '?module=codex'],
+    'adminer' => ['name' => 'Adminer', 'icon' => 'fa-database',
+        'description' => 'Manage databases in the browser. Adminer uses your database credentials.',
+        'url' => 'https://www.adminer.org/latest.php',
+        'file' => 'the latest stable Adminer release', 'page' => './modules/adminer.php'],
+];
+foreach (is_link($fmModulesDirectory) ? [] : (glob($fmModulesDirectory . '/*.php') ?: []) as $modulePath) {
     $id = basename($modulePath, '.php');
-    if (!is_link($modulePath) && preg_match('/^[a-z][a-z0-9-]{0,39}$/D', $id)) $fmModules[$id] = $modulePath;
+    if (!is_link($modulePath) && is_file($modulePath) && preg_match('/^[a-z][a-z0-9-]{0,39}$/D', $id)) $fmModules[$id] = $modulePath;
+}
+if ($isPostRequest && isset($_GET['install_module'])) {
+    $id = $_GET['install_module'];
+    if (!is_string($id) || !isset($fmModuleCatalog[$id])) fmAuthReply(404, 'Unknown module.');
+    $module = $fmModuleCatalog[$id];
+    $destination = $fmModulesDirectory . '/' . $id . '.php';
+    $installed = isset($fmModules[$id]);
+    if ($installed && $id !== 'adminer') fmAuthReply(200, 'Module is already installed.');
+    if (is_link($fmModulesDirectory) || is_link($destination) || (!$installed && file_exists($destination))) {
+        fmAuthReply(409, 'The module installation path is already occupied.');
+    }
+    $context = stream_context_create(['http' => ['timeout' => 15, 'max_redirects' => 4]]);
+    $source = @file_get_contents($installed ? $destination : $module['url'], false, $context, 0, 1048577);
+    if ($source === false && $installed) fmAuthReply(500, 'Cannot read the installed Adminer file.');
+    if ($source === false) fmAuthReply(502, 'Cannot download the module from its official source. Check the server HTTPS connection.');
+    if (strlen($source) > 1048576 || strpos($source, '<?php') !== 0) {
+        fmAuthReply(502, 'The download did not return a valid PHP file.');
+    }
+    // Adminer denies framing by default. Permit only the editor's own origin.
+    if ($id === 'adminer') {
+        $source = str_replace(
+            ['header("X-Frame-Options: deny")', "header('X-Frame-Options: deny')"],
+            'header("X-Frame-Options: SAMEORIGIN")', $source, $changed
+        );
+        if ($installed && !$changed) fmAuthReply(200, 'Module is already installed.');
+    }
+    try {
+        token_get_all($source, TOKEN_PARSE);
+    } catch (ParseError $error) {
+        fmAuthReply(500, 'This module is incompatible with the server PHP version.');
+    }
+    if (!is_dir($fmModulesDirectory) && !@mkdir($fmModulesDirectory, 0755) && !is_dir($fmModulesDirectory)) {
+        fmAuthReply(500, 'Cannot create the modules folder. Check the editor folder permissions.');
+    }
+    $temporary = realpath($fmModulesDirectory) === $fmModulesDirectory ? @tempnam($fmModulesDirectory, '.module-') : false;
+    if ($temporary === false) fmAuthReply(500, 'Cannot prepare the module.');
+    try {
+        $written = dirname($temporary) === $fmModulesDirectory && @file_put_contents($temporary, $source) === strlen($source)
+            && @chmod($temporary, $installed ? (fileperms($destination) & 0777) : 0644)
+            && ($installed ? @rename($temporary, $destination) : @link($temporary, $destination));
+    } finally {
+        @unlink($temporary);
+    }
+    if (!$written) fmAuthReply(500, 'Cannot prepare the module. Check the modules folder permissions and try again.');
+    fmAuthReply(200, 'Module installed.');
 }
 if (isset($_GET['module'])) {
     $id = $_GET['module'];
-    if (!is_string($id) || !isset($fmModules[$id])) { http_response_code(404); exit; }
+    if (!is_string($id) || $id === 'adminer' || !isset($fmModules[$id])) { http_response_code(404); exit; }
     $fmModulePage = $fmModules[$id];
     $fmModuleEditor = __FILE__;
     require $fmModulePage;
@@ -1416,6 +1531,52 @@ if ($isPostRequest && ($_POST['action'] ?? '') === 'github') {
         if (is_resource($lock)) {flock($lock,LOCK_UN);fclose($lock);}
     }
     header('Content-Type: application/json; charset=utf-8'); echo json_encode($result,JSON_INVALID_UTF8_SUBSTITUTE); exit;
+}
+
+if ($isPostRequest && ($_POST['action'] ?? '') === 'git_history') {
+    try {
+        $workspace = realpath($config['root_path']);
+        $file = is_string($_POST['file'] ?? null) ? realpath($_POST['file']) : false;
+        if (!$workspace || !$file || !is_file($file) || strpos($file, $workspace . DIRECTORY_SEPARATOR) !== 0) throw new RuntimeException('Invalid Git history file.');
+        try {
+            $repository = realpath(trim(fmGitRun(dirname($file), ['rev-parse','--show-toplevel'])));
+            if (!$repository) throw new RuntimeException('Git repository unavailable.');
+            $relative = substr($file, strlen($repository) + 1);
+            $log = fmGitRun($repository, ['log','--follow','-100','--format=%x00PCS%x00%H%x00%ct%x00%an%x00%s','--name-status','-z','--',$relative]);
+        } catch (RuntimeException $error) {
+            if (!empty($_POST['commit'])) throw $error;
+            fmAuthReply(200, 'Git history unavailable.', ['items'=>[]]);
+        }
+        $items = [];
+        foreach (explode("\0PCS\0", $log) as $record) {
+            $fields = explode("\0", $record);
+            if (count($fields) < 6 || !preg_match('/^[a-f0-9]{40,64}$/D', $fields[0])) continue;
+            [$commit,$time,$author,$subject] = $fields;
+            $status = trim($fields[4]);
+            $historical = $status !== '' && $status[0] === 'R' ? ($fields[6] ?? '') : $fields[5];
+            if ($historical === '' || $status === 'D') continue;
+            if (($_POST['commit'] ?? '') === $commit) {
+                $readVersion = function ($revision, $path) use ($repository) {
+                    $object = $revision . ':' . $path;
+                    $size = trim(fmGitRun($repository, ['cat-file','-s',$object]));
+                    if (!ctype_digit($size) || (int) $size > 1048576) throw new RuntimeException('Git comparison supports files up to 1 MiB.');
+                    $bytes = fmGitRun($repository, ['cat-file','blob',$object]);
+                    if (strpos($bytes, "\0") !== false || preg_match('//u', $bytes) !== 1) throw new RuntimeException('Only UTF-8 text versions can be compared.');
+                    return $bytes;
+                };
+                $parents = explode(' ', trim(fmGitRun($repository, ['rev-list','--parents','-n','1',$commit])));
+                $before = count($parents) < 2 || $status === 'A' ? '' :
+                    $readVersion($parents[1], $status[0] === 'R' ? $fields[5] : $historical);
+                fmAuthReply(200, 'Git version loaded.', ['content_base64'=>base64_encode($readVersion($commit, $historical)),
+                    'before_base64'=>base64_encode($before)]);
+            }
+            $items[] = ['commit'=>$commit,'time'=>(int)$time,
+                'date'=>fmModifiedDate((int)$time, $config['date_format']),
+                'label'=>'Git · ' . $subject, 'author'=>$author,'revision'=>substr($commit,0,8)];
+        }
+        if (!empty($_POST['commit'])) throw new RuntimeException('Git version is unavailable. Refresh Timeline.');
+        fmAuthReply(200, 'Git history loaded.', ['items'=>$items]);
+    } catch (Throwable $error) { fmAuthReply(400, $error->getMessage()); }
 }
 
 if ($isPostRequest && in_array($_POST['action'] ?? '', ['git_status','git_diff'], true)) {
@@ -1865,6 +2026,9 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         #editor .ace_scrollbar::-webkit-scrollbar-track {background: var(--bg-main);}
         #editor .ace_scrollbar::-webkit-scrollbar-thumb {background: var(--scrollbar-gold);border: 2px solid var(--bg-main);border-radius: 5px;}
         #editor .ace_scrollbar::-webkit-scrollbar-thumb:hover {background: var(--scrollbar-gold-hover);}
+        #editor > :is(.ace_sb-v, .ace_sb-h) {background: var(--bg-main);}
+        #editor > :is(.ace_sb-v, .ace_sb-h) > div:first-child {background: var(--scrollbar-gold);border: 2px solid var(--bg-main);border-radius: 5px;}
+        #editor > :is(.ace_sb-v, .ace_sb-h) > div:first-child:hover {background: var(--scrollbar-gold-hover);}
         #editor .ace_scrollbar::-webkit-scrollbar-corner {background: var(--bg-main);}
         #minimap {position: absolute;top: 0;right: 12px;bottom: 10px;z-index: 5;background: transparent;width: 112px;flex-shrink: 0;overflow: hidden;touch-action: none;cursor: pointer;border-left: 1px solid var(--border-subtle);}
         #minimap[hidden] {display: none;}
@@ -2893,8 +3057,9 @@ $lineCount = substr_count($fileContents, "\n") + 1;
         scheduleOccurrenceDraw();
 
         // ── Warn before leaving with unsaved changes ──────────────────
+        window.editorHasUnsavedContent = () => hasUnsavedChanges && editor.getValue() !== savedEditorValue;
         window.addEventListener('beforeunload', function(e) {
-            if (hasUnsavedChanges) {
+            if (window.editorHasUnsavedContent()) {
                 e.preventDefault();
                 e.returnValue = 'You have unsaved changes. Leave anyway?';
             }
@@ -3022,6 +3187,20 @@ function getPermissions($file)
 }
 
 // Load one level of the explorer; folders are expanded on demand.
+function fmHasHistory($file) {
+    static $copies = null;
+    if ($copies === null) {
+        $root = realpath($GLOBALS['config']['root_path']);
+        $directory = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . '/fm-editor-' . substr(hash('sha256', __FILE__ . '|' . $root), 0, 24);
+        $copies = [];
+        foreach (is_link($directory) ? [] : (glob($directory . '/*.bak') ?: []) as $path) {
+            if (preg_match('/^([a-f0-9]{64})-[0-9]{8}-[0-9]{6}-[a-f0-9]{12}\.bak$/D', basename($path), $match) && !is_link($path) && is_file($path)) $copies[$match[1]] = true;
+        }
+    }
+    $real = realpath($file);
+    return $real && is_file($real) && isset($copies[hash('sha256', $real)]);
+}
+
 function buildDirectoryTree($dir, $relativePath = "")
 {
     global $config;
@@ -3036,6 +3215,7 @@ function buildDirectoryTree($dir, $relativePath = "")
             "name" => $name,
             "type" => is_dir($fullPath) ? "dir" : "file",
             "path" => "/" . ltrim($relativePath . "/" . $name, "/"),
+            "history" => fmHasHistory($fullPath),
         ];
     }
     usort($result, function ($a, $b) {
@@ -3087,6 +3267,7 @@ function getDirectoryContents($dir, $sort = "name", $order = "asc")
                 "permissions" => getPermissions($fullPath),
                 "permissions_octal" => decoct(fileperms($fullPath) & 07777),
                 "icon" => getFileIcon($fullPath),
+                "history" => fmHasHistory($fullPath),
             ];
 
             $fileInfo = array_merge($fileInfo, getFileOwnership($fullPath));
@@ -3637,134 +3818,66 @@ if (isset($_POST["action"]) || isset($_GET["action"])) {
                 $response = renameItem($currentPath, $oldName, $newName);
                 break;
             case "trash":
-                $itemsArray = isset($_POST["items"]) ? $_POST["items"] : "";
-                $items = explode(",", $itemsArray);
-                $status = true;
-                $movedCount = 0;
-                $failedCount = 0;
-                if ($itemsArray == "") {
-                    $response = ["status" => "error", "message" => "No items selected"];
-                    break;
-                }
-                foreach ($items as $item) {
-                    $itemPath = $currentPath . DIRECTORY_SEPARATOR . $item;
-                    if (!file_exists($itemPath)) {
-                        continue;
-                    }
-                    if (moveToTrash($itemPath, $currentPath, $config)) {
-                        $movedCount++;
-                    } else {
-                        $failedCount++;
-                        $status = false;
-                    }
-                }
-                $response = ["status" => $status ? "success" : "error", "message" => "Moved $movedCount item(s) to trash" . ($failedCount > 0 ? ", Failed $failedCount item(s)" : "")];
-                break;
             case "delete":
-                $itemsArray = isset($_POST["items"]) ? $_POST["items"] : "";
-                $status = true;
-                $movedCount = 0;
-                $failedCount = 0;
-                $items = explode(",", $itemsArray);
-                if ($itemsArray == "") {
-                    $response = ["status" => "error", "message" => "No items selected"];
-                    break;
-                }
-                foreach ($items as $item) {
-                    $itemPath = $currentPath . DIRECTORY_SEPARATOR . $item;
-                    if (!file_exists($itemPath)) {
-                        continue;
-                    }
-                    if (deleteItem($itemPath)) {
-                        $movedCount++;
-                    } else {
-                        $failedCount++;
-                        $status = false;
-                    }
-                }
-                $response = ["status" => $status ? "success" : "error", "message" => "Deleted $movedCount item(s) successfully" . ($failedCount > 0 ? ", $failedCount item(s) Failed to delete" : "")];
-                if (fmCleanupTrashMetadata($config)) $response = ['status'=>'error','message'=>"Deleted $movedCount item(s), but some orphaned trash metadata could not be removed. Check trash folder permissions."];
-                break;
             case "restore":
-                $itemsArray = isset($_POST["items"]) ? $_POST["items"] : "";
-                $items = explode(",", $itemsArray);
-                if ($itemsArray == "") {
-                    $response = ["status" => "error", "message" => "No items selected"];
-                    break;
-                }
-                $status = true;
-                $restoredCount = 0;
-                $failedCount = 0;
-                $messages = [];
-                foreach ($items as $item) {
-                    $itemPath = $currentPath . DIRECTORY_SEPARATOR . $item;
-                    $result = restoreFromTrash($itemPath, $config);
-                    if ($result["status"] === "success") {
-                        $restoredCount++;
-                        $messages[] = "$item restored successfully";
-                    } else {
-                        $failedCount++;
-                        $status = false;
-                        $messages[] = "Failed to restore $item: " . $result["message"];
-                    }
-                }
-                $response = ["status" => $status ? "success" : "error", "message" => "Restored $restoredCount item(s)" . ($failedCount > 0 ? ", Failed $failedCount item(s)" : "")];
-                break;
             case "copy":
-                $itemsArray = isset($_POST["items"]) ? $_POST["items"] : "";
-                $items = explode(",", $itemsArray);
-                if ($itemsArray == "") {
-                    $response = ["status" => "error", "message" => "No items selected"];
-                    break;
-                }
-                $destination = isset($_POST["destination"]) ? $config["root_path"] . $_POST["destination"] : "";
-                if (!securityCheck($destination)) {
-                    $response = ["status" => "error", "message" => "Security violation on destination"];
-                    break;
-                }
-                $status = true;
-                $messages = [];
-                foreach ($items as $item) {
-                    $sourcePath = $currentPath . DIRECTORY_SEPARATOR . $item;
-                    $destPath = $destination . DIRECTORY_SEPARATOR . $item;
-                    $result = copyItem($sourcePath, $destPath);
-                    if ($result["status"] != "success") {
-                        $status = false;
-                    }
-                    $messages[] = $result["message"];
-                }
-                $response = ["status" => $status ? "success" : "error", "message" => implode(", ", $messages)];
-                break;
             case "move":
-                $itemsArray = isset($_POST["items"]) ? $_POST["items"] : "";
-                $items = explode(",", $itemsArray);
-                if ($itemsArray == "") {
+                if (($_POST['items'] ?? '') === '') {
                     $response = ["status" => "error", "message" => "No items selected"];
                     break;
                 }
-                $destination = isset($_POST["destination"]) ? $config["root_path"] . $_POST["destination"] : "";
-                if (!securityCheck($destination)) {
-                    $response = ["status" => "error", "message" => "Security violation on destination"];
-                    break;
-                }
-                $status = true;
-                $messages = [];
-                foreach ($items as $item) {
-                    $sourcePath = $currentPath . DIRECTORY_SEPARATOR . $item;
-                    $destPath = $destination . DIRECTORY_SEPARATOR . $item;
-                    if (!file_exists($destPath)) {
-                        if (rename($sourcePath, $destPath)) {
+                $items = explode(',', $_POST['items']);
+                if ($action === 'copy' || $action === 'move') {
+                    $destination = isset($_POST["destination"]) ? $config["root_path"] . $_POST["destination"] : "";
+                    if (!securityCheck($destination)) {
+                        $response = ["status" => "error", "message" => "Security violation on destination"];
+                        break;
+                    }
+                    $status = true;
+                    $messages = [];
+                    foreach ($items as $item) {
+                        $sourcePath = $currentPath . DIRECTORY_SEPARATOR . $item;
+                        $destPath = $destination . DIRECTORY_SEPARATOR . $item;
+                        if ($action === 'copy') {
+                            $result = copyItem($sourcePath, $destPath);
+                            $status = $status && $result["status"] === "success";
+                            $messages[] = $result["message"];
+                        } elseif (file_exists($destPath)) {
+                            $status = false;
+                            $messages[] = "$item already exists in destination";
+                        } elseif (rename($sourcePath, $destPath)) {
                             $messages[] = "Moved $item successfully";
                         } else {
                             $status = false;
                             $messages[] = "Failed to move $item";
                         }
-                    } else {
-                        $status = false;
-                        $messages[] = "$item already exists in destination";
                     }
+                    $response = ["status" => $status ? "success" : "error", "message" => implode(", ", $messages)];
+                    break;
                 }
-                $response = ["status" => $status ? "success" : "error", "message" => implode(", ", $messages)];
+                $failedCount = $completedCount = 0;
+                foreach ($items as $item) {
+                    $itemPath = $currentPath . DIRECTORY_SEPARATOR . $item;
+                    if ($action === 'restore') {
+                        $completed = restoreFromTrash($itemPath, $config)["status"] === "success";
+                    } else {
+                        if (!file_exists($itemPath)) continue;
+                        $completed = $action === 'trash' ? moveToTrash($itemPath, $currentPath, $config) : deleteItem($itemPath);
+                    }
+                    if ($completed) $completedCount++;
+                    else $failedCount++;
+                }
+                if ($action === 'delete') {
+                    $message = "Deleted $completedCount item(s) successfully" . ($failedCount ? ", $failedCount item(s) Failed to delete" : "");
+                    if (fmCleanupTrashMetadata($config)) {
+                        $response = ["status" => "error", "message" => "Deleted $completedCount item(s), but some orphaned trash metadata could not be removed. Check trash folder permissions."];
+                        break;
+                    }
+                } else {
+                    $message = $action === 'trash' ? "Moved $completedCount item(s) to trash" : "Restored $completedCount item(s)";
+                    if ($failedCount) $message .= ", Failed $failedCount item(s)";
+                }
+                $response = ["status" => $failedCount ? "error" : "success", "message" => $message];
                 break;
             case "permissions":
                 $item = isset($_POST["item"]) ? $_POST["item"] : "";
@@ -4089,8 +4202,8 @@ if (isset($_FILES["files"])) {
     exit();
 }
 
-$versionInfo = 'Pocket Code Studio v1.4.0';
-$version = '1.4.0';
+$versionInfo = 'Pocket Code Studio v1.4.1';
+$version = '1.4.1';
 
 if ($username == null) {
     $username = "";
@@ -4165,7 +4278,27 @@ if ($username == null) {
         .file-path-control .btn-icon:hover {background: var(--bg-hover);color: var(--text-primary);}
         .collapse-all-btn {font-size: 0.72rem;color: var(--text-muted);text-align: center;padding: 4px;cursor: pointer;border-bottom: 1px solid var(--border-subtle);transition: color 0.15s;letter-spacing: 0.03em;}
         .collapse-all-btn:hover {color: var(--text-link);}
-        .tree-scroll {overflow-y: auto;flex: 1;padding: 6px 0;}
+        .tree-scroll {overflow-y:auto;flex:1;min-height:0;padding:6px 0;}
+        #timeline {border-top:1px solid var(--border-default);flex-shrink:0;}
+        #timeline summary {display:flex;align-items:center;gap:5px;flex-shrink:0;padding:6px 10px;cursor:pointer;font-size:.72rem;font-weight:600;color:var(--text-secondary);background:var(--bg-surface);list-style:none;}
+        #timeline summary::before {content:"▸";display:inline-block;width:14px;}
+        #timeline[open] summary::before {content:"▾";}
+        #timeline summary::-webkit-details-marker {display:none;}
+        #timeline-file {min-width:0;margin-left:auto;font-size:.72rem;font-weight:400;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        #timeline-items button {display:block;width:100%;border:0;background:transparent;color:var(--text-primary);padding:6px 10px;text-align:left;font:inherit;font-size:.8rem;cursor:pointer;}
+        #timeline-items button:hover {background:var(--bg-hover);}
+        #timeline-items small {display:block;margin:2px 0 0 20px;font-size:.7rem;color:var(--text-muted);}
+        #timeline-items {max-height:28dvh;overflow-y:auto;font-size:.75rem;color:var(--text-secondary);}
+        #timeline-compare {width:min(1400px,96vw);max-width:96vw;padding:0;border:1px solid var(--border-default);border-radius:6px;background:var(--bg-main);color:var(--text-primary);}
+        #timeline-editors {display:flex;height:65dvh;}
+        #timeline-editors > div {width:50%;min-width:0;}
+        #timeline-editors .ace_editor {width:100%;height:calc(100% - 30px);}
+        .timeline-caption {height:30px;padding:4px 8px;background:var(--bg-surface);overflow:hidden;}
+        #timeline-compare.timeline-fullscreen {width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;border-radius:0;}
+        #timeline-compare.timeline-fullscreen #timeline-editors {height:calc(100dvh - 112px);}
+        #timeline-compare::backdrop {background:#0008;}
+        @media(max-width:640px) {#timeline-editors {flex-direction:column;}#timeline-editors > div {width:100%;height:50%;}}
+
         /* ── File Tree ───────────────────────────────────────────── */
         .file-tree {list-style: none;padding: 0;margin: 0;}
         .file-tree li {margin: 0;}
@@ -4173,7 +4306,7 @@ if ($username == null) {
         .tree-loading {display: flex;align-items: center;gap: 6px;padding: 3px 10px;font-size: 0.8rem;line-height: 20px;color: var(--text-muted);}
         .tree-message {padding: 4px 10px;color: var(--text-muted);font-size: 0.75rem;}
         .tree-file {padding-left: 25px !important;}
-        .file-tree .folder-item {display: flex;width: 100%;border: 0;background: transparent;text-align: left;align-items: center;gap: 5px;padding: 3px 10px;font-size: 0.8rem;color: var(--text-secondary);cursor: pointer;border-radius: 0;transition: all 0.12s;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;}
+        .file-tree .folder-item {display: flex;width: 100%;border: 0;background: transparent;text-align: left;align-items: center;gap: 5px;padding: 6px 10px;font-size: 0.8rem;color: var(--text-secondary);cursor: pointer;border-radius: 0;transition: all 0.12s;white-space: nowrap;overflow: hidden;text-overflow: ellipsis;}
         .file-tree .folder-item:hover {background: var(--bg-hover);color: var(--text-primary);}
         .file-tree .folder-item.active {background: var(--bg-selected);color: var(--text-link);border-left: 2px solid var(--accent);}
         .file-tree .folder-item .fa-folder {color: var(--folder-color);font-size: 0.75rem;}
@@ -4207,7 +4340,16 @@ if ($username == null) {
         #workspace-theme option {background: var(--bg-elevated);color: var(--text-primary);}
         /* Internal editor tabs */
         .workspace {flex: 1;min-width: 0;min-height: 0;display: flex;flex-direction: column;}
+        .module-window-controls {display:flex;align-items:center;gap:4px;margin-inline-start:auto;}
+        .module-window-controls button:not(.btn-close) {width:28px;height:28px;padding:0;border:0;border-radius:4px;background:transparent;color:var(--text-secondary);}
+        .module-window-controls button:not(.btn-close):hover {background:var(--bg-hover);color:var(--text-primary);}
+        .module-window-controls .btn-close {margin:0 0 0 4px;}
+        .modal-dialog.modal-fullscreen .modal-body > iframe {height:100% !important;}
         .workspace-tabs {display: flex;flex-shrink: 0;overflow-x: auto;background: var(--bg-main);border-bottom: 1px solid var(--border-subtle);}
+        #workspace-tabs::-webkit-scrollbar {height: 3px;}
+        @supports not selector(::-webkit-scrollbar) {
+            #workspace-tabs {scrollbar-width: thin;scrollbar-color: var(--scrollbar-gold) transparent;}
+        }
         .workspace-tab {display: flex;align-items: center;flex-shrink: 0;border-right: 1px solid var(--border-subtle);border-top: 2px solid transparent;}
         .workspace-tab.active {background: var(--bg-deep);border-top-color: var(--accent);}
         .workspace-tab button {border: 0;background: transparent;color: var(--text-secondary);cursor: pointer;padding: 9px 12px;font-size: 0.8rem;white-space: nowrap;}
@@ -4227,12 +4369,15 @@ if ($username == null) {
         /* ── Navigation Bar ──────────────────────────────────────── */
         .navigation-bar {background: var(--bg-surface);border-bottom: 1px solid var(--border-subtle);padding: 5px 12px;display: flex;align-items: center;flex-wrap: wrap;gap: 2px;}
         .nav-links {display: inline-flex;align-items: center;gap: 5px;text-decoration: none;font-size: 0.78rem;color: var(--text-secondary);padding: 3px 8px;border-radius: var(--radius-sm);transition: all 0.15s;white-space: nowrap;}
+        button.nav-links {border:0;background:transparent;}
         .nav-links i {font-size: 0.72rem;}
         .nav-links:hover {color: var(--text-link);background: var(--bg-selected);}
         .nav-links.disabled {color: var(--text-muted) !important;pointer-events: none;opacity: 0.45;}
         [data-git-tone="pending"] {--git-decoration: var(--text-link);}
         [data-git-tone="added"] {--git-decoration: var(--accent-success, #6cc78a);}
         [data-git-tone="changed"] {--git-decoration: var(--accent-warning, #e5b878);}
+        .history-dot {display:inline-block;flex-shrink:0;width:7px;height:7px;margin-inline:5px;border-radius:50%;background:var(--text-muted);opacity:.35;cursor:pointer;vertical-align:middle;}
+        .history-dot:hover,.history-dot:focus-visible {opacity:1;}
         .file-name-label[data-git-tone], .tree-name[data-git-tone], .git-status-badge[data-git-tone] {color: var(--git-decoration);}
         .git-folder-dot {display: inline-block;width: 7px;height: 7px;margin-left: 8px;border-radius: 50%;background: var(--git-decoration);flex: 0 0 7px;}
         .folder-item > .git-folder-dot {margin-left: auto;}
@@ -4240,8 +4385,7 @@ if ($username == null) {
         .file-name .git-status-badge + .git-status-badge {margin-left: 2px;}
         .folder-item > .git-status-badge {margin-left: 0;}
         .folder-item > .git-status-badge + .git-status-badge {margin-left: -2px;}
-        .git-status-action {cursor: pointer;border-radius: 3px;padding: 2px 3px;}
-        .git-status-action:hover, .git-status-action:focus-visible {background: var(--bg-selected);outline: 1px solid var(--accent);}
+        .git-status-action {cursor:pointer;border-radius:3px;padding:0 2px;line-height:1.2;flex-shrink:0;}
         /* Keep search central and sign-out independent from the application menus. */
         .toolbar-utilities {grid-column: 2;grid-row: 1;width: 100%;min-width: 0;margin: 0;padding: 0;flex-shrink: 0;}
         .toolbar-utilities .search-container {position: relative;width: 100%;min-width: 0;}
@@ -4424,6 +4568,17 @@ if ($username == null) {
     </style>
 </head>
 
+<?php
+$modalCloseButton = '<button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>';
+function fmActionFooter($icon, $label, $labelId = null) { ?>
+    <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
+        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas <?= $icon ?>" aria-hidden="true"></i>
+            <span<?= $labelId ? ' id="' . $labelId . '"' : '' ?>><?= $label ?></span>
+            <div class="spinner-container my-indicator"><div class="spinners"></div></div>
+        </button>
+    </div>
+<?php } ?>
 <body>
 
     <!-- ── Main Toolbar ─────────────────────────────────────────── -->
@@ -4434,7 +4589,13 @@ if ($username == null) {
             <select id="mobile-tabs-select" aria-label="Open files"><option value="">Open files</option></select>
             <button type="button" id="mobile-close-file" aria-label="Close active file" title="Close active file" disabled><i class="fas fa-xmark" aria-hidden="true"></i></button>
         </div>
-        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file-circle-plus"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns" id="menu-show-tree"><i class="fas fa-folder-tree" aria-hidden="true"></i> File tree</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="history" disabled><i class="fas fa-clock-rotate-left" aria-hidden="true"></i> File history…</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a><?php if ($fmModules): ?><div class="dropdown-divider"></div><?php foreach ($fmModules as $id => $modulePath): ?><a class="header-btns" href="?module=<?= $id ?>" data-module="<?= $id ?>"><i class="fas fa-puzzle-piece" aria-hidden="true"></i> <?= ucfirst($id) ?></a><?php endforeach; endif; ?></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
+        <nav id="mobile-app-menus" class="toolbar-actions" aria-label="Application menus"><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-file" data-bs-toggle="dropdown" aria-expanded="false">File</button><div class="dropdown-menu" aria-labelledby="menu-file"><a href="#" class="header-btns" id="new-file-btn" title="New File" aria-label="New File"><i class="fas fa-file-circle-plus"></i> New File</a><a href="#" class="header-btns" id="new-folder-btn" title="New Folder" aria-label="New Folder"><i class="fas fa-folder-plus"></i> New Folder</a><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="edit-btn" title="Open selected file" aria-label="Open selected file"><i class="fas fa-code"></i> Open selected file</a><a href="#" class="header-btns disabled" id="open-browser-btn"><i class="fas fa-arrow-up-right-from-square" aria-hidden="true"></i> Open in browser</a><a href="#" class="header-btns disabled" id="open-phone-btn"><i class="fas fa-qrcode" aria-hidden="true"></i> Open on phone</a><button type="button" class="header-btns editor-menu-action" data-editor-command="save" disabled><i class="fas fa-floppy-disk" aria-hidden="true"></i> Save <span class="menu-shortcut">Ctrl / ⌘ S</span></button><div class="dropdown-divider"></div><a href="#" class="header-btns" id="upload-btn" title="Upload" aria-label="Upload"><i class="fas fa-upload"></i> Upload</a><a href="#" class="header-btns disabled" id="download-btn" title="Download" aria-label="Download"><i class="fas fa-download"></i> Download</a><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#settingsModal"><i class="fas fa-cog" aria-hidden="true"></i> Settings…</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-edit" data-bs-toggle="dropdown" aria-expanded="false">Edit</button><div class="dropdown-menu" aria-labelledby="menu-edit"><button type="button" class="header-btns editor-menu-action" data-editor-command="undo" disabled><i class="fas fa-undo" aria-hidden="true"></i> Undo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="redo" disabled><i class="fas fa-redo" aria-hidden="true"></i> Redo</button><button type="button" class="header-btns editor-menu-action" data-editor-command="copyall" disabled><i class="fas fa-copy" aria-hidden="true"></i> Copy document text</button><button type="button" class="header-btns editor-menu-action" data-editor-command="find" disabled><i class="fas fa-search" aria-hidden="true"></i> Find / Replace</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="copy-btn" title="Copy" aria-label="Copy"><i class="fas fa-copy"></i> Copy</a><a href="#" class="header-btns disabled" id="move-btn" title="Move" aria-label="Move"><i class="fas fa-arrows-alt"></i> Move</a><a href="#" class="header-btns disabled" id="rename-btn" title="Rename" aria-label="Rename"><i class="fas fa-tag"></i> Rename</a><a href="#" class="header-btns disabled" id="delete-btn" title="Delete" aria-label="Delete"><i class="fas fa-trash"></i> Delete</a><a href="#" class="header-btns disabled" id="restore-btn" title="Restore" aria-label="Restore"><i class="fas fa-undo"></i> Restore</a></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-view" data-bs-toggle="dropdown" aria-expanded="false">View</button><div class="dropdown-menu" aria-labelledby="menu-view"><label class="workspace-theme-choice" for="workspace-theme"><span><i class="fas fa-palette" aria-hidden="true"></i> Color theme</span><select id="workspace-theme" class="btn-settings" aria-label="Color theme" onchange="setWorkspaceTheme(this.value)"></select></label><div class="dropdown-divider"></div><button type="button" class="header-btns" id="menu-show-files"><i class="fas fa-list" aria-hidden="true"></i> File list</button><button type="button" class="header-btns" id="menu-show-tree"><i class="fas fa-folder-tree" aria-hidden="true"></i> File tree</button><button type="button" class="header-btns editor-menu-action" data-editor-command="map" aria-pressed="false" disabled><i class="fas fa-map" aria-hidden="true"></i> Toggle minimap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="wrap" aria-pressed="false" disabled><i class="fas fa-align-left" aria-hidden="true"></i> Toggle word wrap</button><button type="button" class="header-btns editor-menu-action" data-editor-command="invisibles" aria-pressed="false" disabled><i class="fas fa-paragraph" aria-hidden="true"></i> Show Invisibles</button><button type="button" class="header-btns editor-menu-action" data-editor-command="indentguides" aria-pressed="false" disabled><i class="fas fa-indent" aria-hidden="true"></i> Show Indent Guides</button><button type="button" class="header-btns editor-menu-action" data-editor-command="autocomplete" aria-pressed="false" disabled><i class="fas fa-wand-magic-sparkles" aria-hidden="true"></i> Live Autocompletion</button><button type="button" class="header-btns editor-menu-action" data-editor-command="emmet" aria-pressed="false" title="Expand HTML abbreviations with Tab" disabled><i class="fas fa-bolt" aria-hidden="true"></i> Emmet (HTML)</button><button type="button" class="header-btns editor-menu-action" data-editor-command="inlinechanges" aria-pressed="false" disabled><i class="fas fa-code-compare" aria-hidden="true"></i> Show Changes Since Save</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="foldall" disabled><i class="fas fa-compress-arrows-alt" aria-hidden="true"></i> Fold All</button><button type="button" class="header-btns editor-menu-action" data-editor-command="unfoldall" disabled><i class="fas fa-expand-arrows-alt" aria-hidden="true"></i> Unfold All</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="fullscreen" aria-pressed="false" disabled><i class="fas fa-expand" aria-hidden="true"></i> Fullscreen</button></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-tools" data-bs-toggle="dropdown" aria-expanded="false">Tools</button><div class="dropdown-menu" aria-labelledby="menu-tools"><button type="button" class="header-btns" id="login-activity-btn" data-bs-toggle="modal" data-bs-target="#loginActivityModal"><i class="fas fa-shield-halved" aria-hidden="true"></i> Login activity</button><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#updateEditorModal"><i class="fas fa-cloud-arrow-up" aria-hidden="true"></i> Update editor…</button><div class="dropdown-divider"></div><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#githubModal"><i class="fa-brands fa-github" aria-hidden="true"></i> GitHub: Commit &amp; Push…</button><button type="button" class="header-btns editor-menu-action" data-editor-command="gitdiff" disabled><i class="fas fa-code-branch" aria-hidden="true"></i> Git: View changes against HEAD</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="history" disabled><i class="fas fa-clock-rotate-left" aria-hidden="true"></i> File history…</button><div class="dropdown-divider"></div><button type="button" class="header-btns editor-menu-action" data-editor-command="format" disabled><i class="fas fa-code" aria-hidden="true"></i> Format document</button><div class="dropdown-divider"></div><a href="#" class="header-btns disabled" id="permissions-btn" title="Permission" aria-label="Permission"><i class="fas fa-shield-alt"></i> Permission</a><a href="#" class="header-btns disabled" id="compress-btn" title="Compress" aria-label="Compress"><i class="fas fa-file-archive"></i> Compress</a><a href="#" class="header-btns disabled" id="extract-btn" title="Extract" aria-label="Extract"><i class="fas fa-box-open"></i> Extract</a><div class="dropdown-divider"></div><?php foreach ($fmModuleCatalog + $fmModules as $id => $module): ?>
+<?php $name = $fmModuleCatalog[$id]['name'] ?? ucfirst($id); $icon = $fmModuleCatalog[$id]['icon'] ?? 'fa-puzzle-piece'; ?>
+<?php if (isset($fmModules[$id])): ?>
+<a class="header-btns" href="<?= $fmModuleCatalog[$id]['page'] ?? '?module=' . $id ?>" data-module="<?= $id ?>"><i class="fas <?= $icon ?>" aria-hidden="true"></i> <?= $name ?></a>
+<?php else: ?>
+<button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#module-install-<?= $id ?>"><i class="fas <?= $icon ?>" aria-hidden="true"></i> <?= $name ?></button>
+<?php endif; endforeach; ?></div></div><div class="dropdown toolbar-more"><button class="menu-heading" type="button" id="menu-help" data-bs-toggle="dropdown" aria-expanded="false">Help</button><div class="dropdown-menu" aria-labelledby="menu-help"><button type="button" class="header-btns" data-bs-toggle="modal" data-bs-target="#editorHelpModal"><i class="fas fa-keyboard" aria-hidden="true"></i> Keyboard shortcuts &amp; help</button></div></div></nav>
         <div class="toolbar-utilities d-flex align-items-center gap-2">
             <div class="search-container">
                 <div class="input-group input-group-sm">
@@ -4451,7 +4612,7 @@ if ($username == null) {
                 </div>
             </div>
         </div>
-        <form method="post" id="logout-form"><input type="hidden" name="fm_auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form>
+        <form method="post" id="logout-form"><input type="hidden" name="auth_action" value="logout"><button type="submit" class="menu-heading">Sign out</button></form>
         <input type="file" id="file-upload" multiple style="display:none">
 
         <!-- Upload progress -->
@@ -4478,6 +4639,7 @@ if ($username == null) {
                     </ul>
                 </div>
             </div>
+            <details id="timeline"<?= ($_COOKIE['fm_timeline'] ?? '1') === '0' ? '' : ' open' ?>><summary><i class="fas fa-clock-rotate-left" aria-hidden="true"></i> Timeline <span id="timeline-file"></span></summary><div id="timeline-items" role="status">Open a text file to view its history.</div></details>
         </div>
 
         <div class="sidebar-resizer" id="sidebar-resizer" role="separator" tabindex="0" aria-label="Resize file sidebar" aria-orientation="vertical" aria-controls="file-sidebar" aria-valuemin="140" aria-valuemax="700" aria-valuenow="220" title="Drag to resize; double-click to reset"></div>
@@ -4500,8 +4662,7 @@ if ($username == null) {
                     <input type="text" class="form-control" id="breadcrumb" value="/" placeholder="/" aria-label="Current folder path" title="Current folder — enter a path and press Enter" autocomplete="off" spellcheck="false">
                     <button type="button" class="btn-icon" id="breadcrumb-search-btn" title="Open folder path">Go</button>
                 </div>
-                <a href="#" class="nav-links" id="select-all-btn"><i class="fas fa-check-square"></i> Select All</a>
-                <a href="#" class="nav-links disabled" id="unselect-all-btn"><i class="fas fa-square"></i> Unselect</a>
+                <button type="button" class="nav-links disabled" id="select-all-btn" disabled><i class="fas fa-check-square" aria-hidden="true"></i><span>Select all</span></button>
                 <a href="#" class="nav-links" id="view-trash-btn"><i class="fas fa-trash-alt"></i> Trash</a>
             </div>
 
@@ -4511,7 +4672,7 @@ if ($username == null) {
                     <thead>
                         <tr>
                             <th class="checkbox-col">
-                                <input type="checkbox" class="form-check-input" id="select-all-checkbox">
+                                <input type="checkbox" class="form-check-input" id="select-all-checkbox" aria-label="Select all files" disabled>
                             </th>
                             <th class="icon-col"></th>
                             <?php foreach (['name'=>'Name', 'size'=>'Size', 'last_modified'=>'Modified', 'extension'=>'Type', 'permissions'=>'Permissions', 'owner'=>'Owner / Group'] as $key => $label): ?>
@@ -4545,7 +4706,7 @@ if ($username == null) {
 
     <div class="modal fade" id="editorHelpModal" tabindex="-1" aria-labelledby="editorHelpTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="editorHelpTitle"><i class="fas fa-keyboard me-2" aria-hidden="true"></i>Editor help</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="editorHelpTitle"><i class="fas fa-keyboard me-2" aria-hidden="true"></i>Editor help</h5><?= $modalCloseButton ?></div>
             <div class="modal-body">
                 <p>Click a folder in the sidebar to expand it; click a file to open an editor tab. Drag the sidebar border to resize it.</p>
                 <p><strong>Ctrl / ⌘ S</strong> — Save<br><strong>Ctrl / ⌘ Z</strong> — Undo<br><strong>Ctrl / ⌘ + click</strong> — Add cursor<br><strong>Escape</strong> — Return to one cursor<br><strong>Ctrl H</strong> — Find / Replace<br><strong>Shift Alt F</strong> — Format<br><strong>F11</strong> — Fullscreen</p>
@@ -4585,7 +4746,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-box-open me-2"></i>Extract Archive</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i class="fas fa-box-open me-2"></i>Extract Archive</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Archive: <strong id="extractFileName"
@@ -4606,15 +4767,7 @@ if ($username == null) {
                             The destination directory will be created if it doesn't exist.
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-box-open" aria-hidden="true"></i>
-                            <span>Extract</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-box-open', 'Extract'); ?>
                 </form>
             </div>
         </div>
@@ -4626,7 +4779,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-folder-plus me-2" aria-hidden="true"></i>Create New Folder</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i class="fas fa-folder-plus me-2" aria-hidden="true"></i>Create New Folder</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <label class="form-label">Folder Name</label>
                         <input type="text" name="name" class="form-control" id="folderName" placeholder="my-new-folder"
@@ -4634,15 +4787,7 @@ if ($username == null) {
                         <input type="hidden" name="path" id="currenPathValue">
                         <input type="hidden" name="action" value="create_dir">
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-plus" aria-hidden="true"></i>
-                            <span>Create</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-plus', 'Create'); ?>
                 </form>
             </div>
         </div>
@@ -4655,7 +4800,7 @@ if ($username == null) {
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="fas fa-file-circle-plus me-2"></i>Create
-                            New File</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                            New File</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">File Name</label>
@@ -4669,15 +4814,7 @@ if ($username == null) {
                         <textarea class="code-editor" name="content" id="fileContent" rows="12"
                             placeholder="// File contents..."></textarea>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-plus" aria-hidden="true"></i>
-                            <span>Create</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-plus', 'Create'); ?>
                 </form>
             </div>
         </div>
@@ -4690,7 +4827,7 @@ if ($username == null) {
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="fas fa-tag me-2"></i>Rename Item
-                        </h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        </h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <label class="form-label">New Name</label>
                         <input type="text" name="new_name" class="form-control" id="newName">
@@ -4698,15 +4835,7 @@ if ($username == null) {
                         <input type="hidden" name="path" id="renamePath">
                         <input type="hidden" name="action" value="rename">
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-tag" aria-hidden="true"></i>
-                            <span>Rename</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-tag', 'Rename'); ?>
                 </form>
             </div>
         </div>
@@ -4719,7 +4848,7 @@ if ($username == null) {
                 <form method="post" id="workspace-settings-form">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="fas fa-cog me-2"></i>File Manager
-                            Settings</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                            Settings</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label" for="settings-root">Workspace root</label>
@@ -4735,7 +4864,7 @@ if ($username == null) {
                             <div class="form-text" id="timezone-preview"></div>
                             <div class="form-text" id="timezone-browser-hint"></div>
                             <button type="button" class="btn btn-secondary mt-2" id="use-browser-timezone" hidden>Use browser timezone</button>
-                            <input type="hidden" name="fm_auth_action" value="save_settings">
+                            <input type="hidden" name="auth_action" value="save_settings">
                         </div>
                         <div class="mb-3">
                             <label class="form-label">Date Format</label>
@@ -4758,15 +4887,7 @@ if ($username == null) {
                         </section>
                         <p class="form-text mb-0" id="settings-result" role="status" aria-live="polite"></p>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-floppy-disk" aria-hidden="true"></i>
-                            <span>Save Settings</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-floppy-disk', 'Save Settings'); ?>
                 </form>
 
             </div>
@@ -4780,7 +4901,7 @@ if ($username == null) {
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
                         <h5 class="modal-title"><i class="fas fa-shield-alt me-2"></i>Change
-                            Permissions</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                            Permissions</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Item: <span id="permItem"
@@ -4794,62 +4915,21 @@ if ($username == null) {
                             <input type="hidden" name="action" value="permissions">
                         </div>
                         <div class="row mb-2 g-2">
+                            <?php foreach (['Owner' => 100, 'Group' => 10, 'Public' => 1] as $role => $place): ?>
                             <div class="col-4">
                                 <div class="border p-2" style="border-radius:var(--radius-sm)">
-                                    <div class="form-text mb-1" style="color:var(--text-muted);font-weight:600">Owner
-                                    </div>
+                                    <div class="form-text mb-1" style="color:var(--text-muted);font-weight:600"><?= $role ?></div>
+                                    <?php foreach (['Read' => 4, 'Write' => 2, 'Execute' => 1] as $permission => $bit): ?>
+                                    <?php $permissionId = strtolower($role) . ($bit === 1 ? 'Exec' : $permission); ?>
                                     <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="ownerRead" data-value="400"><label class="form-check-label">Read</label>
-                                    </div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="ownerWrite" data-value="200"><label
-                                            class="form-check-label">Write</label></div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="ownerExec" data-value="100"><label
-                                            class="form-check-label">Execute</label></div>
+                                        id="<?= $permissionId ?>" data-value="<?= $place * $bit ?>"><label class="form-check-label" for="<?= $permissionId ?>"><?= $permission ?></label></div>
+                                    <?php endforeach; ?>
                                 </div>
                             </div>
-                            <div class="col-4">
-                                <div class="border p-2" style="border-radius:var(--radius-sm)">
-                                    <div class="form-text mb-1" style="color:var(--text-muted);font-weight:600">Group
-                                    </div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="groupRead" data-value="40"><label class="form-check-label">Read</label>
-                                    </div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="groupWrite" data-value="20"><label
-                                            class="form-check-label">Write</label></div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="groupExec" data-value="10"><label
-                                            class="form-check-label">Execute</label></div>
-                                </div>
-                            </div>
-                            <div class="col-4">
-                                <div class="border p-2" style="border-radius:var(--radius-sm)">
-                                    <div class="form-text mb-1" style="color:var(--text-muted);font-weight:600">Public
-                                    </div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="publicRead" data-value="4"><label class="form-check-label">Read</label>
-                                    </div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="publicWrite" data-value="2"><label
-                                            class="form-check-label">Write</label></div>
-                                    <div class="form-check"><input class="form-check-input perm-check" type="checkbox"
-                                            id="publicExec" data-value="1"><label
-                                            class="form-check-label">Execute</label></div>
-                                </div>
-                            </div>
+                            <?php endforeach; ?>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-check" aria-hidden="true"></i>
-                            <span>Apply</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-check', 'Apply'); ?>
                 </form>
             </div>
         </div>
@@ -4861,7 +4941,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-file-archive me-2"></i>Compress Items</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i class="fas fa-file-archive me-2"></i>Compress Items</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <div class="mb-3">
                             <label class="form-label">Archive Name</label>
@@ -4885,15 +4965,7 @@ if ($username == null) {
                             </div>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-file-archive" aria-hidden="true"></i>
-                            <span>Compress</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-file-archive', 'Compress'); ?>
                 </form>
             </div>
         </div>
@@ -4905,7 +4977,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-trash me-2"></i>Confirm Delete</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i class="fas fa-trash me-2"></i>Confirm Delete</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Are you sure you want to delete the
                             selected item(s)?</p>
@@ -4926,15 +4998,7 @@ if ($username == null) {
                             undone.
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-trash" aria-hidden="true"></i>
-                            <span id="deleteButtonText">Move to Trash</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-trash', 'Move to Trash', 'deleteButtonText'); ?>
                 </form>
             </div>
         </div>
@@ -4942,7 +5006,7 @@ if ($username == null) {
 
     <div class="modal fade" id="phoneModal" tabindex="-1" aria-labelledby="phoneModalTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="phoneModalTitle"><i class="fas fa-qrcode me-2"></i>Open on phone</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="phoneModalTitle"><i class="fas fa-qrcode me-2"></i>Open on phone</h5><?= $modalCloseButton ?></div>
             <div class="modal-body text-center">
                 <p id="phone-file-name" style="overflow-wrap:anywhere"></p>
                 <p id="phone-qr-status" role="status" aria-live="polite"></p>
@@ -4973,7 +5037,7 @@ if ($username == null) {
 
     <div class="modal fade" id="uploadReplaceModal" tabindex="-1" aria-labelledby="uploadReplaceTitle" aria-hidden="true">
         <div class="modal-dialog"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle"><i class="fas fa-copy me-2" aria-hidden="true"></i>Replace existing files?</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="uploadReplaceTitle"><i class="fas fa-copy me-2" aria-hidden="true"></i>Replace existing files?</h5><?= $modalCloseButton ?></div>
             <div class="modal-body"><p>These files already exist in the destination folder. Replace them with the uploaded versions?</p><ul id="upload-replace-names" class="list-unstyled" style="max-height:40vh;overflow:auto;overflow-wrap:anywhere"></ul></div>
             <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button><button type="button" class="btn btn-primary" id="upload-replace-confirm"><i class="fas fa-right-left me-2" aria-hidden="true"></i>Replace</button></div>
         </div></div>
@@ -4981,7 +5045,7 @@ if ($username == null) {
 
     <div class="modal fade" id="githubModal" tabindex="-1" aria-labelledby="githubTitle" aria-hidden="true" data-bs-backdrop="static">
         <div class="modal-dialog modal-lg"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="githubTitle"><i class="fa-brands fa-github me-2"></i>GitHub · Commit &amp; Push</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="githubTitle"><i class="fa-brands fa-github me-2"></i>GitHub · Commit &amp; Push</h5><?= $modalCloseButton ?></div>
             <div class="modal-body">
                 <p id="github-branch" class="form-text"></p>
                 <details><summary>Connection settings</summary>
@@ -5002,7 +5066,7 @@ if ($username == null) {
                     </form>
                 </details>
                 <hr><p class="form-text">Select saved files to commit. No files are selected automatically. Unsaved editor changes are not included.</p>
-                <button type="button" id="github-select-all" class="btn btn-secondary btn-sm mb-2"><i class="fas fa-check-square" aria-hidden="true"></i> Select all</button>
+                <button type="button" id="github-select-all" class="btn btn-secondary btn-sm mb-2" disabled><i class="fas fa-check-square" aria-hidden="true"></i> <span>Select all</span></button>
                 <div id="github-files" class="border rounded p-2" style="max-height:30vh;overflow:auto"></div>
                 <label class="form-label mt-2" for="github-message">Commit message</label><textarea id="github-message" class="form-control" rows="2" maxlength="4000"></textarea>
                 <p id="github-feedback" class="form-text mt-2" role="status" aria-live="polite" style="white-space:pre-line;overflow-wrap:anywhere"></p>
@@ -5013,7 +5077,7 @@ if ($username == null) {
 
     <div class="modal fade" id="loginActivityModal" tabindex="-1" aria-labelledby="loginActivityTitle" aria-hidden="true">
         <div class="modal-dialog modal-lg"><div class="modal-content">
-            <div class="modal-header"><h5 class="modal-title" id="loginActivityTitle"><i class="fas fa-shield-halved me-2"></i>Login activity</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+            <div class="modal-header"><h5 class="modal-title" id="loginActivityTitle"><i class="fas fa-shield-halved me-2"></i>Login activity</h5><?= $modalCloseButton ?></div>
             <div class="modal-body">
                 <p id="login-activity-summary"></p><div id="login-global-limit" class="alert alert-warning" hidden></div>
                 <div class="table-responsive"><table class="table table-hover"><thead><tr><th>IP</th><th>Last attempt</th><th>Failed · 24h</th><th>Status</th><th></th></tr></thead><tbody id="login-activity-rows"></tbody></table></div>
@@ -5035,7 +5099,7 @@ if ($username == null) {
     </div>
 
     <div class="modal fade" id="updateEditorModal" tabindex="-1" aria-labelledby="update-editor-title" data-bs-backdrop="static"><div class="modal-dialog"><div class="modal-content">
-        <div class="modal-header"><h5 class="modal-title" id="update-editor-title"><i class="fas fa-cloud-arrow-up me-2" aria-hidden="true"></i>Update editor</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-header"><h5 class="modal-title" id="update-editor-title"><i class="fas fa-cloud-arrow-up me-2" aria-hidden="true"></i>Update editor</h5><?= $modalCloseButton ?></div>
         <div class="modal-body"><ul class="list-unstyled d-grid gap-2 mb-3">
                 <li><i class="fas fa-file-code fa-fw me-2" aria-hidden="true"></i>Choose a trusted Pocket Code Studio PHP release.</li>
                 <li><i class="fas fa-lock fa-fw me-2" aria-hidden="true"></i>Keep your filename, password and settings.</li>
@@ -5057,7 +5121,7 @@ if ($username == null) {
             <div class="modal-content">
                 <div class="modal-header">
                     <h5 class="modal-title"><i class="fas fa-search me-2"></i>Search Results
-                    </h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                    </h5><?= $modalCloseButton ?></div>
                 <div class="modal-body" style="padding:0">
                     <div class="table-responsive">
                         <table class="table table-hover mb-0" id="search-results-table">
@@ -5092,7 +5156,7 @@ if ($username == null) {
             <div class="modal-content">
                 <form hx-post="" hx-trigger="submit" hx-swap="none">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i id="fileOpIcon" class="fas fa-copy me-2" aria-hidden="true"></i><span id="fileOpTitle">File Operation</span></h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i id="fileOpIcon" class="fas fa-copy me-2" aria-hidden="true"></i><span id="fileOpTitle">File Operation</span></h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <input type="hidden" name="action" id="fileOpType" value="copy">
                         <div class="mb-3" id="fileOpItems" style="font-size:0.8rem;color:var(--text-secondary)"></div>
@@ -5106,15 +5170,7 @@ if ($username == null) {
                                     style="color:var(--text-link)"></span></div>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-check" aria-hidden="true"></i>
-                            <span>Execute</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-check', 'Execute'); ?>
                 </form>
             </div>
         </div>
@@ -5129,7 +5185,7 @@ if ($username == null) {
                     <input type="hidden" name="items" id="restoreItems">
                     <input type="hidden" name="action" value="restore">
                     <div class="modal-header">
-                        <h5 class="modal-title"><i class="fas fa-undo me-2"></i>Restore Items</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+                        <h5 class="modal-title"><i class="fas fa-undo me-2"></i>Restore Items</h5><?= $modalCloseButton ?></div>
                     <div class="modal-body">
                         <p style="font-size:0.82rem;color:var(--text-secondary)">Restore selected items to their
                             original locations?</p>
@@ -5139,24 +5195,190 @@ if ($username == null) {
                             renamed automatically.
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Cancel</button>
-                        <button type="submit" class="btn btn-primary d-flex align-items-center gap-2"><i class="fas fa-undo" aria-hidden="true"></i>
-                            <span>Restore</span>
-                            <div class="spinner-container my-indicator">
-                                <div class="spinners"></div>
-                            </div>
-                        </button>
-                    </div>
+                    <?php fmActionFooter('fa-undo', 'Restore'); ?>
                 </form>
             </div>
         </div>
     </div>
 
+    <?php foreach (array_diff_key($fmModuleCatalog, $fmModules) as $id => $module): ?>
+    <div class="modal fade" id="module-install-<?= $id ?>" tabindex="-1" aria-labelledby="module-install-title-<?= $id ?>" aria-hidden="true">
+        <form class="modal-dialog" data-install-module="<?= $id ?>"><div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title" id="module-install-title-<?= $id ?>"><i class="fas <?= $module['icon'] ?> me-2" aria-hidden="true"></i>Install <?= $module['name'] ?></h5><?= $modalCloseButton ?></div>
+            <div class="modal-body">
+                <p><?= $module['description'] ?></p>
+                <p>The editor downloads <a href="<?= $module['url'] ?>" target="_blank" rel="noopener"><?= $module['file'] ?></a> and saves it as <code>modules/<?= $id ?>.php</code> beside this editor. It creates the <code>modules</code> folder if needed.</p>
+                <?php if ($id === 'codex'): ?>
+                <p class="fw-semibold mb-2">After installation</p>
+                <ol class="ps-3">
+                    <li>Open AI Integration and choose the project folder the agent can access.</li>
+                    <li>Choose a private folder outside the public web root for deployment history.</li>
+                    <li>Generate a token and use <strong>Copy setup instructions</strong>. Paste the instructions into a private chat with your AI coding agent, such as Codex or Claude Code.</li>
+                </ol>
+                <p>The agent can read project files, check for conflicts before publishing, and deploy when you ask. You can review the files and their changes in the deployment history.</p>
+                <?php endif; ?>
+                <p data-install-status role="status" class="mb-0"></p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button>
+                <button type="submit" class="btn btn-primary"><i class="fas fa-download me-2" aria-hidden="true"></i>Install</button>
+                <a class="btn btn-primary d-none" href="<?= $module['page'] ?>" data-module="<?= $id ?>" data-title="<?= $module['name'] ?>"><i class="fas <?= $module['icon'] ?> me-2" aria-hidden="true"></i>Open module</a>
+            </div>
+        </div></form>
+    </div>
+    <?php endforeach; ?>
+    <dialog id="reauth-dialog" class="editor-dialog" aria-labelledby="reauth-title" style="margin:auto;padding:0;width:min(420px,94vw);border:1px solid var(--border-default);border-radius:6px;background:var(--bg-main);color:var(--text-primary)">
+        <div class="modal-header"><h5 class="modal-title" id="reauth-title"><i class="fas fa-lock me-2" aria-hidden="true"></i>Sign in</h5><form method="dialog"><button type="submit" class="btn-close" aria-label="Close"></button></form></div>
+        <div class="modal-body p-0"><iframe title="Sign in" style="display:block;width:100%;height:min(285px,65dvh);border:0"></iframe></div>
+    </dialog>
+    <style>#reauth-dialog::backdrop{background:#0008}</style>
+    <script>
+        const reauthDialog = document.getElementById('reauth-dialog');
+        const reauthFrame = reauthDialog.querySelector('iframe');
+        reauthDialog.addEventListener('focusin', event => event.stopPropagation());
+        window.workspaceRequireSignIn = () => {
+            if (reauthDialog.open) return;
+            window.workspaceLoadModuleFrame(reauthFrame, '?reauth=1');
+            reauthDialog.showModal();
+        };
+        window.workspaceSignedIn = (source, token) => {
+            if (!reauthDialog.open || source !== reauthFrame.contentWindow) return;
+            window.fmCSRFToken = token;
+            reauthDialog.close();
+        };
+    </script>
+    <dialog id="timeline-compare" class="editor-dialog" aria-labelledby="timeline-title">
+        <div class="modal-header"><h5 class="modal-title" id="timeline-title"><i class="fas fa-code-compare me-2" aria-hidden="true"></i>Timeline comparison</h5><div class="module-window-controls"><button type="button" id="timeline-minimize" title="Minimize" aria-label="Minimize"><i class="fas fa-minus" aria-hidden="true"></i></button><button type="button" id="timeline-maximize" title="Maximize" aria-label="Maximize" aria-pressed="false"><i class="fas fa-expand" aria-hidden="true"></i></button><button type="button" id="timeline-close" class="btn-close" aria-label="Close"></button></div></div>
+        <div id="timeline-editors"><div><div class="timeline-caption" id="timeline-before-label">Saved version</div><div id="timeline-before"></div></div><div><div class="timeline-caption" id="timeline-current-label">Current editor</div><div id="timeline-current"></div></div></div>
+        <div class="modal-footer"><span id="timeline-diff-status" role="status"></span><button type="button" class="btn btn-secondary" id="timeline-previous" aria-label="Previous change"><i class="fas fa-arrow-up" aria-hidden="true"></i></button><button type="button" class="btn btn-secondary" id="timeline-next" aria-label="Next change"><i class="fas fa-arrow-down" aria-hidden="true"></i></button><button type="button" class="btn btn-secondary" id="timeline-inline">Open inline</button><button type="button" class="btn btn-primary" id="timeline-restore">Restore into editor</button></div>
+    </dialog>
+    <template id="module-window-template">
+        <div class="modal fade" data-workspace-module tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
+                <div class="modal-header"><h5 class="modal-title"><i class="fas me-2" aria-hidden="true"></i><span></span></h5><div class="module-window-controls">
+                    <button type="button" data-minimize-module aria-label="Minimize" title="Minimize"><i class="fas fa-minus" aria-hidden="true"></i></button>
+                    <button type="button" data-maximize-module aria-label="Maximize" title="Maximize" aria-pressed="false"><i class="fas fa-expand" aria-hidden="true"></i></button>
+                    <?= $modalCloseButton ?>
+                </div></div>
+                <div class="modal-body p-0"><iframe style="display:block;width:100%;height:72dvh;border:0;background:var(--bg-main)"></iframe></div>
+                <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="fas fa-xmark me-2" aria-hidden="true"></i>Close</button></div>
+            </div></div>
+        </div>
+    </template>
+    <script>
+        function openModuleWindow(link) {
+            const id = 'module-window-' + link.dataset.module;
+            let modal = document.getElementById(id);
+            if (!modal) {
+                modal = document.getElementById('module-window-template').content.firstElementChild.cloneNode(true);
+                modal.id = id;
+                const title = link.dataset.title || link.textContent.trim();
+                modal.setAttribute('aria-label', title);
+                modal.querySelector('.modal-title span').textContent = title;
+                modal.querySelector('.modal-title i').className = link.querySelector('i').className + ' me-2';
+                const frame = modal.querySelector('iframe');
+                frame.title = title;
+                modal.addEventListener('hidden.bs.modal', () => {
+                    if (!modal.dataset.moduleMinimized) frame.removeAttribute('src');
+                });
+                document.body.append(modal);
+            }
+            const frame = modal.querySelector('iframe');
+            if (!frame.hasAttribute('src')) {
+                const url = new URL(link.href);
+                if (link.dataset.module !== 'adminer') url.searchParams.set('embedded', '1');
+                window.workspaceLoadModuleFrame(frame, url.href);
+            }
+            bootstrap.Modal.getOrCreateInstance(modal).show(link);
+        }
+        async function installWorkspaceModule(id) {
+            const response = await fetch('?install_module=' + id, {method: 'POST'});
+            const {message} = await response.json();
+            if (!response.ok) throw new Error(message || 'Cannot install the module.');
+            return message;
+        }
+        document.addEventListener('click', async event => {
+            const link = event.target.closest('a[data-module]');
+            if (!link || event.defaultPrevented) return;
+            event.preventDefault();
+            const installer = link.closest('.modal');
+            if (installer) {
+                installer.addEventListener('hidden.bs.modal', () => openModuleWindow(link), {once:true});
+                bootstrap.Modal.getInstance(installer).hide();
+                return;
+            }
+            if (link.dataset.loading) return;
+            if (link.dataset.module === 'adminer' && !document.getElementById('module-window-adminer')) {
+                link.dataset.loading = 'true';
+                try {
+                    await installWorkspaceModule('adminer');
+                } catch (error) {
+                    window.workspaceToast?.(error.message, 'Adminer', 'warning');
+                    return;
+                } finally {
+                    delete link.dataset.loading;
+                }
+            }
+            openModuleWindow(link);
+        });
+        document.querySelectorAll('[data-install-module]').forEach(form => form.addEventListener('submit', async event => {
+            event.preventDefault();
+            const button = form.querySelector('[type="submit"]');
+            if (!button || button.disabled) return;
+            const status = form.querySelector('[data-install-status]');
+            button.disabled = true;
+            window.workspaceLoading(status, 'Installing module…');
+            try {
+                status.textContent = await installWorkspaceModule(form.dataset.installModule) + ' Reload the editor to update the Tools menu.';
+                button.remove();
+                form.querySelector('[data-module]').classList.remove('d-none');
+            } catch (error) {
+                status.textContent = error.message || 'Cannot install the module.';
+                button.disabled = false;
+            }
+        }));
+    </script>
+    <div id="minimized-modules" aria-label="Minimized modules" class="position-fixed bottom-0 end-0 p-2 d-flex flex-wrap gap-2" style="z-index:1030;pointer-events:none"></div>
+    <script>
+        document.addEventListener('click', event => {
+            const maximize = event.target.closest('[data-maximize-module]');
+            if (maximize) {
+                const modal = maximize.closest('.modal');
+                const expanded = modal.querySelector('.modal-dialog').classList.toggle('modal-fullscreen');
+                const label = expanded ? 'Restore window size' : 'Maximize';
+                maximize.setAttribute('aria-pressed', String(expanded));
+                maximize.setAttribute('aria-label', label);
+                maximize.title = label;
+                maximize.firstElementChild.className = 'fas ' + (expanded ? 'fa-compress' : 'fa-expand');
+                bootstrap.Modal.getInstance(modal)?.handleUpdate();
+                return;
+            }
+            const control = event.target.closest('[data-minimize-module]');
+            const modal = control?.closest('.modal');
+            if (!modal || modal.dataset.moduleMinimized) return;
+            modal.dataset.moduleMinimized = 'true';
+            const dialog = bootstrap.Modal.getOrCreateInstance(modal);
+            const restore = document.createElement('button');
+            restore.type = 'button';
+            restore.disabled = true;
+            restore.className = 'btn btn-secondary btn-sm';
+            restore.style.pointerEvents = 'auto';
+            restore.textContent = modal.querySelector('.modal-title').textContent.trim();
+            restore.setAttribute('aria-label', 'Restore ' + restore.textContent);
+            restore.onclick = () => dialog.show(restore);
+            document.getElementById('minimized-modules').append(restore);
+            modal.addEventListener('hidden.bs.modal', () => { restore.disabled = false; restore.focus(); }, {once:true});
+            modal.addEventListener('shown.bs.modal', () => {
+                delete modal.dataset.moduleMinimized;
+                restore.remove();
+            }, {once:true});
+            dialog.hide();
+        });
+    </script>
     <!-- ── Scripts ───────────────────────────────────────────────── -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.0/js/bootstrap.bundle.min.js"></script>
     <?php foreach ($fmModules as $id => $modulePath): ?>
-        <?php if (strpos((string) file_get_contents($modulePath, false, null, 0, 256), '@workspace-launcher') !== false): ?>
+        <?php if ($id !== 'adminer' && strpos((string) file_get_contents($modulePath, false, null, 0, 256), '@workspace-launcher') !== false): ?>
             <script defer src="?module=<?= $id ?>&amp;launcher=1"></script>
         <?php endif; ?>
     <?php endforeach; ?>
@@ -5167,7 +5389,7 @@ if ($username == null) {
     </script>
 
     <div class="modal fade" id="aboutPocketModal" tabindex="-1" aria-labelledby="aboutPocketTitle" aria-hidden="true"><div class="modal-dialog"><div class="modal-content">
-        <div class="modal-header"><h5 class="modal-title" id="aboutPocketTitle"><i class="fas fa-circle-info me-2" aria-hidden="true"></i>Pocket Code Studio</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button></div>
+        <div class="modal-header"><h5 class="modal-title" id="aboutPocketTitle"><i class="fas fa-circle-info me-2" aria-hidden="true"></i>Pocket Code Studio</h5><?= $modalCloseButton ?></div>
         <div class="modal-body"><p>A single-file PHP workspace maintained by <a href="https://github.com/Renat2985" target="_blank" rel="noopener noreferrer">Renat2985</a>.</p>
         <p><a href="https://github.com/Renat2985/pocket-code-studio" target="_blank" rel="noopener noreferrer">Project, documentation &amp; issues</a></p>
         <p>Based on Joseph Chuks’ <a href="https://github.com/JosephChuks/php-file-manager-with-code-editor" target="_blank" rel="noopener noreferrer">PHP File Manager</a> and <a href="https://github.com/JosephChuks/cwp-codeEditor" target="_blank" rel="noopener noreferrer">CWP Code Editor</a>. Editor powered by Ace; icons from Material Icon Theme and Seti UI.</p>
@@ -5385,6 +5607,20 @@ if ($username == null) {
                 }
                 return badge;
             }
+            function updateSelectAllButton(button, allSelected, empty) {
+                button.disabled = empty;
+                button.firstElementChild.className = 'fas ' + (allSelected ? 'fa-square' : 'fa-check-square');
+                button.lastElementChild.textContent = allSelected ? 'Unselect all' : 'Select all';
+            }
+            const fileSelectionButton = document.getElementById('select-all-btn');
+            const fileSelectionCheckbox = document.getElementById('select-all-checkbox');
+            const githubSelectionButton = document.getElementById('github-select-all');
+            const githubFiles = document.getElementById('github-files');
+            const githubCheckboxes = () => [...githubFiles.querySelectorAll('input:not(:disabled)')];
+            function updateGitHubSelection() {
+                const inputs = githubCheckboxes();
+                updateSelectAllButton(githubSelectionButton, inputs.length > 0 && inputs.every(input => input.checked), !inputs.length);
+            }
             const githubModal = document.getElementById('githubModal');
             const githubForm = document.getElementById('github-settings');
             const githubFeedback = document.getElementById('github-feedback');
@@ -5396,13 +5632,13 @@ if ($username == null) {
                 githubForm.elements.token.value = ''; githubForm.elements.remove_token.checked = false;
                 document.getElementById('github-token-state').textContent = data.settings.has_token ? 'Token saved. Leave blank to keep it.' : 'No token saved.';
                 githubForm.closest('details').open = !data.settings.has_token;
-                const list = document.getElementById('github-files'); list.replaceChildren();
-                if (!githubState.files.length) list.textContent = 'No changed files. Use Push existing commits to retry a previous push.';
+                githubFiles.replaceChildren();
+                if (!githubState.files.length) githubFiles.textContent = 'No changed files. Use Push existing commits to retry a previous push.';
                 githubState.files.forEach(file => {
                     const label = document.createElement('label'); label.className = 'd-flex align-items-center gap-2 py-1';
                     const input = document.createElement('input'); input.type = 'checkbox'; input.className = 'form-check-input'; input.value = file.path; input.disabled = !file.allowed;
                     const text = document.createElement('span'); text.textContent = file.path + (file.allowed ? '' : ' (unsupported: directory, symlink or large file)'); text.style.overflowWrap = 'anywhere';
-                    label.append(input, text, createGitStatusBadge(file.status, file.path)); list.append(label);
+                    label.append(input, text, createGitStatusBadge(file.status, file.path)); githubFiles.append(label);
                 });
             }
             async function githubOperation(operation, fields = {}) {
@@ -5436,6 +5672,7 @@ if ($username == null) {
                     controls.forEach((control, index) => { control.disabled = disabled[index]; });
                     // Rendering may replace the file checkboxes while the request is in progress.
                     githubBusy = false;
+                    updateGitHubSelection();
                 }
             }
             githubModal.addEventListener('shown.bs.modal', () => githubOperation('read'));
@@ -5448,9 +5685,13 @@ if ($username == null) {
                 githubOperation('save', fields);
             });
             document.getElementById('github-refresh').addEventListener('click', () => githubOperation('read'));
-            document.getElementById('github-select-all').addEventListener('click', () => {
+            githubFiles.addEventListener('change', updateGitHubSelection);
+            githubSelectionButton.addEventListener('click', () => {
                 if (githubBusy) return;
-                document.querySelectorAll('#github-files input:not(:disabled)').forEach(input => { input.checked = true; });
+                const inputs = githubCheckboxes();
+                const select = inputs.some(input => !input.checked);
+                inputs.forEach(input => { input.checked = select; });
+                updateGitHubSelection();
             });
             function startGitHubPush(commit) {
                 if (!githubState) { githubFeedback.textContent = 'Refresh the repository first.'; return; }
@@ -5653,6 +5894,7 @@ if ($username == null) {
                         '; Max-Age=31536000; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
                     updateBreadcrumb(currentPath);
                     showFiles(fileList);
+                    updateButtonStates();
                     renderGitStatus();
                 } catch (error) {
                     if (request !== fileListRequest || error.name === 'AbortError') return;
@@ -5721,6 +5963,7 @@ if ($username == null) {
             let gitStatusTimer = null;
             let gitStatusUnavailable = false;
             let gitFiles = {}, gitFolders = new Map(), decorationSource = null, decorationDetails = {};
+            window.addEventListener('focus', () => { if (decorationSource) refreshGitStatus(); });
             document.addEventListener('workspace-decoration-source', event => {
                 decorationSource = event.detail;
                 refreshGitStatus();
@@ -5741,25 +5984,19 @@ if ($username == null) {
                     badge.dataset.gitTone = status === 'P' ? 'pending' : tone;
                     if (isFolder) {
                         badge.className = 'git-folder-dot';
-                        badge.title = status === 'P' ? 'Contains files pending sync with Codex' : decorationSource?.folderTitles?.[tone] || (tone === 'added' ? 'Contains added or untracked files' : 'Contains Git changes');
+                        badge.title = decorationSource?.folderTitles?.[tone] || (tone === 'added' ? 'Contains added or untracked files' : 'Contains Git changes');
                         badge.setAttribute('role', 'img');
                         badge.setAttribute('aria-label', badge.title);
                     }
                     label.parentElement.append(badge);
                     if (details?.pending) {
-                        const pending = document.createElement('span');
-                        pending.className = 'git-status-badge';
-                        pending.dataset.gitTone = 'pending';
-                        pending.innerHTML = '<i class="fas fa-arrows-rotate" aria-hidden="true"></i>';
-                        pending.title = 'Pending sync with Codex';
-                        pending.setAttribute('role', 'img');
-                        pending.setAttribute('aria-label', pending.title);
-                        label.parentElement.append(pending);
-                    }
-                    if (details?.changed && decorationSource?.openCurrent) {
-                        const pencil = createGitStatusBadge('M', path, decorationSource.openCurrent);
+                        const open = details.changed && decorationSource?.openCurrent;
+                        const pencil = open ? createGitStatusBadge('M', path, open) : document.createElement('span');
+                        pencil.classList.add('git-status-badge');
+                        pencil.dataset.gitTone = 'pending';
                         pencil.innerHTML = '<i class="fas fa-pencil" aria-hidden="true"></i>';
-                        pencil.title = 'Compare uploaded version with current file';
+                        pencil.title = open ? 'Pending sync · Compare uploaded version with current file' : 'Pending sync';
+                        if (!open) pencil.setAttribute('role', 'img');
                         pencil.setAttribute('aria-label', pencil.title + ': ' + path);
                         label.parentElement.append(pencil);
                     }
@@ -5797,12 +6034,12 @@ if ($username == null) {
                     decorationDetails = source ? (data.details || {}) : {};
                     gitFolders = new Map();
                     for (const [path, status] of Object.entries(gitFiles)) {
+                        if (status === 'P') continue;
                         let slash = path.lastIndexOf('/');
                         while (slash > 0) {
                             const folder = path.slice(0, slash);
                             const previous = gitFolders.get(folder);
-                            if (decorationDetails[path]?.pending) gitFolders.set(folder, 'P');
-                            else if (previous !== 'P' && previous !== 'M') gitFolders.set(folder, status === 'A' || status === 'U' ? 'A' : 'M');
+                            if (previous !== 'M') gitFolders.set(folder, status === 'A' || status === 'U' ? 'A' : 'M');
                             slash = path.lastIndexOf('/', slash - 1);
                         }
                     }
@@ -5820,6 +6057,33 @@ if ($username == null) {
                 }
                 return chars.slice(0, limit - 1).join('') + '…';
             }
+            function addHistoryDot(label, target) {
+                if (label.parentElement.querySelector('.history-dot')) return;
+                const dot = document.createElement('span');
+                dot.className = 'history-dot';
+                dot.title = 'File history available';
+                dot.tabIndex = 0;
+                dot.setAttribute('role', 'button');
+                dot.setAttribute('aria-label', 'File history: ' + target.name);
+                const open = event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    void showContextFileHistory(target);
+                };
+                dot.addEventListener('click', open);
+                dot.addEventListener('dblclick', event => event.stopPropagation());
+                dot.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') open(event);
+                });
+                label.after(dot);
+            }
+            document.addEventListener('workspace-file-saved', ({detail}) => {
+                const path = detail.path.startsWith(SERVER_ROOT_PATH + '/') ? detail.path.slice(SERVER_ROOT_PATH.length) : detail.path;
+                document.querySelectorAll('.tree-name, .file-name-label').forEach(label => {
+                    const name = label.dataset.gitPath || currentPath + '/' + label.closest('.file-item').dataset.name;
+                    if (name === path) addHistoryDot(label, {name:path.slice(path.lastIndexOf('/') + 1), directory:path.slice(0, path.lastIndexOf('/'))});
+                });
+            });
             function showFiles(files) {
                 const tbody = document.getElementById('files-list');
 
@@ -5853,6 +6117,7 @@ if ($username == null) {
                     const link = label.parentElement;
                     link.title = file.name;
                     link.setAttribute('aria-label', file.name);
+                    if (file.history) addHistoryDot(label, {name:file.name, directory:currentPath});
                     cell.textContent = (file.owner ?? '—') + ':' + (file.group ?? '—');
                     cell.title = 'Owner: ' + (file.owner ?? '—') + ' (UID ' + (file.uid ?? 'unknown') + ') · Group: ' + (file.group ?? '—') + ' (GID ' + (file.gid ?? 'unknown') + ')';
                 });
@@ -5901,6 +6166,168 @@ if ($username == null) {
                     });
                 });
             }
+
+            const timeline = document.getElementById('timeline');
+            const timelineItems = document.getElementById('timeline-items');
+            const timelineDialog = document.getElementById('timeline-compare');
+            let timelineProvider, timelineRequest = 0, timelineView, timelineSelection;
+            const decodeHistory = data => new TextDecoder('utf-8', {fatal:true,ignoreBOM:true}).decode(Uint8Array.from(atob(data.content_base64), char => char.charCodeAt(0)));
+            document.addEventListener('workspace-timeline-provider', event => {
+                timelineProvider = event.detail;
+                void refreshTimeline();
+            });
+            timeline.addEventListener('toggle', () => {
+                document.cookie = 'fm_timeline=' + (timeline.open ? '1' : '0') + '; Max-Age=31536000; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+                if (timeline.open) void refreshTimeline();
+            });
+            document.addEventListener('workspace-file-saved', () => { if (timeline.open) void refreshTimeline(); });
+            async function refreshTimeline() {
+                const request = ++timelineRequest, path = activeEditorPath;
+                const tab = editorTabs.get(path);
+                const timelineFile = document.getElementById('timeline-file');
+                timelineFile.textContent = path ? path.slice(workspaceRoot.length) : '';
+                timelineFile.title = path ? path.slice(workspaceRoot.length) : '';
+                if (!timeline.open) return;
+                if (!tab?.frame.contentWindow.editor) {
+                    timelineItems.textContent = 'Open a text file to view its history.';
+                    return;
+                }
+                window.workspaceLoading(timelineItems, 'Loading history…');
+                try {
+                    const [local, remote, git] = await Promise.all([
+                        requestWorkspace('file_history', {file:path}),
+                        timelineProvider ? timelineProvider.list(path).catch(error => ({items:[],error:error.message})) : {items:[]},
+                        requestWorkspace('git_history', {file:path}).catch(error => ({items:[],error:error.message}))
+                    ]);
+                    if (request !== timelineRequest || activeEditorPath !== path) return;
+                    const entries = local.items.map(copy => ({...copy, label:'Saved in editor', load:async () => decodeHistory(await requestWorkspace('file_history', {file:path,id:copy.id}))}));
+                    for (const entry of remote.items) entries.push({...entry, load:() => timelineProvider.read(path, entry)});
+                    for (const entry of git.items) entries.push({...entry, load:async () => {
+                        const data = await requestWorkspace('git_history', {file:path,commit:entry.commit});
+                        return {baseline:decodeHistory({content_base64:data.before_base64}), current:decodeHistory(data)};
+                    }});
+                    entries.sort((a,b) => b.time - a.time);
+                    timelineItems.replaceChildren();
+                    if (!entries.length) timelineItems.textContent = 'No history recorded.';
+                    for (const entry of entries) {
+                        const button = document.createElement('button');
+                        const icon = document.createElement('i');
+                        icon.className = 'fas ' + (entry.commit ? 'fa-code-branch' : entry.update ? 'fa-code-commit' : 'fa-clock-rotate-left') + ' me-2';
+                        const date = document.createElement('small');
+                        date.textContent = entry.date;
+                        if (entry.commit) button.title = entry.author + ' · ' + entry.revision;
+                        button.append(icon, document.createTextNode(entry.label), date);
+                        button.onclick = async () => {
+                            button.disabled = true;
+                            try {
+                                const baseline = await entry.load();
+                                if (request !== timelineRequest || activeEditorPath !== path) return;
+                                await showTimelineComparison(tab, {...(typeof baseline === 'string' ? {baseline} : baseline),date:entry.date}, entry.label);
+                            } catch (error) { window.workspaceAlert(error.message, 'Timeline', 'warning'); }
+                            finally { button.disabled = false; }
+                        };
+                        timelineItems.append(button);
+                    }
+                    for (const [name,data] of [['AI',remote],['Git',git]]) if (data.error) {
+                        const message = document.createElement('p');
+                        message.textContent = name + ' history unavailable: ' + data.error;
+                        timelineItems.append(message);
+                    }
+                } catch (error) { if (request === timelineRequest) timelineItems.textContent = error.message; }
+            }
+            async function showTimelineComparison(tab, copy, label) {
+                await window.loadInlineDiff();
+                if (editorTabs.get(activeEditorPath) !== tab) return;
+                const source = tab.frame.contentWindow.editor;
+                if (timelineView) {
+                    delete timelineDialog.dataset.minimized;
+                    timelineView.destroy();
+                    for (const id of ['timeline-before','timeline-current']) {
+                        const container = document.getElementById(id);
+                        container.replaceChildren();
+                        delete container.env;
+                    }
+                }
+                timelineRestore.hidden = true;
+                timelineSelection = {tab,copy,path:activeEditorPath};
+                timelineDialog.showModal();
+                const left = ace.edit('timeline-before'), right = ace.edit('timeline-current');
+                for (const view of [left,right]) {
+                    view.setTheme(source.getTheme());
+                    view.setOptions({readOnly:true,fontSize:window.getEditorFontSize(),showPrintMargin:false});
+                    view.session.setMode(source.session.getMode().$id);
+                }
+                left.setValue(copy.baseline,-1);
+                right.setValue(copy.current ?? source.getValue(),-1);
+                const commitComparison = typeof copy.current === 'string';
+                document.getElementById('timeline-current-label').textContent = commitComparison ? 'After commit' : 'Current editor';
+                document.getElementById('timeline-inline').hidden = commitComparison;
+                document.getElementById('timeline-before-label').textContent = (commitComparison ? 'Before commit · ' : '') + label + ' · ' + copy.date;
+                timelineView = ace.require('ace/ext/diff').createDiffView({editorA:left,editorB:right});
+                left.resize(); right.resize();
+                timelineView.onInput();
+                const count = timelineView.chunks?.length || 0;
+                document.getElementById('timeline-diff-status').textContent = count ? count + ' changed section(s)' : (commitComparison ? 'No text changes in this commit' : 'No differences from the current editor');
+                for (const id of ['timeline-previous','timeline-next']) document.getElementById(id).disabled = !count;
+                document.getElementById('timeline-restore').disabled = (copy.current ?? copy.baseline) === source.getValue();
+                if (count) {
+                    const first = timelineView.chunks[0];
+                    left.gotoLine(first.old.start.row + 1, 0, false);
+                    right.gotoLine(first.new.start.row + 1, 0, false);
+                }
+            }
+            document.getElementById('timeline-previous').onclick = () => timelineView?.gotoNext(-1);
+            document.getElementById('timeline-next').onclick = () => timelineView?.gotoNext(1);
+            document.getElementById('timeline-close').onclick = () => timelineDialog.close();
+            const timelineRestore = document.createElement('button');
+            timelineRestore.type = 'button';
+            timelineRestore.className = 'btn btn-secondary btn-sm';
+            timelineRestore.style.pointerEvents = 'auto';
+            timelineRestore.textContent = 'Timeline comparison';
+            timelineRestore.hidden = true;
+            document.getElementById('minimized-modules').append(timelineRestore);
+            timelineRestore.onclick = () => {
+                timelineRestore.hidden = true;
+                delete timelineDialog.dataset.minimized;
+                timelineDialog.showModal();
+            };
+            document.getElementById('timeline-minimize').onclick = () => {
+                timelineDialog.dataset.minimized = 'true';
+                timelineRestore.hidden = false;
+                timelineDialog.close();
+            };
+            document.getElementById('timeline-maximize').onclick = event => {
+                const expanded = timelineDialog.classList.toggle('timeline-fullscreen');
+                const button = event.currentTarget;
+                button.setAttribute('aria-pressed', String(expanded));
+                button.title = expanded ? 'Restore window size' : 'Maximize';
+                button.setAttribute('aria-label', button.title);
+                button.firstElementChild.className = 'fas ' + (expanded ? 'fa-compress' : 'fa-expand');
+            };
+            new ResizeObserver(() => {
+                timelineView?.editorA.resize();
+                timelineView?.editorB.resize();
+            }).observe(timelineDialog);
+            timelineDialog.addEventListener('close', () => {
+                if (timelineDialog.dataset.minimized) return;
+                timelineView?.destroy(); timelineView = null;
+                for (const id of ['timeline-before','timeline-current']) {
+                    const container = document.getElementById(id);
+                    container.replaceChildren();
+                    delete container.env;
+                }
+            });
+            document.getElementById('timeline-inline').onclick = () => {
+                const {tab,copy,path} = timelineSelection;
+                timelineDialog.close();
+                if (editorTabs.get(path) === tab) void tab.frame.contentWindow.compareHistoryCopy(copy);
+            };
+            document.getElementById('timeline-restore').onclick = async () => {
+                const {tab,copy,path} = timelineSelection;
+                if (editorTabs.get(path) !== tab || !await window.workspaceConfirm('Replace the editor content with this version? Save to write it to the server.', 'Restore version')) return;
+                tab.frame.contentWindow.editor.setValue(copy.current ?? copy.baseline,-1);
+                timelineDialog.close();
+            };
 
             let contextHistoryRequest = 0, contextHistoryTarget = null;
             const contextHistoryDialog = document.getElementById('file-history-dialog');
@@ -6027,6 +6454,12 @@ if ($username == null) {
             function updateButtonStates() {
                 const n = selectedItems.length;
                 const inTrash = currentPath === '/.trash';
+                const empty = fileList.length === 0;
+                fileSelectionCheckbox.disabled = empty;
+                fileSelectionCheckbox.checked = !empty && n === fileList.length;
+                fileSelectionCheckbox.indeterminate = n > 0 && !fileSelectionCheckbox.checked;
+                updateSelectAllButton(fileSelectionButton, fileSelectionCheckbox.checked, empty);
+                fileSelectionButton.classList.toggle('disabled', empty);
 
                 const selectedFile = n === 1 ? fileList.find(item => item.name === selectedItems[0]) : null;
                 const isFile = selectedFile?.type === 'file';
@@ -6047,7 +6480,6 @@ if ($username == null) {
                     'open-phone-btn': publicFile && !inTrash && (activeEditorPath !== null || isFile),
                     'extract-btn': isArchive && !inTrash,
                     'restore-btn': n > 0 && inTrash,
-                    'unselect-all-btn': n > 0,
                 };
                 if (activeEditorPath !== null) {
                     const ready = tabCanManageFile(editorTabs.get(activeEditorPath));
@@ -6134,6 +6566,7 @@ if ($username == null) {
                         } else {
                             button.classList.add('tree-file');
                             button.append(icon, label);
+                            if (item.history) addHistoryDot(label, {name:item.name, directory:item.path.substring(0, item.path.lastIndexOf('/'))});
                             button.addEventListener('click', () => {
                                 document.querySelectorAll('#directory-tree .folder-item.active').forEach(el => el.classList.remove('active'));
                                 button.classList.add('active');
@@ -6288,27 +6721,16 @@ if ($username == null) {
                 loadFileList();
             }));
 
-            // ── Select all ────────────────────────────────────────────
-            document.getElementById('select-all-checkbox').addEventListener('change', function() {
-                document.querySelectorAll('.item-check').forEach(c => {
-                    c.checked = this.checked;
-                    c.dispatchEvent(new Event('change'));
+            function setFileSelection(checked) {
+                selectedItems = checked ? fileList.map(item => item.name) : [];
+                document.querySelectorAll('#files-list .file-item').forEach(row => {
+                    row.classList.toggle('selected', checked);
+                    row.querySelector('.item-check').checked = checked;
                 });
-            });
-            document.getElementById('select-all-btn').addEventListener('click', e => {
-                e.preventDefault();
-                const cb = document.getElementById('select-all-checkbox');
-                cb.checked = true;
-                cb.dispatchEvent(new Event('change'));
-            });
-            document.getElementById('unselect-all-btn').addEventListener('click', e => {
-                e.preventDefault();
-                if (!e.currentTarget.classList.contains('disabled')) {
-                    const cb = document.getElementById('select-all-checkbox');
-                    cb.checked = false;
-                    cb.dispatchEvent(new Event('change'));
-                }
-            });
+                updateButtonStates();
+            }
+            fileSelectionCheckbox.addEventListener('change', () => setFileSelection(fileSelectionCheckbox.checked));
+            fileSelectionButton.addEventListener('click', () => setFileSelection(!fileSelectionCheckbox.checked));
 
             // ── Toolbar actions ───────────────────────────────────────
             document.getElementById('new-file-btn').addEventListener('click', e => {
@@ -6578,11 +7000,18 @@ if ($username == null) {
             }
 
             // ── Download ──────────────────────────────────────────────
+            async function downloadWorkspaceFile(directory, name) {
+                try {
+                    const response = await fetch('?reauth=1', {method:'HEAD'});
+                    if (response.ok) location.href = '?action=download&' + new URLSearchParams({path:directory, file:name});
+                } catch (_) {
+                    window.workspaceToast('Could not start the download.', 'Download', 'error');
+                }
+            }
             document.getElementById('download-btn').addEventListener('click', e => {
                 e.preventDefault();
                 if (!e.currentTarget.classList.contains('disabled') && selectedItems.length === 1) {
-                    window.location.href =
-                        `${window.location.pathname}?action=download&path=${encodeURIComponent(currentPath)}&file=${encodeURIComponent(selectedItems[0])}`;
+                    downloadWorkspaceFile(currentPath, selectedItems[0]);
                 }
             });
 
@@ -7143,6 +7572,7 @@ if ($username == null) {
                 scheduleSaveTabs();
                 updateEditorMenu();
                 refreshMobileTabs();
+                void refreshTimeline();
                 filesPanel.hidden = path !== null;
                 filesTab.setAttribute('aria-selected', String(path === null));
                 filesTab.parentElement.classList.toggle('active', path === null);
@@ -7306,7 +7736,7 @@ if ($username == null) {
             };
             window.addEventListener('beforeunload', event => {
                 saveWorkspaceTabs();
-                if ([...editorTabs.values()].some(tabHasChanges)) {
+                if ([...editorTabs.values()].some(tab => tab.frame.contentWindow.editorHasUnsavedContent?.() ?? tabHasChanges(tab))) {
                     event.preventDefault();
                     event.returnValue = '';
                 }
@@ -7418,6 +7848,7 @@ if ($username == null) {
                         return;
                     }
                     tab.loaded = true;
+                    if (activeEditorPath === path) void refreshTimeline();
                     if (savedLocation) {
                         const row = Math.min(savedLocation.row, source.session.getLength() - 1);
                         const column = Math.min(savedLocation.column, source.session.getLine(row).length);
@@ -7580,7 +8011,7 @@ if ($username == null) {
                 if (id === 'ctx-browser') { openFileInBrowser(target.name, target.directory); return; }
                 if (id === 'ctx-phone') { showPhoneQR(target.name, target.directory); return; }
                 if (id === 'ctx-download') {
-                    if (target.type === 'file') window.location.href = window.location.pathname + '?action=download&path=' + encodeURIComponent(target.directory) + '&file=' + encodeURIComponent(target.name);
+                    if (target.type === 'file') downloadWorkspaceFile(target.directory, target.name);
                     return;
                 }
                 const action = contextActions[id];
@@ -7611,6 +8042,7 @@ if ($username == null) {
 
             // ── HTMX hooks ────────────────────────────────────────────
             document.addEventListener('submit', evt => {
+                if (evt.target.method === 'dialog') return;
                 evt.target.querySelectorAll("button[type='submit']").forEach(btn => {
                     if (btn.offsetParent !== null) {
                         btn.disabled = true;

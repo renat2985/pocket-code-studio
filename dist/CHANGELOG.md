@@ -2,6 +2,18 @@
 
 Each ZIP contains the complete editor release. Entries describe changes from the preceding archived version; the oldest entry summarizes the baseline.
 
+## 1.4.1
+
+Archive: `pocket-code-studio-1.4.1.zip`
+
+- Add a sidebar Timeline combining saved file copies, Git commits and AI deployments, with side-by-side comparison, change navigation and restore into the editor. Git entries show the changes made by each commit, including renamed files.
+- Mark files with saved history using clickable dots in the file list and sidebar.
+- Include server edits marked with a pencil in AI Integration sync. Clear the pencil after the agent acknowledges the downloaded version, and preserve the latest deployment markers.
+- Expand the AI Integration API with folder browsing, directory creation, file copying, file and folder renaming, deletion and permission changes. Remember the selected site.
+- Install AI Integration and the latest stable Adminer from Tools. Open modules in iframe dialogs with loading indicators, minimize and maximize controls. Include AI Integration in the release archive.
+- Restore expired sessions through an embedded sign-in dialog while preserving open files and unsaved edits.
+- Simplify Select all into a toggle in Files and GitHub Commit & Push, and unify file-marker hover outlines and editor scrollbars.
+
 ## 1.4.0
 
 Archive: `pocket-code-studio-1.4.0.zip`
